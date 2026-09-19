@@ -1,6 +1,6 @@
 """
 Production Pure-Python 5-Minute Cron Runner.
-Zero-Docker, Zero-GC architecture.
+Zero-Docker architecture with bounded allocation and explicit data-validity checks.
 
 Execution via crontab:
     */5 * * * * cd /workspaces/screener && /usr/bin/python3 cron_runner.py >> cron.log 2>&1

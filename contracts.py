@@ -1,6 +1,6 @@
 """
-Core zero-GC data contracts for Quantitative Crypto Derivatives Platform.
-Powered strictly by msgspec.Struct(gc=False) for zero-copy deserialization and zero GC pressure.
+Core typed data contracts for Quantitative Crypto Derivatives Platform.
+Uses msgspec.Struct(gc=False) for bounded object-model overhead; hot-path NumPy buffers may still allocate.
 """
 from __future__ import annotations
 from typing import Optional
@@ -10,7 +10,7 @@ import msgspec
 class NormalizedTrade(msgspec.Struct, gc=False):
     """
     Normalized taker trade event from crypto derivative exchanges.
-    Strictly zero GC overhead.
+    msgspec.Struct minimizes Python object overhead; this does not guarantee zero allocations end-to-end.
     """
     symbol: str
     price: float
@@ -31,7 +31,7 @@ class OrderBookLevel(msgspec.Struct, gc=False):
 class OrderBookSnapshot(msgspec.Struct, gc=False):
     """
     Synchronized L2 OrderBook snapshot with microstructure metrics.
-    Zero GC allocation.
+    msgspec Struct keeps Python object overhead bounded; callers must still account for numeric buffer allocations.
     """
     symbol: str
     last_update_id: int
@@ -107,6 +107,7 @@ class SignalEvent(msgspec.Struct, gc=False):
     relative_strength: float = 0.0 # Beta-adjusted Relative Strength vs BTC (%)
     sweep_reclaim: bool = False    # True if Wyckoff Spring / Upthrust liquidity sweep confirmed
     gate_status: str = "PASSED"    # "PASSED", "GATED_BTC_DUMP", "GATED_PRE_FUNDING", etc.
+    sweep_pattern: str = "NONE"     # "BULLISH_SWEEP_RECLAIM", "BEARISH_SWEEP_RECLAIM", or "NONE"
 
 
 class MarketStateSnapshot(msgspec.Struct, gc=False):
@@ -131,3 +132,14 @@ class MarketStateSnapshot(msgspec.Struct, gc=False):
     # FIX [C1]: History buffers for CVD divergence detection (need 4-12 points minimum)
     cvd_history_5m: tuple = ()  # Tuple of last N CVD values (5m snapshots)
     price_history_5m: tuple = ()  # Tuple of last N prices (5m snapshots)
+    funding_history_5m: tuple = ()  # Historical 8h funding observations for empirical Z-scores
+    basis_history_5m: tuple = ()  # Historical basis bps observations for empirical Z-scores
+    delta_oi_pct_history_5m: tuple = ()  # Historical DeltaOI/OI observations for empirical Z-scores
+    micro_factor_history_5m: tuple = ()  # Historical OBI*(1-VPIN) observations for empirical Z-scores
+    whale_divergence_history_5m: tuple = ()  # Historical raw whale-retail divergence observations
+    cvd_divergence_history_5m: tuple = ()  # Historical CVD divergence factor observations
+    candle_open_time_ms: int = 0  # Open time of the most recently persisted closed 5m candle
+    candle_open_times_5m: tuple = ()  # Closed 5m candle open times aligned with price_history_5m
+    candle_high_5m: float = 0.0
+    candle_low_5m: float = 0.0
+    signal_ready: bool = False

@@ -3,7 +3,7 @@ Production-ready Binance Futures Ingestion Layer.
 Implements:
 1. Low-latency WebSocket client with automatic reconnection and exponential backoff.
 2. Robust Finite State Machine (FSM) for L2 Order Book synchronization with sequence integrity checks (pu == u_prev).
-3. Zero-copy msgspec serialization and Zero-GC data structures.
+3. Typed msgspec serialization with bounded Python object overhead; numeric hot paths may allocate NumPy buffers.
 4. Normalization of trades, order book depth, funding rates (8h basis), and mark price basis spread.
 5. High-concurrency REST batch collector for universe-wide 5-minute cron executions.
 """
@@ -14,6 +14,7 @@ import collections
 import enum
 import logging
 import math
+import os
 import random
 import time
 from typing import Any, Callable, Coroutine, Deque, Dict, List, Optional, Set, Tuple
@@ -158,14 +159,15 @@ class BinanceOrderBookFSM:
             self.state = OrderBookFSMState.BUFFERING
             return False
 
-        # First event must satisfy U <= lastUpdateId AND u >= lastUpdateId
+        # Binance local-book contract: the first buffered event must contain
+        # the update immediately after the REST snapshot: U <= lastUpdateId + 1 <= u.
         first_event = self.buffer[0]
         U = first_event.get("U", 0)
         u = first_event.get("u", 0)
 
-        if not (U <= self.last_update_id <= u):
+        if not (U <= self.last_update_id + 1 <= u):
             logger.warning(
-                f"[{self.symbol}] First event sequence mismatch: U={U} <= lastUpdateId={self.last_update_id} <= u={u} violated. Resetting."
+                f"[{self.symbol}] First event sequence mismatch: U={U} <= lastUpdateId+1={self.last_update_id + 1} <= u={u} violated. Resetting."
             )
             self.reset()
             return False
@@ -199,6 +201,8 @@ class BinanceOrderBookFSM:
         for p_str, q_str in bids:
             price = float(p_str)
             qty = float(q_str)
+            if not math.isfinite(price) or price <= 0.0 or not math.isfinite(qty) or qty < 0.0:
+                raise ValueError("Invalid bid depth level")
             if qty == 0.0:
                 self.bids.pop(price, None)
             else:
@@ -207,6 +211,8 @@ class BinanceOrderBookFSM:
         for p_str, q_str in asks:
             price = float(p_str)
             qty = float(q_str)
+            if not math.isfinite(price) or price <= 0.0 or not math.isfinite(qty) or qty < 0.0:
+                raise ValueError("Invalid ask depth level")
             if qty == 0.0:
                 self.asks.pop(price, None)
             else:
@@ -268,6 +274,47 @@ class BinanceOrderBookFSM:
         )
 
 
+class WeightedRateLimiter:
+    """Sliding-window REQUEST_WEIGHT limiter with explicit 429/418 cooldowns."""
+
+    def __init__(self, max_weight: int, window_seconds: float = 60.0) -> None:
+        if max_weight <= 0 or window_seconds <= 0.0:
+            raise ValueError("Rate limiter configuration must be positive")
+        self.max_weight = max_weight
+        self.window_seconds = window_seconds
+        self._events: Deque[Tuple[float, int]] = collections.deque()
+        self._used_weight = 0
+        self._lock = asyncio.Lock()
+        self._cooldown_until = 0.0
+
+    async def acquire(self, weight: int) -> None:
+        if weight <= 0:
+            return
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                while self._events and now - self._events[0][0] >= self.window_seconds:
+                    _, old_weight = self._events.popleft()
+                    self._used_weight -= old_weight
+
+                wait_for_cooldown = max(0.0, self._cooldown_until - now)
+                if wait_for_cooldown > 0.0:
+                    sleep_for = wait_for_cooldown
+                elif self._used_weight + weight <= self.max_weight:
+                    self._events.append((now, weight))
+                    self._used_weight += weight
+                    return
+                else:
+                    oldest_at, _ = self._events[0]
+                    sleep_for = max(0.001, self.window_seconds - (now - oldest_at))
+            await asyncio.sleep(sleep_for)
+
+    def cooldown(self, seconds: float) -> None:
+        if seconds > 0.0:
+            self._cooldown_until = max(self._cooldown_until, time.monotonic() + seconds)
+
+
+
 class BinanceFuturesIngestion:
     """
     Asynchronous Binance Futures Ingestion Layer.
@@ -298,32 +345,96 @@ class BinanceFuturesIngestion:
         self._session: Optional[aiohttp.ClientSession] = None
         self._running: bool = False
         self._ws_task: Optional[asyncio.Task[None]] = None
+        self._book_sync_tasks: Dict[str, asyncio.Task[None]] = {}
+        self._funding_intervals_hours: Dict[str, float] = {}
+        self._funding_info_loaded = False
         self._msg_decoder = msgspec.json.Decoder()
+        # Production cron route: 40 ticker + 10 premiumIndex + 100*20 aggTrades
+        # + 100*2 depth + 100*1 kline + 100*1 OI history = 2450 worst-case if
+        # every endpoint used the historical path. The actual scanner does not
+        # request current OI separately. Keep a 5% safety reserve by default and
+        # let the limiter pace beyond one window rather than violating Binance limits.
+        self._rate_limiter = WeightedRateLimiter(
+            max_weight=int(os.getenv("BINANCE_REQUEST_WEIGHT_BUDGET", "2280"))
+        )
+        self._backoff_429_seconds = float(os.getenv("BINANCE_429_BACKOFF_SEC", "1.0"))
+        self._cooldown_418_seconds = float(os.getenv("BINANCE_418_COOLDOWN_SEC", "60.0"))
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=10, connect=5)
-            self._session = aiohttp.ClientSession(
-                timeout=timeout,
-                headers={"User-Agent": "QuantEngine/1.0", "Accept-Encoding": "gzip"},
-            )
+            headers = {
+                "User-Agent": "QuantEngine/1.0",
+                "Accept-Encoding": "gzip",
+            }
+            api_key = os.getenv("BINANCE_API_KEY")
+            if api_key:
+                headers["X-MBX-APIKEY"] = api_key
+            self._session = aiohttp.ClientSession(timeout=timeout, headers=headers)
         return self._session
+
+    async def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Optional[Dict[str, str]] = None,
+        weight: int,
+        symbol: Optional[str] = None,
+    ) -> Optional[Any]:
+        if weight < 0:
+            raise ValueError("request weight must be non-negative")
+        await self._rate_limiter.acquire(weight)
+        session = await self._get_session()
+        try:
+            async with session.request(method, url, params=params) as resp:
+                if resp.status == 200:
+                    return await resp.json(content_type=None)
+
+                retry_after_raw = resp.headers.get("Retry-After")
+                try:
+                    retry_after = float(retry_after_raw) if retry_after_raw else 0.0
+                except ValueError:
+                    retry_after = 0.0
+
+                if resp.status == 429:
+                    cooldown = max(self._backoff_429_seconds, retry_after)
+                    self._rate_limiter.cooldown(cooldown)
+                    logger.error(
+                        "binance_rate_limited status=429 symbol=%s retry_after=%s cooldown=%.2fs",
+                        symbol, retry_after_raw, cooldown,
+                    )
+                elif resp.status == 418:
+                    cooldown = max(self._cooldown_418_seconds, retry_after)
+                    self._rate_limiter.cooldown(cooldown)
+                    logger.critical(
+                        "binance_ip_banned status=418 symbol=%s retry_after=%s cooldown=%.2fs",
+                        symbol, retry_after_raw, cooldown,
+                    )
+                else:
+                    body = await resp.text()
+                    logger.error(
+                        "binance_http_error status=%s symbol=%s body=%s",
+                        resp.status, symbol, body[:500],
+                    )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.error("binance_request_failed symbol=%s url=%s error=%s", symbol, url, exc)
+        except (TypeError, ValueError) as exc:
+            logger.error("binance_response_invalid symbol=%s url=%s error=%s", symbol, url, exc)
+        return None
 
     async def fetch_l2_snapshot(self, symbol: str, limit: int = 1000) -> Optional[Dict[str, Any]]:
         """Fetch REST depth snapshot for order book FSM synchronization."""
-        session = await self._get_session()
+        if limit not in (5, 10, 20, 50, 100, 500, 1000):
+            raise ValueError("unsupported Binance depth limit")
+        weight = 20 if limit == 1000 else (10 if limit == 500 else (5 if limit == 100 else 2))
         url = f"{self.REST_BASE_URL}/fapi/v1/depth"
-        params = {"symbol": symbol, "limit": str(limit)}
-        try:
-            async with session.get(url, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data
-                logger.error(f"[{symbol}] Failed to fetch depth snapshot: HTTP {resp.status}")
-                return None
-        except Exception as exc:
-            logger.error(f"[{symbol}] Exception fetching depth snapshot: {exc}")
+        data = await self._request_json(
+            "GET", url, params={"symbol": symbol, "limit": str(limit)}, weight=weight, symbol=symbol
+        )
+        if not isinstance(data, dict):
             return None
+        return data
 
     def _build_stream_url(self) -> str:
         """Construct multi-stream WebSocket URL for all requested contracts."""
@@ -357,10 +468,16 @@ class BinanceFuturesIngestion:
                     logger.info("WebSocket connected successfully!")
                     backoff_sec = 1.0  # Reset backoff on successful connection
 
-                    # Set books into BUFFERING state and schedule snapshots
-                    for sym, book in self.books.items():
-                        book.on_ws_connected()
-                        asyncio.create_task(self._sync_symbol_book(sym))
+                    funding_info = await self.fetch_universe_funding_info()
+                    self._funding_info_loaded = funding_info is not None
+                    if funding_info is not None:
+                        self._funding_intervals_hours = funding_info
+                    else:
+                        logger.error("funding_info_unavailable streaming funding normalization is disabled until metadata loads")
+
+                    # Set books into BUFFERING state and schedule snapshots.
+                    for sym in self.books:
+                        self._schedule_book_sync(sym)
 
                     async for msg in ws:
                         if not self._running:
@@ -382,30 +499,45 @@ class BinanceFuturesIngestion:
 
         logger.info("Streaming stopped.")
 
+    def _schedule_book_sync(self, symbol: str) -> None:
+        """Schedule one snapshot resync for a symbol after connect or sequence gap."""
+        book = self.books.get(symbol)
+        if book is None:
+            return
+        task = self._book_sync_tasks.get(symbol)
+        if task is not None and not task.done():
+            return
+        if book.state == OrderBookFSMState.DISCONNECTED:
+            book.on_ws_connected()
+        self._book_sync_tasks[symbol] = asyncio.create_task(self._sync_symbol_book(symbol))
+
     async def _sync_symbol_book(self, symbol: str) -> None:
         """Fetch snapshot and synchronize symbol FSM book."""
         book = self.books.get(symbol)
         if not book:
             return
-        book.state = OrderBookFSMState.REST_SNAPSHOT
-        # Allow buffer to collect a few diff events first
-        await asyncio.sleep(0.3)
-        snapshot = await self.fetch_l2_snapshot(symbol, limit=1000)
-        if snapshot:
-            success = book.apply_snapshot(snapshot)
-            # FIX [C7]: If buffer was empty (apply_snapshot returned False), schedule retry
-            if not success and book.state == OrderBookFSMState.BUFFERING:
-                logger.info(f"[{symbol}] Buffer exhausted, scheduling resync in 0.5s...")
-                await asyncio.sleep(0.5)
-                # Fetch new snapshot and retry
-                snapshot_retry = await self.fetch_l2_snapshot(symbol, limit=1000)
-                if snapshot_retry:
-                    book.apply_snapshot(snapshot_retry)
-            
-            if self.on_book and book.state == OrderBookFSMState.IN_SYNC:
-                snap = book.get_snapshot(depth=10)
-                if snap:
-                    await self.on_book(snap)
+        current_task = asyncio.current_task()
+        try:
+            book.state = OrderBookFSMState.REST_SNAPSHOT
+            await asyncio.sleep(0.3)
+            snapshot = await self.fetch_l2_snapshot(symbol, limit=1000)
+            if snapshot:
+                success = book.apply_snapshot(snapshot)
+                if not success and book.state == OrderBookFSMState.BUFFERING:
+                    logger.info(f"[{symbol}] Buffer exhausted, waiting for new events before resync...")
+                if self.on_book and book.state == OrderBookFSMState.IN_SYNC:
+                    snap = book.get_snapshot(depth=10)
+                    if snap:
+                        await self.on_book(snap)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("book_sync_failed symbol=%s error=%s", symbol, exc)
+            if book.state != OrderBookFSMState.DISCONNECTED:
+                book.reset()
+        finally:
+            if self._book_sync_tasks.get(symbol) is current_task:
+                self._book_sync_tasks.pop(symbol, None)
 
     async def _dispatch_ws_message(self, raw_text: str) -> None:
         """Parse and dispatch multi-stream combined WebSocket messages."""
@@ -423,46 +555,77 @@ class BinanceFuturesIngestion:
             symbol = data.get("s", "")
             book = self.books.get(symbol)
             if book:
-                book.handle_depth_event(data)
+                try:
+                    book.handle_depth_event(data)
+                except (TypeError, ValueError, KeyError) as exc:
+                    logger.error("malformed_depth_event symbol=%s error=%s", symbol, exc)
+                    book.reset()
+                if book.state == OrderBookFSMState.DISCONNECTED:
+                    self._schedule_book_sync(symbol)
                 if self.on_book and book.state == OrderBookFSMState.IN_SYNC:
                     snap = book.get_snapshot(depth=10)
                     if snap:
                         await self.on_book(snap)
 
         elif event_type == "aggTrade":
-            symbol = data.get("s", "")
-            is_maker = bool(data.get("m", False))
+            symbol = data.get("s")
+            try:
+                is_maker = bool(data["m"])
+                price = float(data["p"])
+                qty = float(data["q"])
+                timestamp_ms = int(data["T"])
+                trade_id = int(data["a"])
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.error("malformed_agg_trade error=%s payload=%s", exc, data)
+                return
+            if (not isinstance(symbol, str) or not symbol
+                    or not math.isfinite(price) or price <= 0.0
+                    or not math.isfinite(qty) or qty <= 0.0
+                    or timestamp_ms <= 0 or trade_id <= 0):
+                logger.error("invalid_agg_trade payload=%s", data)
+                return
             side = "SELL" if is_maker else "BUY"
-            price = float(data.get("p", 0.0))
-            qty = float(data.get("q", 0.0))
             trade = NormalizedTrade(
                 symbol=symbol,
                 price=price,
                 quantity=qty,
                 quote_quantity=price * qty,
                 side=side,
-                timestamp_ms=int(data.get("T", 0)),
+                timestamp_ms=timestamp_ms,
                 is_buyer_maker=is_maker,
-                trade_id=int(data.get("a", 0)),
+                trade_id=trade_id,
             )
             if self.on_trade:
                 await self.on_trade(trade)
 
         elif event_type == "markPriceUpdate":
-            symbol = data.get("s", "")
-            raw_rate = float(data.get("r", 0.0))
-            mark_price = float(data.get("p", 0.0))
-            index_price = float(data.get("i", 0.0))
-            next_time = int(data.get("T", 0))
+            symbol = data.get("s")
+            try:
+                raw_rate = float(data["r"])
+                mark_price = float(data["p"])
+                index_price = float(data["i"])
+                next_time = int(data["T"])
+                event_time = int(data["E"])
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.error("malformed_mark_price error=%s payload=%s", exc, data)
+                return
+            if (not isinstance(symbol, str) or not symbol
+                    or not math.isfinite(raw_rate)
+                    or not math.isfinite(mark_price) or mark_price <= 0.0
+                    or not math.isfinite(index_price) or index_price <= 0.0
+                    or next_time <= 0 or event_time <= 0
+                    or not self._funding_info_loaded):
+                logger.error("invalid_or_unready_mark_price symbol=%s payload=%s", symbol, data)
+                return
 
-            # Funding rate normalization: 8h basis
-            # Binance default is 8h; if rate is non-standard, formula is (1 + raw)^(8/interval) - 1
-            interval_h = 8.0
+            interval_h = self._funding_intervals_hours.get(symbol, 8.0)
+            if not math.isfinite(interval_h) or interval_h <= 0.0 or 1.0 + raw_rate <= 0.0:
+                logger.error("invalid_funding_metadata symbol=%s interval_h=%s raw_rate=%s", symbol, interval_h, raw_rate)
+                return
             norm_8h = (1.0 + raw_rate) ** (8.0 / interval_h) - 1.0
             annualized = norm_8h * 3.0 * 365.0 * 100.0
-
             basis_spread = mark_price - index_price
-            basis_bps = (basis_spread / index_price * 10000.0) if index_price > 0.0 else 0.0
+            basis_bps = basis_spread / index_price * 10000.0
 
             funding = NormalizedFunding(
                 symbol=symbol,
@@ -475,7 +638,7 @@ class BinanceFuturesIngestion:
                 basis_spread=basis_spread,
                 basis_spread_bps=basis_bps,
                 next_funding_time_ms=next_time,
-                timestamp_ms=int(data.get("E", int(time.time() * 1000))),
+                timestamp_ms=event_time,
             )
             if self.on_funding:
                 await self.on_funding(funding)
@@ -483,6 +646,12 @@ class BinanceFuturesIngestion:
     async def stop(self) -> None:
         """Gracefully stop ingestion and close sessions."""
         self._running = False
+        tasks = list(self._book_sync_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._book_sync_tasks.clear()
         if self._session and not self._session.closed:
             await self._session.close()
         logger.info("Binance ingestion cleanly stopped.")
@@ -492,109 +661,297 @@ class BinanceFuturesIngestion:
     # -------------------------------------------------------------------------
 
     async def fetch_universe_tickers(self) -> Dict[str, Dict[str, Any]]:
-        """Fetch 24hr tickers for all futures contracts in 1 single HTTP call."""
-        session = await self._get_session()
+        """Fetch 24h ticker data for all USDT-M symbols in one request."""
         url = f"{self.REST_BASE_URL}/fapi/v1/ticker/24hr"
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return {item["symbol"]: item for item in data if item["symbol"].endswith("USDT")}
+        data = await self._request_json("GET", url, weight=40)
+        if not isinstance(data, list):
             return {}
+        out: Dict[str, Dict[str, Any]] = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            symbol = item.get("symbol")
+            try:
+                quote_volume = float(item["quoteVolume"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not isinstance(symbol, str) or not symbol.endswith("USDT"):
+                continue
+            if not math.isfinite(quote_volume) or quote_volume < 0.0:
+                continue
+            out[symbol] = item
+        return out
 
     async def fetch_universe_premium_index(self) -> Dict[str, Dict[str, Any]]:
-        """Fetch premium index (funding, mark, index price) for all contracts in 1 single call."""
-        session = await self._get_session()
+        """Fetch premium/funding data for all USDT-M symbols in one request."""
         url = f"{self.REST_BASE_URL}/fapi/v1/premiumIndex"
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return {item["symbol"]: item for item in data if item["symbol"].endswith("USDT")}
+        data = await self._request_json("GET", url, weight=10)
+        if not isinstance(data, list):
             return {}
+        return {
+            item["symbol"]: item
+            for item in data
+            if isinstance(item, dict)
+            and isinstance(item.get("symbol"), str)
+            and item["symbol"].endswith("USDT")
+        }
+
+    async def fetch_universe_funding_info(self) -> Optional[Dict[str, float]]:
+        """Fetch funding-interval metadata; absence of a symbol means default 8h only when the request succeeded."""
+        url = f"{self.REST_BASE_URL}/fapi/v1/fundingInfo"
+        data = await self._request_json("GET", url, weight=0)
+        if not isinstance(data, list):
+            return None
+        out: Dict[str, float] = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            symbol = item.get("symbol")
+            try:
+                interval_h = float(item["fundingIntervalHours"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if not isinstance(symbol, str) or not symbol.endswith("USDT"):
+                return None
+            if not math.isfinite(interval_h) or interval_h <= 0.0:
+                return None
+            out[symbol] = interval_h
+        return out
 
     async def fetch_symbol_open_interest(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Fetch current open interest for a specific contract."""
-        session = await self._get_session()
+        """Fetch current open interest; retained for external compatibility."""
         url = f"{self.REST_BASE_URL}/fapi/v1/openInterest"
-        try:
-            async with session.get(url, params={"symbol": symbol}) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-        except Exception:
-            pass
-        return None
+        data = await self._request_json(
+            "GET", url, params={"symbol": symbol}, weight=1, symbol=symbol
+        )
+        return data if isinstance(data, dict) else None
+
+    async def fetch_symbol_closed_5m_klines(
+        self,
+        symbol: str,
+        closed_open_ms: int,
+        *,
+        history_bars: int,
+    ) -> Optional[List[list]]:
+        """Fetch exactly `history_bars` completed 5m bars ending at `closed_open_ms`."""
+        interval_ms = 5 * 60 * 1000
+        if history_bars < 2 or closed_open_ms <= 0 or closed_open_ms % interval_ms != 0:
+            raise ValueError("invalid completed-5m kline request")
+        start_ms = closed_open_ms - (history_bars - 1) * interval_ms
+        end_ms = closed_open_ms + interval_ms - 1
+        limit = history_bars
+        if limit > 1500:
+            raise ValueError("history_bars exceeds Binance kline limit")
+        weight = 1 if limit < 100 else (2 if limit < 500 else (5 if limit <= 1000 else 10))
+        url = f"{self.REST_BASE_URL}/fapi/v1/klines"
+        data = await self._request_json(
+            "GET",
+            url,
+            params={
+                "symbol": symbol,
+                "interval": "5m",
+                "startTime": str(start_ms),
+                "endTime": str(end_ms),
+                "limit": str(limit),
+            },
+            weight=weight,
+            symbol=symbol,
+        )
+        if not isinstance(data, list) or len(data) != history_bars:
+            logger.warning(
+                "kline_window_incomplete symbol=%s expected=%d actual=%s",
+                symbol, history_bars, len(data) if isinstance(data, list) else None,
+            )
+            return None
+
+        opens: List[int] = []
+        for row in data:
+            if not isinstance(row, list) or len(row) < 12:
+                return None
+            try:
+                open_ms = int(row[0])
+                close_ms = int(row[6])
+                numeric = [float(row[i]) for i in (1, 2, 3, 4, 5, 9)]
+            except (TypeError, ValueError):
+                return None
+            if not all(math.isfinite(v) for v in numeric):
+                return None
+            if min(numeric[0:4]) <= 0.0 or numeric[4] < 0.0 or numeric[5] < 0.0:
+                return None
+            if close_ms != open_ms + interval_ms - 1:
+                return None
+            opens.append(open_ms)
+        expected_opens = [start_ms + i * interval_ms for i in range(history_bars)]
+        if opens != expected_opens or opens[-1] != closed_open_ms:
+            logger.warning("kline_window_gap symbol=%s expected_last=%d actual=%s", symbol, closed_open_ms, opens[-1] if opens else None)
+            return None
+        return data
+
+    async def fetch_symbol_closed_5m_open_interest(
+        self, symbol: str, current_open_ms: int
+    ) -> Optional[float]:
+        """Fetch the OI observation belonging to the just-closed 5m period."""
+        interval_ms = 5 * 60 * 1000
+        if current_open_ms <= 0 or current_open_ms % interval_ms != 0:
+            raise ValueError("invalid completed-5m OI boundary")
+        closed_open_ms = current_open_ms - interval_ms
+        url = f"{self.REST_BASE_URL}/futures/data/openInterestHist"
+        data = await self._request_json(
+            "GET",
+            url,
+            params={
+                "symbol": symbol,
+                "period": "5m",
+                "startTime": str(closed_open_ms),
+                "endTime": str(current_open_ms),
+                "limit": "10",
+            },
+            weight=1,
+            symbol=symbol,
+        )
+        if not isinstance(data, list):
+            return None
+        candidates: List[Tuple[int, float]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            try:
+                ts = int(item["timestamp"])
+                oi = float(item["sumOpenInterest"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if closed_open_ms <= ts <= current_open_ms and math.isfinite(oi) and oi >= 0.0:
+                candidates.append((ts, oi))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda pair: pair[0])
+        return candidates[-1][1]
 
     async def fetch_symbol_orderbook_top(self, symbol: str, limit: int = 20) -> Optional[OrderBookSnapshot]:
-        """Fetch REST depth snapshot and compute OBI directly for cron cycle."""
+        """Fetch REST depth snapshot and compute top-10 OBI for cron cycle."""
         snapshot = await self.fetch_l2_snapshot(symbol, limit=limit)
         if not snapshot:
             return None
-
-        raw_bids = [(float(p), float(q)) for p, q in snapshot.get("bids", [])]
-        raw_asks = [(float(p), float(q)) for p, q in snapshot.get("asks", [])]
-
-        if not raw_bids or not raw_asks:
+        try:
+            raw_bids = [(float(p), float(q)) for p, q in snapshot.get("bids", [])]
+            raw_asks = [(float(p), float(q)) for p, q in snapshot.get("asks", [])]
+            last_update_id = int(snapshot["lastUpdateId"])
+        except (KeyError, TypeError, ValueError):
             return None
-
+        if not raw_bids or not raw_asks or last_update_id <= 0:
+            return None
+        if not all(math.isfinite(p) and math.isfinite(q) and p > 0.0 and q >= 0.0 for p, q in raw_bids + raw_asks):
+            return None
+        raw_bids.sort(key=lambda x: x[0], reverse=True)
+        raw_asks.sort(key=lambda x: x[0])
         best_bid = raw_bids[0][0]
         best_ask = raw_asks[0][0]
-        
-        # FIX [C4]: Check for crossed book (best_bid >= best_ask) - same as FSM get_snapshot
         if best_bid >= best_ask:
-            logger.warning(f"[{symbol}] Crossed book detected in REST snapshot: best_bid={best_bid} >= best_ask={best_ask}")
+            logger.warning("crossed_rest_book symbol=%s bid=%s ask=%s", symbol, best_bid, best_ask)
             return None
-        
+        top_bids = raw_bids[:10]
+        top_asks = raw_asks[:10]
         mid = (best_bid + best_ask) * 0.5
         spread = best_ask - best_bid
-        spread_bps = (spread / mid * 10000.0) if mid > 0 else 0.0
-
-        bid_vol_5 = sum(q for _, q in raw_bids[:5])
-        ask_vol_5 = sum(q for _, q in raw_asks[:5])
+        if mid <= 0.0:
+            return None
+        spread_bps = spread / mid * 10000.0
+        bid_vol_5 = sum(q for _, q in top_bids[:5])
+        ask_vol_5 = sum(q for _, q in top_asks[:5])
         tot_5 = bid_vol_5 + ask_vol_5
-        obi_5 = (bid_vol_5 - ask_vol_5) / tot_5 if tot_5 > 0 else 0.0
-
-        bid_vol_10 = sum(q for _, q in raw_bids[:10])
-        ask_vol_10 = sum(q for _, q in raw_asks[:10])
+        bid_vol_10 = sum(q for _, q in top_bids)
+        ask_vol_10 = sum(q for _, q in top_asks)
         tot_10 = bid_vol_10 + ask_vol_10
-        obi_10 = (bid_vol_10 - ask_vol_10) / tot_10 if tot_10 > 0 else 0.0
-
+        if tot_5 <= 0.0 or tot_10 <= 0.0:
+            return None
         return OrderBookSnapshot(
             symbol=symbol,
-            last_update_id=snapshot.get("lastUpdateId", 0),
+            last_update_id=last_update_id,
             timestamp_ms=int(time.time() * 1000),
-            bids=tuple(raw_bids[:10]),
-            asks=tuple(raw_asks[:10]),
+            bids=tuple(top_bids),
+            asks=tuple(top_asks),
             best_bid=best_bid,
             best_ask=best_ask,
             mid_price=mid,
             spread=spread,
             spread_bps=spread_bps,
-            obi_depth5=obi_5,
-            obi_depth10=obi_10,
+            obi_depth5=(bid_vol_5 - ask_vol_5) / tot_5,
+            obi_depth10=(bid_vol_10 - ask_vol_10) / tot_10,
         )
 
-    async def fetch_recent_agg_trades_cvd(self, symbol: str, limit: int = 100) -> Tuple[float, float, float]:
-        """
-        Fetch recent aggregated trades and compute taker volume & CVD.
-        Returns: (taker_buy_vol, taker_sell_vol, cvd)
-        """
-        session = await self._get_session()
+    async def fetch_5m_agg_trades(
+        self,
+        symbol: str,
+        start_time_ms: int,
+        end_time_ms: int,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Fetch the complete aggregate-trade set inside a closed 5m window."""
+        if start_time_ms < 0 or end_time_ms < start_time_ms:
+            raise ValueError("invalid aggregate-trade window")
+        if end_time_ms - start_time_ms >= 60 * 60 * 1000:
+            raise ValueError("aggregate-trade query window must be < 1 hour")
+
         url = f"{self.REST_BASE_URL}/fapi/v1/aggTrades"
-        try:
-            async with session.get(url, params={"symbol": symbol, "limit": str(limit)}) as resp:
-                if resp.status == 200:
-                    trades = await resp.json()
-                    buy_vol = 0.0
-                    sell_vol = 0.0
-                    for t in trades:
-                        qty = float(t.get("q", 0.0))
-                        is_maker = bool(t.get("m", False))
-                        if is_maker:
-                            sell_vol += qty  # Buyer was maker -> Taker sold
-                        else:
-                            buy_vol += qty   # Taker bought
-                    return buy_vol, sell_vol, (buy_vol - sell_vol)
-                elif resp.status == 429:
-                    await asyncio.sleep(0.5)
-        except Exception:
-            pass
-        return 0.0, 0.0, 0.0
+        params = {
+            "symbol": symbol,
+            "startTime": str(start_time_ms),
+            "endTime": str(end_time_ms),
+            "limit": "1000",
+        }
+        data = await self._request_json("GET", url, params=params, weight=20, symbol=symbol)
+        if not isinstance(data, list):
+            return None
+
+        out: List[Dict[str, Any]] = []
+        next_from_id: Optional[int] = None
+        while data:
+            last_id: Optional[int] = None
+            for item in data:
+                if not isinstance(item, dict):
+                    return None
+                try:
+                    trade_id = int(item["a"])
+                    ts = int(item["T"])
+                    qty = float(item["q"])
+                    maker = bool(item["m"])
+                except (KeyError, TypeError, ValueError):
+                    return None
+                if trade_id <= 0 or ts < 0 or not math.isfinite(qty) or qty <= 0.0:
+                    return None
+                if last_id is not None and trade_id <= last_id:
+                    return None
+                last_id = trade_id
+                if ts < start_time_ms:
+                    continue
+                if ts > end_time_ms:
+                    data = []
+                    break
+                out.append({"a": trade_id, "T": ts, "q": qty, "m": maker})
+
+            if not data or len(data) < 1000:
+                break
+            if last_id is None:
+                return None
+            next_from_id = last_id + 1
+            if next_from_id <= last_id:
+                return None
+            data = await self._request_json(
+                "GET",
+                url,
+                params={"symbol": symbol, "fromId": str(next_from_id), "limit": "1000"},
+                weight=20,
+                symbol=symbol,
+            )
+            if not isinstance(data, list):
+                return None
+
+        # IDs are monotonic in the API response; preserve that order for deterministic VPIN.
+        if any(b["a"] <= a["a"] for a, b in zip(out, out[1:])):
+            return None
+        return out
+
+    async def fetch_recent_agg_trades_cvd(self, symbol: str, limit: int = 100) -> Tuple[float, float, float]:
+        """Deprecated: unbounded latest-N trade windows are not valid 5m aggregates."""
+        raise RuntimeError(
+            "fetch_recent_agg_trades_cvd is deprecated; use fetch_5m_agg_trades with explicit timestamps"
+        )
