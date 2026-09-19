@@ -28,7 +28,7 @@ class BacktestMetrics(msgspec.Struct, gc=False):
     deflated_sharpe_ratio: float  # Bailey & López de Prado (2014) DSR probability in [0.0, 1.0]
     is_statistically_significant: bool  # True if DSR >= 0.95 (5% significance level)
     skewness: float
-    kurtosis: float
+    excess_kurtosis: float  # FIX [N1]: Renamed from kurtosis to clarify it's EXCESS kurtosis (raw - 3)
 
 
 def compute_deflated_sharpe_ratio(
@@ -240,7 +240,7 @@ class QuantBacktester:
             deflated_sharpe_ratio=round(dsr, 4),
             is_statistically_significant=(dsr >= 0.95),
             skewness=round(skew, 2),
-            kurtosis=round(kurt, 2),
+            excess_kurtosis=round(kurt, 2),
         )
 
     def _empty_metrics(self) -> BacktestMetrics:
@@ -259,5 +259,5 @@ class QuantBacktester:
             deflated_sharpe_ratio=0.0,
             is_statistically_significant=False,
             skewness=0.0,
-            kurtosis=3.0,
+            excess_kurtosis=0.0,  # FIX [N1]: Return excess kurtosis (0.0 for empty), not raw kurtosis (3.0)
         )

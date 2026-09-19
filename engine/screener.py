@@ -229,12 +229,15 @@ class QuantScreener:
                 # Previously: only 2 points (prev + current) were passed with lookback=2,
                 # but detect_cvd_divergence_jit returns 0.0 when n < 4.
                 # Solution: Build history from stored state if available, otherwise skip.
+                # FIX [N2]: Mark signals as warmup until we have sufficient history (6 points).
                 div_score = 0.0
+                is_warmup = True
                 if p_snap is not None and hasattr(p_snap, 'cvd_history_5m') and p_snap.cvd_history_5m:
                     # Use stored 5m CVD history (should have 4-12 points)
                     cvd_hist = list(p_snap.cvd_history_5m) + [cvd]
                     price_hist = list(p_snap.price_history_5m) + [last_price]
                     if len(cvd_hist) >= 4:
+                        is_warmup = False  # We have enough history for meaningful signal
                         prices_arr = np.array(price_hist[-12:], dtype=np.float64)  # Last 12 points max
                         cvd_arr = np.array(cvd_hist[-12:], dtype=np.float64)
                         lookback = min(6, len(prices_arr) - 1)  # Use 6 or less depending on data
@@ -249,6 +252,7 @@ class QuantScreener:
                 # stored swing levels from previous cycles that are distinct from current 24h range.
                 
                 has_sweep_reclaim = False
+                sweep_enabled = False
                 if p_snap and p_snap.low_24h > 0.0 and p_snap.high_24h > 0.0:
                     # Check if 24h extremes are meaningfully different from current bar
                     # to avoid false positives at 24h window boundaries
@@ -260,6 +264,7 @@ class QuantScreener:
                     if swing_range_pct > curr_range_pct * 1.5:  # 24h range should be significantly wider
                         recent_low_swing = p_snap.low_24h
                         recent_high_swing = p_snap.high_24h
+                        sweep_enabled = True
                     else:
                         # Fall back to current bar - no sweep detection this cycle
                         recent_low_swing = low_price
@@ -269,8 +274,9 @@ class QuantScreener:
                     recent_low_swing = low_price
                     recent_high_swing = high_price
 
-                # Only attempt sweep detection if swing levels are meaningful
-                if recent_low_swing != low_price or recent_high_swing != high_price:
+                # FIX [N3]: Use explicit boolean flag instead of float comparison (!=)
+                # Float equality is unreliable due to precision issues
+                if sweep_enabled:
                     sweep_event = self.sweep_detector.detect(
                         symbol=symbol,
                         current_price=last_price,
