@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: quant-screener-run
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   run-screener:
@@ -26,6 +26,11 @@ jobs:
       SCAN_CONCURRENCY: "25"
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
+      BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+      GITHUB_TOKEN: ${{ github.token }}
+      SIGNAL_HISTORY_BARS: "60"
+      SIGNAL_Z_MIN_SAMPLES: "24"
+      BETA_MIN_SAMPLES: "24"
 
     steps:
       - name: Checkout repository
@@ -33,7 +38,7 @@ jobs:
         with:
           fetch-depth: 1
           ref: main
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -47,6 +52,11 @@ jobs:
           key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
           restore-keys: |
             pip-${{ runner.os }}-
+
+      - name: Validate required secrets
+        run: |
+          set -euo pipefail
+          test -n "${BINANCE_API_KEY:-}"
 
       - name: Install dependencies
         run: |
@@ -69,6 +79,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          export GITHUB_TOKEN="${GITHUB_TOKEN:?GITHUB_TOKEN is required}"
           git add -f .market_state.bin .signals_latest.json 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No state changes to commit."
@@ -76,9 +87,9 @@ jobs:
           fi
           git commit -m "chore(state): update quant market snapshot [skip ci]"
           for attempt in 1 2 3 4 5; do
-            git fetch origin main
+            git -c http.extraheader="AUTHORIZATION: bearer ${GITHUB_TOKEN}" fetch origin main
             if git rebase origin/main; then
-              if git push origin HEAD:main; then
+              if git -c http.extraheader="AUTHORIZATION: bearer ${GITHUB_TOKEN}" push origin HEAD:main; then
                 echo "State snapshot committed successfully."
                 exit 0
               fi
@@ -87,5 +98,5 @@ jobs:
             fi
             sleep $((attempt * 2))
           done
-          echo "Warning: Could not push state changes, continuing."
-          exit 0
+          echo "ERROR: Could not push state changes after all retries." >&2
+          exit 1
