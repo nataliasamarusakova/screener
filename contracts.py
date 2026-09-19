@@ -128,3 +128,6 @@ class MarketStateSnapshot(msgspec.Struct, gc=False):
     low_24h: float = 0.0       # 24h low — used as swing low reference for Wyckoff sweep detection
     high_24h: float = 0.0      # 24h high — used as swing high reference for Wyckoff sweep detection
     whale_sentiment_z: float = 0.0
+    # FIX [C1]: History buffers for CVD divergence detection (need 4-12 points minimum)
+    cvd_history_5m: tuple = ()  # Tuple of last N CVD values (5m snapshots)
+    price_history_5m: tuple = ()  # Tuple of last N prices (5m snapshots)

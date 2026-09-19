@@ -392,7 +392,16 @@ class BinanceFuturesIngestion:
         await asyncio.sleep(0.3)
         snapshot = await self.fetch_l2_snapshot(symbol, limit=1000)
         if snapshot:
-            book.apply_snapshot(snapshot)
+            success = book.apply_snapshot(snapshot)
+            # FIX [C7]: If buffer was empty (apply_snapshot returned False), schedule retry
+            if not success and book.state == OrderBookFSMState.BUFFERING:
+                logger.info(f"[{symbol}] Buffer exhausted, scheduling resync in 0.5s...")
+                await asyncio.sleep(0.5)
+                # Fetch new snapshot and retry
+                snapshot_retry = await self.fetch_l2_snapshot(symbol, limit=1000)
+                if snapshot_retry:
+                    book.apply_snapshot(snapshot_retry)
+            
             if self.on_book and book.state == OrderBookFSMState.IN_SYNC:
                 snap = book.get_snapshot(depth=10)
                 if snap:
@@ -528,6 +537,12 @@ class BinanceFuturesIngestion:
 
         best_bid = raw_bids[0][0]
         best_ask = raw_asks[0][0]
+        
+        # FIX [C4]: Check for crossed book (best_bid >= best_ask) - same as FSM get_snapshot
+        if best_bid >= best_ask:
+            logger.warning(f"[{symbol}] Crossed book detected in REST snapshot: best_bid={best_bid} >= best_ask={best_ask}")
+            return None
+        
         mid = (best_bid + best_ask) * 0.5
         spread = best_ask - best_bid
         spread_bps = (spread / mid * 10000.0) if mid > 0 else 0.0

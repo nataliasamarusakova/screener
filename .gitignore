@@ -1,8 +1,42 @@
+# Compiled Python files
+*.pyc
 __pycache__/
-*.py[cod]
-*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+
+# Environment files
+.env
+.env.local
+*.env.*
+
+# Coverage reports
+.coverage
+coverage/
+htmlcov/
+
+# Python cache
+.mypy_cache/
 .pytest_cache/
-.market_state.bin*
-.signals_latest.json
-.alert_cache.json
-cron.log
+
+# Distribution artifacts
+dist/
+build/
+*.egg-info/
+
+# Editors
+.vscode/
+.idea/
+
+# System files
+.DS_Store
+Thumbs.db

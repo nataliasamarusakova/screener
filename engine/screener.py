@@ -225,37 +225,62 @@ class QuantScreener:
                     vpin = 0.3
 
                 # CVD Divergence Check
-                if p_snap is not None:
-                    prices_arr = np.array([p_snap.last_price, last_price], dtype=np.float64)
-                    cvd_arr = np.array([p_snap.cumulative_cvd_5m, cvd], dtype=np.float64)
-                    div_score, _ = detect_cvd_divergence_jit(prices_arr, cvd_arr, lookback=2)
-                else:
-                    div_score = 0.0
+                # FIX [C1]: Need at least 4-12 points of history for meaningful divergence detection.
+                # Previously: only 2 points (prev + current) were passed with lookback=2,
+                # but detect_cvd_divergence_jit returns 0.0 when n < 4.
+                # Solution: Build history from stored state if available, otherwise skip.
+                div_score = 0.0
+                if p_snap is not None and hasattr(p_snap, 'cvd_history_5m') and p_snap.cvd_history_5m:
+                    # Use stored 5m CVD history (should have 4-12 points)
+                    cvd_hist = list(p_snap.cvd_history_5m) + [cvd]
+                    price_hist = list(p_snap.price_history_5m) + [last_price]
+                    if len(cvd_hist) >= 4:
+                        prices_arr = np.array(price_hist[-12:], dtype=np.float64)  # Last 12 points max
+                        cvd_arr = np.array(cvd_hist[-12:], dtype=np.float64)
+                        lookback = min(6, len(prices_arr) - 1)  # Use 6 or less depending on data
+                        div_score, _ = detect_cvd_divergence_jit(prices_arr, cvd_arr, lookback=lookback)
 
                 # Liquidity Sweep & Reclaim Check (Wyckoff Spring / Upthrust)
-                # Swing reference levels: use PREVIOUS cycle's 24h low/high stored in state.
-                # Using prev_close (p_snap.last_price) as a swing level was incorrect —
-                # a close price has no special significance as a stop-loss cluster level.
-                # The 24h low/high represent real structural extremes where stops accumulate.
+                # FIX [C2]: Use 5m OHLC from historical bars, not 24h ticker extremes.
+                # Previously: high_price/low_price were 24h extremes from ticker, causing false
+                # sweep detection at 24h window boundaries.
+                # Solution: Store and use actual 5m swing highs/lows from recent bars.
+                # For now, we use a conservative approach: only detect sweeps if we have
+                # stored swing levels from previous cycles that are distinct from current 24h range.
+                
+                has_sweep_reclaim = False
                 if p_snap and p_snap.low_24h > 0.0 and p_snap.high_24h > 0.0:
-                    # Use stored prior period 24h extremes as swing reference
-                    recent_low_swing = p_snap.low_24h
-                    recent_high_swing = p_snap.high_24h
+                    # Check if 24h extremes are meaningfully different from current bar
+                    # to avoid false positives at 24h window boundaries
+                    swing_range_pct = ((p_snap.high_24h - p_snap.low_24h) / p_snap.low_24h) * 100.0
+                    curr_range_pct = ((high_price - low_price) / low_price) * 100.0
+                    
+                    # Only use 24h extremes as swing levels if they represent a wider range
+                    # than the current bar (i.e., not just boundary artifacts)
+                    if swing_range_pct > curr_range_pct * 1.5:  # 24h range should be significantly wider
+                        recent_low_swing = p_snap.low_24h
+                        recent_high_swing = p_snap.high_24h
+                    else:
+                        # Fall back to current bar - no sweep detection this cycle
+                        recent_low_swing = low_price
+                        recent_high_swing = high_price
                 else:
-                    # First run: use current 24h low/high (no sweep detection on cold start)
+                    # First run: no prior state, skip sweep detection
                     recent_low_swing = low_price
                     recent_high_swing = high_price
 
-                sweep_event = self.sweep_detector.detect(
-                    symbol=symbol,
-                    current_price=last_price,
-                    current_high=high_price,
-                    current_low=low_price,
-                    recent_swing_high=recent_high_swing,
-                    recent_swing_low=recent_low_swing,
-                    cvd_delta=cvd,
-                )
-                has_sweep_reclaim = sweep_event is not None and sweep_event.is_confirmed
+                # Only attempt sweep detection if swing levels are meaningful
+                if recent_low_swing != low_price or recent_high_swing != high_price:
+                    sweep_event = self.sweep_detector.detect(
+                        symbol=symbol,
+                        current_price=last_price,
+                        current_high=high_price,
+                        current_low=low_price,
+                        recent_swing_high=recent_high_swing,
+                        recent_swing_low=recent_low_swing,
+                        cvd_delta=cvd,
+                    )
+                    has_sweep_reclaim = sweep_event is not None and sweep_event.is_confirmed
 
                 # Synthetic Liquidation Check
                 liq = self.liq_detector.detect(
@@ -348,6 +373,16 @@ class QuantScreener:
                 )
                 signals.append(sig)
 
+                # FIX [C1]: Maintain rolling 5m CVD/price history for divergence detection
+                # Keep last N=12 points (enough for lookback=6 with n>=4 requirement)
+                MAX_HISTORY = 12
+                if p_snap is not None and hasattr(p_snap, 'cvd_history_5m') and p_snap.cvd_history_5m:
+                    cvd_hist = list(p_snap.cvd_history_5m)[-MAX_HISTORY+1:] + [cvd]
+                    price_hist = list(p_snap.price_history_5m)[-MAX_HISTORY+1:] + [last_price]
+                else:
+                    cvd_hist = [cvd]
+                    price_hist = [last_price]
+
                 new_snapshots.append(
                     MarketStateSnapshot(
                         symbol=symbol,
@@ -364,6 +399,8 @@ class QuantScreener:
                         low_24h=low_price,
                         high_24h=high_price,
                         whale_sentiment_z=z_whale,
+                        cvd_history_5m=tuple(cvd_hist[-MAX_HISTORY:]),
+                        price_history_5m=tuple(price_hist[-MAX_HISTORY:]),
                     )
                 )
 
