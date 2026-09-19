@@ -71,6 +71,22 @@ class MCPServer:
         risk_pct: float = 1.0,
     ) -> Dict[str, Any]:
         """Tool: Computes mathematically sound position sizing based on invalidation distance."""
+        # FIX [C6]: Validate signal_type whitelist and input types
+        if signal_type not in ("STRONG_LONG", "STRONG_SHORT"):
+            return {"error": f"Invalid signal_type '{signal_type}'. Must be 'STRONG_LONG' or 'STRONG_SHORT'."}
+        
+        try:
+            entry_price = float(entry_price)
+            invalidation_price = float(invalidation_price)
+            target_price = float(target_price)
+            account_capital_usdt = float(account_capital_usdt)
+            risk_pct = float(risk_pct)
+        except (TypeError, ValueError) as exc:
+            return {"error": f"Invalid numeric parameters: {exc}"}
+        
+        if entry_price <= 0 or invalidation_price <= 0 or target_price <= 0 or account_capital_usdt <= 0:
+            return {"error": "All price and capital values must be positive."}
+        
         self.risk_engine.risk_per_trade_pct = risk_pct
         rec = self.risk_engine.calculate_sizing(
             symbol=symbol,

@@ -44,15 +44,19 @@ def compute_deflated_sharpe_ratio(
     3. Sample length T.
 
     Returns: (DSR probability in [0, 1], skewness, kurtosis)
+    
+    FIX [C5]: The observed_sr should be per-period Sharpe (not annualized) when returns
+    are per-period. Annualization factors must be consistent between SR calculation
+    and DSR adjustment.
     """
     T = len(returns)
     if T < 5 or observed_sr == 0.0:
-        return 0.0, 0.0, 3.0
+        return 0.0, 0.0, 0.0  # excess kurtosis = 0 for empty
 
     mean_r = np.mean(returns)
     std_r = np.std(returns)
     if std_r <= 1e-12:
-        return 0.0, 0.0, 3.0
+        return 0.0, 0.0, 0.0
 
     # Calculate skewness and kurtosis
     diffs = returns - mean_r
@@ -62,7 +66,6 @@ def compute_deflated_sharpe_ratio(
     skewness = float(m3 / (std_r ** 3))
     # Bailey & López de Prado (2014) require EXCESS kurtosis γ₄ = (m4/σ⁴) - 3
     # (normal distribution → raw=3, excess=0).
-    # Using raw kurtosis here inflates SE(SR) → artificially deflates DSR probability.
     excess_kurtosis = float(m4 / (std_r ** 4)) - 3.0
 
     # Expected maximum Sharpe ratio under the null hypothesis (Euler-Mascheroni approx)
@@ -205,7 +208,11 @@ class QuantBacktester:
         std_ret = float(np.std(r_arr)) if len(r_arr) > 1 else 1.0
         ann_factor = math.sqrt(self.annualization_factor / holding_bars)
 
-        sharpe = (mean_ret / std_ret) * ann_factor if std_ret > 1e-9 else 0.0
+        sharpe_annualized = (mean_ret / std_ret) * ann_factor if std_ret > 1e-9 else 0.0
+        
+        # FIX [C5]: For DSR, use per-period Sharpe (not annualized) since returns are per-trade
+        # Bailey & López de Prado require consistent frequency between SR and returns
+        sharpe_per_period = (mean_ret / std_ret) if std_ret > 1e-9 else 0.0
 
         # Downside risk for Sortino
         downside_diffs = r_arr[r_arr < 0]
@@ -213,8 +220,9 @@ class QuantBacktester:
         sortino = (mean_ret / downside_std) * ann_factor if downside_std > 1e-9 else 0.0
 
         # Deflated Sharpe Ratio calculation
+        # Use per-period Sharpe with per-period returns (r_arr/100 converts % to decimal)
         dsr, skew, kurt = compute_deflated_sharpe_ratio(
-            observed_sr=sharpe, returns=r_arr / 100.0, n_trials=n_trials
+            observed_sr=sharpe_per_period, returns=r_arr / 100.0, n_trials=n_trials
         )
 
         return BacktestMetrics(
@@ -227,7 +235,7 @@ class QuantBacktester:
             max_drawdown_pct=round(max_dd_pct, 2),
             annualized_return_pct=round(mean_ret * (self.annualization_factor / holding_bars), 2),
             annualized_volatility_pct=round(std_ret * ann_factor, 2),
-            sharpe_ratio=round(sharpe, 2),
+            sharpe_ratio=round(sharpe_annualized, 2),
             sortino_ratio=round(sortino, 2),
             deflated_sharpe_ratio=round(dsr, 4),
             is_statistically_significant=(dsr >= 0.95),
