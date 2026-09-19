@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.market_state.bin*
+.signals_latest.json
+.alert_cache.json
+cron.log

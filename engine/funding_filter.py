@@ -1,0 +1,86 @@
+"""
+Funding Settlement Epoch Proximity & Countdown Filter.
+Protects against pre-funding frontrunning dumps and paying adverse funding fees
+in the final 15-25 minutes before 8h/4h settlement.
+"""
+from __future__ import annotations
+
+import time
+from typing import Optional, Tuple
+import msgspec
+
+
+class FundingGateResult(msgspec.Struct, gc=False):
+    symbol: str
+    minutes_to_settlement: float
+    is_in_epoch_window: bool             # True if < threshold minutes to settlement
+    allow_long: bool
+    allow_short: bool
+    gate_reason: str
+
+
+class FundingFilterEngine:
+    """
+    Evaluates time remaining until funding settlement and filters adverse positioning.
+    """
+
+    def __init__(self, proximity_threshold_minutes: float = 20.0) -> None:
+        self.proximity_threshold_minutes = proximity_threshold_minutes
+
+    def evaluate_funding_gate(
+        self,
+        symbol: str,
+        signal_type: str,
+        funding_rate_8h: float,
+        next_funding_time_ms: int,
+        current_time_ms: Optional[int] = None,
+    ) -> FundingGateResult:
+        """
+        Evaluates whether a trade is safe to execute relative to the next funding epoch.
+        """
+        now_ms = current_time_ms or int(time.time() * 1000)
+
+        if next_funding_time_ms <= now_ms:
+            # Settlement time in past or unknown
+            return FundingGateResult(
+                symbol=symbol,
+                minutes_to_settlement=480.0,
+                is_in_epoch_window=False,
+                allow_long=True,
+                allow_short=True,
+                gate_reason="PASSED",
+            )
+
+        minutes_to_settlement = (next_funding_time_ms - now_ms) / (60.0 * 1000.0)
+        is_in_window = minutes_to_settlement <= self.proximity_threshold_minutes
+
+        allow_long = True
+        allow_short = True
+        reason = "PASSED"
+
+        if is_in_window:
+            # Overheated positive funding: Longs pay Shorts
+            if funding_rate_8h >= 0.0003:  # +0.03%
+                if signal_type == "STRONG_LONG":
+                    allow_long = False
+                    reason = (
+                        f"BLOCKED_PRE_FUNDING_PAYOUT: Long pays {funding_rate_8h*100:+.3f}% "
+                        f"in {minutes_to_settlement:.1f}m (Pre-settlement dumping risk)"
+                    )
+            # Heavy negative funding: Shorts pay Longs
+            elif funding_rate_8h <= -0.0003:  # -0.03%
+                if signal_type == "STRONG_SHORT":
+                    allow_short = False
+                    reason = (
+                        f"BLOCKED_PRE_FUNDING_PAYOUT: Short pays {abs(funding_rate_8h)*100:+.3f}% "
+                        f"in {minutes_to_settlement:.1f}m (Pre-settlement squeeze risk)"
+                    )
+
+        return FundingGateResult(
+            symbol=symbol,
+            minutes_to_settlement=round(minutes_to_settlement, 1),
+            is_in_epoch_window=is_in_window,
+            allow_long=allow_long,
+            allow_short=allow_short,
+            gate_reason=reason,
+        )

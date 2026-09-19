@@ -1,0 +1,91 @@
+name: Quant Screener Engine
+
+on:
+  schedule:
+    # Trigger automatically every 5 minutes
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [run_quant_engine]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: quant-screener-run
+  cancel-in-progress: false
+
+jobs:
+  run-screener:
+    name: Execute 5-Min Quant Screener
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      TOP_N_SYMBOLS: "100"
+      SCAN_CONCURRENCY: "25"
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: main
+          persist-credentials: true
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Codebase syntax verification
+        run: python -m compileall -q .
+
+      - name: Execute pytest test suite
+        run: python -m pytest -q
+
+      - name: Run 5-Minute Quant Screener
+        run: python cron_runner.py
+
+      - name: Persist market state & latest signals
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f .market_state.bin .signals_latest.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+          git commit -m "chore(state): update quant market snapshot [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            if git rebase origin/main; then
+              if git push origin HEAD:main; then
+                echo "State snapshot committed successfully."
+                exit 0
+              fi
+            else
+              git rebase --abort 2>/dev/null || true
+            fi
+            sleep $((attempt * 2))
+          done
+          echo "Warning: Could not push state changes, continuing."
+          exit 0
