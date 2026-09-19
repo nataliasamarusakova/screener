@@ -40,10 +40,15 @@ class CEXCostModel:
         base_latency_ms: int = 50,       # Approximate network + matching engine transit
         adverse_selection_factor: float = 1.2,
     ) -> None:
-        self.maker_fee_bps = maker_fee_bps
-        self.taker_fee_bps = taker_fee_bps
-        self.base_latency_ms = base_latency_ms
-        self.adverse_selection_factor = adverse_selection_factor
+        values = (maker_fee_bps, taker_fee_bps, base_latency_ms, adverse_selection_factor)
+        if not all(math.isfinite(float(x)) for x in values):
+            raise ValueError("Execution cost parameters must be finite")
+        if maker_fee_bps < 0.0 or taker_fee_bps < 0.0 or base_latency_ms < 0 or adverse_selection_factor < 0.0:
+            raise ValueError("Execution cost parameters must be non-negative")
+        self.maker_fee_bps = float(maker_fee_bps)
+        self.taker_fee_bps = float(taker_fee_bps)
+        self.base_latency_ms = int(base_latency_ms)
+        self.adverse_selection_factor = float(adverse_selection_factor)
 
     def simulate_execution(
         self,
@@ -66,8 +71,16 @@ class CEXCostModel:
         if side_norm not in ("BUY", "SELL"):
             raise ValueError(f"Invalid side: {side}. Must be 'BUY' or 'SELL'.")
 
+        if not math.isfinite(float(reference_price)) or reference_price <= 0.0:
+            raise ValueError("reference_price must be finite and positive")
+        if not math.isfinite(float(spread_bps)) or spread_bps < 0.0:
+            raise ValueError("spread_bps must be finite and non-negative")
+        if decision_timestamp_ms is not None and decision_timestamp_ms < 0:
+            raise ValueError("decision_timestamp_ms must be non-negative")
         lat_ms = latency_ms if latency_ms is not None else self.base_latency_ms
-        t_decision = decision_timestamp_ms or 0
+        if not isinstance(lat_ms, int) or lat_ms < 0:
+            raise ValueError("latency_ms must be a non-negative integer")
+        t_decision = decision_timestamp_ms if decision_timestamp_ms is not None else 0
         t_execution = t_decision + lat_ms
 
         # Enforce Point-in-Time causality
@@ -76,7 +89,7 @@ class CEXCostModel:
                 f"Lookahead bias violation! T_execution ({t_execution}) < T_decision ({t_decision})"
             )
 
-        half_spread_bps = max(0.5, spread_bps * 0.5)
+        half_spread_bps = spread_bps * 0.5
 
         if is_market_order:
             # Market order crosses the spread and pays adverse selection

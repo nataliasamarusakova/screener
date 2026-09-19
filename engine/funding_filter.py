@@ -5,6 +5,7 @@ in the final 15-25 minutes before 8h/4h settlement.
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import Optional, Tuple
 import msgspec
@@ -38,17 +39,40 @@ class FundingFilterEngine:
         """
         Evaluates whether a trade is safe to execute relative to the next funding epoch.
         """
-        now_ms = current_time_ms or int(time.time() * 1000)
+        now_ms = current_time_ms if current_time_ms is not None else int(time.time() * 1000)
 
-        if next_funding_time_ms <= now_ms:
-            # Settlement time in past or unknown
+        try:
+            funding_rate_8h = float(funding_rate_8h)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("funding_rate_8h must be numeric") from exc
+        if not math.isfinite(funding_rate_8h):
             return FundingGateResult(
                 symbol=symbol,
-                minutes_to_settlement=480.0,
+                minutes_to_settlement=0.0,
                 is_in_epoch_window=False,
-                allow_long=True,
-                allow_short=True,
-                gate_reason="PASSED",
+                allow_long=False,
+                allow_short=False,
+                gate_reason="INVALID_FUNDING_RATE",
+            )
+
+        if next_funding_time_ms <= 0:
+            return FundingGateResult(
+                symbol=symbol,
+                minutes_to_settlement=0.0,
+                is_in_epoch_window=False,
+                allow_long=False,
+                allow_short=False,
+                gate_reason="UNKNOWN_FUNDING_TIME",
+            )
+
+        if next_funding_time_ms <= now_ms:
+            return FundingGateResult(
+                symbol=symbol,
+                minutes_to_settlement=0.0,
+                is_in_epoch_window=False,
+                allow_long=False,
+                allow_short=False,
+                gate_reason="STALE_FUNDING_TIME",
             )
 
         minutes_to_settlement = (next_funding_time_ms - now_ms) / (60.0 * 1000.0)

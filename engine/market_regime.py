@@ -5,7 +5,8 @@ and prevents shorting during BTC impulse rallies.
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+import math
+from typing import Sequence, Tuple, Optional
 import msgspec
 
 
@@ -27,11 +28,13 @@ class MarketRegimeEngine:
         self,
         dump_threshold_5m_pct: float = -0.30,   # BTC dropping >= 0.3% in 5m triggers DUMP gate
         pump_threshold_5m_pct: float = +0.30,   # BTC rising >= 0.3% in 5m triggers PUMP gate
-        beta_alt_btc: float = 1.6,             # Typical altcoin beta to BTC
+        beta_alt_btc: Optional[float] = None,  # Legacy compatibility only; production path requires rolling beta.
         min_decoupled_rs_pct: float = 1.2,     # Minimum Relative Strength to bypass dump gate
     ) -> None:
         self.dump_threshold_5m_pct = dump_threshold_5m_pct
         self.pump_threshold_5m_pct = pump_threshold_5m_pct
+        if beta_alt_btc is not None and (not math.isfinite(beta_alt_btc) or beta_alt_btc <= 0.0):
+            raise ValueError("beta_alt_btc must be finite and positive when supplied")
         self.beta_alt_btc = beta_alt_btc
         self.min_decoupled_rs_pct = min_decoupled_rs_pct
 
@@ -88,13 +91,55 @@ class MarketRegimeEngine:
         self,
         alt_change_5m_pct: float,
         btc_change_5m_pct: float,
+        beta: Optional[float] = None,
     ) -> float:
         """
         Calculates Beta-adjusted Relative Strength (RS):
         RS = Delta P_alt - beta * Delta P_btc.
         Positive RS indicates the altcoin is outperforming BTC.
         """
-        return alt_change_5m_pct - (self.beta_alt_btc * btc_change_5m_pct)
+        beta_value = beta if beta is not None else self.beta_alt_btc
+        if beta_value is None:
+            raise ValueError("rolling beta is required for relative-strength calculation")
+        if not math.isfinite(beta_value) or beta_value <= 0.0:
+            raise ValueError("beta must be finite and positive")
+        return alt_change_5m_pct - (beta_value * btc_change_5m_pct)
+
+    @staticmethod
+    def calculate_rolling_beta(
+        alt_times_ms: Sequence[int],
+        alt_prices: Sequence[float],
+        btc_times_ms: Sequence[int],
+        btc_prices: Sequence[float],
+        min_samples: int = 24,
+    ) -> Optional[float]:
+        """Estimate beta from aligned historical 5m closes, excluding the current bar."""
+        if min_samples < 2:
+            raise ValueError("min_samples must be >= 2")
+        alt_map = {int(t): float(p) for t, p in zip(alt_times_ms, alt_prices) if float(p) > 0.0 and math.isfinite(float(p))}
+        btc_map = {int(t): float(p) for t, p in zip(btc_times_ms, btc_prices) if float(p) > 0.0 and math.isfinite(float(p))}
+        common = sorted(set(alt_map) & set(btc_map))
+        if len(common) < min_samples + 1:
+            return None
+
+        alt_rets = []
+        btc_rets = []
+        for prev_t, cur_t in zip(common[:-1], common[1:]):
+            if cur_t - prev_t != 5 * 60 * 1000:
+                continue
+            alt_rets.append((alt_map[cur_t] / alt_map[prev_t]) - 1.0)
+            btc_rets.append((btc_map[cur_t] / btc_map[prev_t]) - 1.0)
+        if len(alt_rets) < min_samples:
+            return None
+
+        alt_mean = sum(alt_rets) / len(alt_rets)
+        btc_mean = sum(btc_rets) / len(btc_rets)
+        cov = sum((a - alt_mean) * (b - btc_mean) for a, b in zip(alt_rets, btc_rets))
+        var_btc = sum((b - btc_mean) ** 2 for b in btc_rets)
+        if var_btc <= 1e-16:
+            return None
+        beta = cov / var_btc
+        return beta if math.isfinite(beta) and beta > 0.0 else None
 
     def check_signal_gate(
         self,
@@ -102,6 +147,7 @@ class MarketRegimeEngine:
         signal_type: str,
         btc_regime: BTCRegime,
         alt_change_5m_pct: float,
+        beta: Optional[float] = None,
     ) -> Tuple[bool, str]:
         """
         Gates signals based on BTC correlation.
@@ -109,8 +155,10 @@ class MarketRegimeEngine:
         """
         if symbol.upper() in ("BTCUSDT", "BTCUSDT_240628"):
             return True, "BTC_SELF"
+        if beta is None:
+            return False, "MISSING_ROLLING_BETA"
 
-        rs = self.calculate_relative_strength(alt_change_5m_pct, btc_regime.btc_change_5m_pct)
+        rs = self.calculate_relative_strength(alt_change_5m_pct, btc_regime.btc_change_5m_pct, beta=beta)
 
         if signal_type == "STRONG_LONG":
             if not btc_regime.allow_alt_longs:

@@ -7,7 +7,7 @@ Filters out:
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+import math
 import msgspec
 
 
@@ -41,6 +41,25 @@ class QualityFilter:
         """
         Validates whether a contract meets institutional liquidity and quality standards.
         """
+        if not all(math.isfinite(float(x)) for x in (quote_volume_24h, spread_bps, funding_rate_8h)):
+            return QualityGateResult(
+                symbol=symbol,
+                is_valid=False,
+                quote_volume_24h=quote_volume_24h,
+                spread_bps=spread_bps,
+                funding_rate_8h=funding_rate_8h,
+                rejection_reason="NON_FINITE_INPUT",
+            )
+        if quote_volume_24h < 0.0 or spread_bps < 0.0:
+            return QualityGateResult(
+                symbol=symbol,
+                is_valid=False,
+                quote_volume_24h=quote_volume_24h,
+                spread_bps=spread_bps,
+                funding_rate_8h=funding_rate_8h,
+                rejection_reason="INVALID_MARKET_DATA",
+            )
+
         # 1. Volume Gate
         if quote_volume_24h < self.min_24h_volume_usdt:
             return QualityGateResult(

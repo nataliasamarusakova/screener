@@ -1,11 +1,14 @@
 """
-Walk-Forward Backtesting Engine powered by Polars SIMD LazyFrames
-with Bailey & López de Prado Deflated Sharpe Ratio (DSR) & CEX Cost Modeling.
+Point-in-time walk-forward backtesting with CEX frictions and Deflated Sharpe Ratio.
+
+The backtest frequency is the frequency of the input bars (production: closed 5m bars).
+Trade PnL includes both execution price impact and exchange fees.
 """
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
+
 import msgspec
 import numpy as np
 import polars as pl
@@ -25,73 +28,73 @@ class BacktestMetrics(msgspec.Struct, gc=False):
     annualized_volatility_pct: float
     sharpe_ratio: float
     sortino_ratio: float
-    deflated_sharpe_ratio: float  # Bailey & López de Prado (2014) DSR probability in [0.0, 1.0]
-    is_statistically_significant: bool  # True if DSR >= 0.95 (5% significance level)
+    deflated_sharpe_ratio: float
+    is_statistically_significant: bool
     skewness: float
     kurtosis: float
+    n_trials: int = 0
 
 
 def compute_deflated_sharpe_ratio(
     observed_sr: float,
     returns: np.ndarray,
-    n_trials: int = 20,
-    var_trials_sr: float = 0.25,
+    n_trials: Optional[int] = None,
+    var_trials_sr: Optional[float] = None,
 ) -> Tuple[float, float, float]:
     """
-    Computes Deflated Sharpe Ratio (DSR) accounting for:
-    1. Multiple testing / selection bias (number of trials N).
-    2. Non-Gaussian returns (skewness and kurtosis).
-    3. Sample length T.
+    Compute DSR from per-period returns.
 
-    Returns: (DSR probability in [0, 1], skewness, kurtosis)
-    
-    FIX [C5]: The observed_sr should be per-period Sharpe (not annualized) when returns
-    are per-period. Annualization factors must be consistent between SR calculation
-    and DSR adjustment.
+    n_trials must be the actual number of model/parameter trials that were searched.
+    The multiple-testing variance must be supplied for n_trials > 1; there is no
+    defensible default in the engine.
+
+    Returns: (DSR probability [0,1], skewness, raw kurtosis).
     """
+    returns = np.asarray(returns, dtype=np.float64)
+    returns = returns[np.isfinite(returns)]
     T = len(returns)
-    if T < 5 or observed_sr == 0.0:
-        return 0.0, 0.0, 0.0  # excess kurtosis = 0 for empty
+    if T < 5:
+        return 0.0, 0.0, 3.0
+    if not math.isfinite(observed_sr):
+        return 0.0, 0.0, 3.0
 
-    mean_r = np.mean(returns)
-    std_r = np.std(returns)
+    mean_r = float(np.mean(returns))
+    std_r = float(np.std(returns, ddof=1))
     if std_r <= 1e-12:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 3.0
 
-    # Calculate skewness and kurtosis
     diffs = returns - mean_r
-    m3 = np.mean(diffs ** 3)
-    m4 = np.mean(diffs ** 4)
+    m3 = float(np.mean(diffs ** 3))
+    m4 = float(np.mean(diffs ** 4))
+    skewness = m3 / (std_r ** 3)
+    raw_kurtosis = m4 / (std_r ** 4)
 
-    skewness = float(m3 / (std_r ** 3))
-    # Bailey & López de Prado (2014) require EXCESS kurtosis γ₄ = (m4/σ⁴) - 3
-    # (normal distribution → raw=3, excess=0).
-    excess_kurtosis = float(m4 / (std_r ** 4)) - 3.0
+    if n_trials is None:
+        return 0.0, skewness, raw_kurtosis
+    if n_trials < 1:
+        raise ValueError("n_trials must be >= 1 when supplied")
 
-    # Expected maximum Sharpe ratio under the null hypothesis (Euler-Mascheroni approx)
     euler_mascheroni = 0.5772156649
-    if n_trials <= 1:
+    if n_trials == 1:
         sr_benchmark = 0.0
     else:
-        # Approximate expected maximum of N standard normal variables
+        if var_trials_sr is None or not math.isfinite(var_trials_sr) or var_trials_sr <= 0.0:
+            raise ValueError("var_trials_sr is required and must be positive when n_trials > 1")
         norm_inv1 = math.sqrt(2.0) * _erfinv(2.0 * (1.0 - 1.0 / n_trials) - 1.0)
         norm_inv2 = math.sqrt(2.0) * _erfinv(2.0 * (1.0 - 1.0 / (n_trials * math.e)) - 1.0)
-        sr_benchmark = math.sqrt(var_trials_sr) * ((1.0 - euler_mascheroni) * norm_inv1 + euler_mascheroni * norm_inv2)
+        sr_benchmark = math.sqrt(var_trials_sr) * (
+            (1.0 - euler_mascheroni) * norm_inv1 + euler_mascheroni * norm_inv2
+        )
 
-    # Standard error of the Sharpe ratio under non-normality (Bailey & LdP 2014, Eq.1):
-    # SE(SR) = sqrt( (1 - γ₃·SR + ((γ₄-1)/4)·SR²) / (T-1) )
-    # where γ₃ = skewness, γ₄ = excess kurtosis
-    denom_term = 1.0 - skewness * observed_sr + ((excess_kurtosis - 1.0) / 4.0) * (observed_sr ** 2)
+    # Bailey/López de Prado convention uses raw kurtosis gamma4 (normal ~= 3).
+    denom_term = 1.0 - skewness * observed_sr + ((raw_kurtosis - 1.0) / 4.0) * (observed_sr ** 2)
     if denom_term <= 0.0:
-        denom_term = 1.0
+        return 0.0, skewness, raw_kurtosis
+
     se_sr = math.sqrt(denom_term / (T - 1.0))
-
-    # Test statistic z
-    z_stat = (observed_sr - sr_benchmark) / se_sr if se_sr > 0 else 0.0
-
-    # Cumulative normal probability Phi(z)
+    z_stat = (observed_sr - sr_benchmark) / se_sr if se_sr > 0.0 else 0.0
     dsr = 0.5 * (1.0 + math.erf(z_stat / math.sqrt(2.0)))
-    return max(0.0, min(1.0, dsr)), skewness, excess_kurtosis
+    return max(0.0, min(1.0, dsr)), skewness, raw_kurtosis
 
 
 def _erfinv(y: float) -> float:
@@ -102,145 +105,210 @@ def _erfinv(y: float) -> float:
     ln1_y2 = math.log(1.0 - y * y)
     term1 = 2.0 / (math.pi * a) + ln1_y2 / 2.0
     val = term1 * term1 - ln1_y2 / a
-    return sgn * math.sqrt(math.sqrt(val) - term1)
+    return sgn * math.sqrt(max(0.0, math.sqrt(val) - term1))
 
 
 class QuantBacktester:
-    """
-    SIMD LazyFrame Walk-Forward Backtester with realistic CEX frictions.
-    """
+    """Backtester using closed-bar next-open entries and per-bar risk metrics."""
 
     def __init__(
         self,
         cost_model: Optional[CEXCostModel] = None,
-        annualization_factor: float = 365.0 * 24.0 * 12.0,  # 5-minute bars in a year
+        annualization_factor: float = 365.0 * 24.0 * 12.0,  # 5-minute bars/year; validated by timestamp cadence.
+        market_spread_bps: float = 1.5,  # Backtest input; TODO: replace with symbol/time-varying spread observations.
     ) -> None:
+        if not math.isfinite(float(annualization_factor)) or annualization_factor <= 0.0:
+            raise ValueError("annualization_factor must be finite and positive")
+        if not math.isfinite(float(market_spread_bps)) or market_spread_bps < 0.0:
+            raise ValueError("market_spread_bps must be finite and non-negative")
         self.cost_model = cost_model or CEXCostModel()
         self.annualization_factor = annualization_factor
+        self.market_spread_bps = market_spread_bps
+
+    @staticmethod
+    def _net_return_long(entry, exit_) -> float:
+        entry_fee = entry.fee_bps / 10000.0
+        exit_fee = exit_.fee_bps / 10000.0
+        return (
+            (exit_.executed_price * (1.0 - exit_fee))
+            - (entry.executed_price * (1.0 + entry_fee))
+        ) / entry.executed_price
+
+    @staticmethod
+    def _net_return_short(entry, exit_) -> float:
+        entry_fee = entry.fee_bps / 10000.0
+        exit_fee = exit_.fee_bps / 10000.0
+        return (entry.executed_price * (1.0 - entry_fee) - exit_.executed_price * (1.0 + exit_fee)) / entry.executed_price
 
     def run_backtest(
         self,
         df: pl.DataFrame,
         score_column: str = "composite_score",
         price_column: str = "close",
+        open_price_column: str = "open",
+        timestamp_column: str = "timestamp_ms",
         long_threshold: float = 75.0,
         short_threshold: float = -75.0,
-        holding_bars: int = 6,          # 30-minute default holding horizon (6 x 5m bars)
-        n_trials: int = 20,
+        holding_bars: int = 6,
+        n_trials: Optional[int] = None,
+        var_trials_sr: Optional[float] = None,
     ) -> BacktestMetrics:
         """
-        Executes vectorized backtest on Polars DataFrame with realistic slippage.
+        Signal on bar i executes at bar i+1 OPEN and exits at a later CLOSED bar.
+        The input must contain strictly increasing, gap-free 5m timestamps because
+        annualization_factor is explicitly the 5m bars/year convention.
+        Returns are fixed-notional per-bar PnL, including execution costs and fees;
+        inactive bars are zero returns.
         """
-        if df.is_empty() or score_column not in df.columns or price_column not in df.columns:
+        required = (score_column, price_column, open_price_column, timestamp_column)
+        if df.is_empty() or any(col not in df.columns for col in required):
+            if timestamp_column not in df.columns:
+                raise ValueError(f"Backtest requires {timestamp_column!r} with 5m timestamps")
+            return self._empty_metrics()
+        if holding_bars < 1:
             return self._empty_metrics()
 
-        prices = df[price_column].to_numpy()
-        scores = df[score_column].to_numpy()
+        timestamps = df[timestamp_column].cast(pl.Int64).to_numpy()
+        prices = df[price_column].cast(pl.Float64).to_numpy()
+        opens = df[open_price_column].cast(pl.Float64).to_numpy()
+        scores = df[score_column].cast(pl.Float64).to_numpy()
         n_bars = len(prices)
-
         if n_bars < holding_bars + 2:
             return self._empty_metrics()
+        if not (np.isfinite(prices).all() and np.isfinite(opens).all()):
+            return self._empty_metrics()
+        if np.any(prices <= 0.0) or np.any(opens <= 0.0):
+            return self._empty_metrics()
+        if len(timestamps) != n_bars or n_bars < 2:
+            return self._empty_metrics()
+        timestamp_diffs = np.diff(timestamps)
+        if not np.all(timestamp_diffs == 5 * 60 * 1000):
+            raise ValueError("Backtest timestamps must be strictly contiguous 5m bars")
 
-        trade_returns: List[float] = []
+        bar_returns = np.zeros(n_bars, dtype=np.float64)
+        trade_returns: list[float] = []
         i = 0
 
-        while i < n_bars - holding_bars:
+        while i < n_bars - holding_bars - 1:
             score = scores[i]
-            if score >= long_threshold:
-                # Enter Long at next bar's open/price with slippage
-                entry_ref = prices[i + 1]
+            if not math.isfinite(float(score)):
+                i += 1
+                continue
+
+            if score >= long_threshold or score <= short_threshold:
+                side = "BUY" if score >= long_threshold else "SELL"
+                entry_idx = i + 1
+                exit_idx = min(entry_idx + holding_bars, n_bars - 1)
+                entry_ref = float(opens[entry_idx])
+                exit_ref = float(prices[exit_idx])
+                if entry_ref <= 0.0 or exit_ref <= 0.0:
+                    i += 1
+                    continue
+
                 entry_exec = self.cost_model.simulate_execution(
-                    symbol="BTCUSDT", side="BUY", reference_price=entry_ref, spread_bps=1.5, is_market_order=True
-                ).executed_price
-
-                exit_idx = min(i + 1 + holding_bars, n_bars - 1)
-                exit_ref = prices[exit_idx]
+                    symbol="BTCUSDT",
+                    side=side,
+                    reference_price=entry_ref,
+                    spread_bps=self.market_spread_bps,
+                    is_market_order=True,
+                )
+                exit_side = "SELL" if side == "BUY" else "BUY"
                 exit_exec = self.cost_model.simulate_execution(
-                    symbol="BTCUSDT", side="SELL", reference_price=exit_ref, spread_bps=1.5, is_market_order=True
-                ).executed_price
+                    symbol="BTCUSDT",
+                    side=exit_side,
+                    reference_price=exit_ref,
+                    spread_bps=self.market_spread_bps,
+                    is_market_order=True,
+                )
 
-                pnl_pct = ((exit_exec - entry_exec) / entry_exec) * 100.0
-                trade_returns.append(pnl_pct)
-                i += holding_bars
-            elif score <= short_threshold:
-                # Enter Short at next bar's open/price with slippage
-                entry_ref = prices[i + 1]
-                entry_exec = self.cost_model.simulate_execution(
-                    symbol="BTCUSDT", side="SELL", reference_price=entry_ref, spread_bps=1.5, is_market_order=True
-                ).executed_price
+                net_return = (
+                    self._net_return_long(entry_exec, exit_exec)
+                    if side == "BUY"
+                    else self._net_return_short(entry_exec, exit_exec)
+                )
+                if not math.isfinite(net_return):
+                    i = exit_idx
+                    continue
 
-                exit_idx = min(i + 1 + holding_bars, n_bars - 1)
-                exit_ref = prices[exit_idx]
-                exit_exec = self.cost_model.simulate_execution(
-                    symbol="BTCUSDT", side="BUY", reference_price=exit_ref, spread_bps=1.5, is_market_order=True
-                ).executed_price
+                # Decompose the exact execution return into non-overlapping 5m marks.
+                # The denominator is the executed entry price, matching _net_return_*.
+                entry_fee = entry_exec.fee_bps / 10000.0
+                exit_fee = exit_exec.fee_bps / 10000.0
+                entry_exec_price = entry_exec.executed_price
+                if side == "BUY":
+                    bar_returns[entry_idx] += (float(prices[entry_idx]) - entry_exec_price * (1.0 + entry_fee)) / entry_exec_price
+                    for j in range(entry_idx + 1, exit_idx):
+                        bar_returns[j] += (float(prices[j]) - float(prices[j - 1])) / entry_exec_price
+                    bar_returns[exit_idx] += (exit_exec.executed_price * (1.0 - exit_fee) - float(prices[exit_idx - 1])) / entry_exec_price
+                else:
+                    bar_returns[entry_idx] += (entry_exec_price * (1.0 - entry_fee) - float(prices[entry_idx])) / entry_exec_price
+                    for j in range(entry_idx + 1, exit_idx):
+                        bar_returns[j] += (float(prices[j - 1]) - float(prices[j])) / entry_exec_price
+                    bar_returns[exit_idx] += (float(prices[exit_idx - 1]) - exit_exec.executed_price * (1.0 + exit_fee)) / entry_exec_price
 
-                pnl_pct = ((entry_exec - exit_exec) / entry_exec) * 100.0
-                trade_returns.append(pnl_pct)
-                i += holding_bars
+                trade_returns.append(net_return)
+                i = exit_idx
             else:
                 i += 1
 
         if not trade_returns:
             return self._empty_metrics()
 
-        r_arr = np.array(trade_returns, dtype=np.float64)
-        wins = r_arr[r_arr > 0]
-        losses = r_arr[r_arr < 0]
-
+        r_arr = np.asarray(trade_returns, dtype=np.float64)
+        wins = r_arr[r_arr > 0.0]
+        losses = r_arr[r_arr < 0.0]
         total_trades = len(r_arr)
         win_trades = len(wins)
         loss_trades = len(losses)
-        win_rate = (win_trades / total_trades) * 100.0 if total_trades > 0 else 0.0
 
-        gross_profit = float(np.sum(wins)) if len(wins) > 0 else 0.0
-        gross_loss = abs(float(np.sum(losses))) if len(losses) > 0 else 1e-6
-        profit_factor = gross_profit / gross_loss
+        gross_profit = float(np.sum(wins)) if len(wins) else 0.0
+        gross_loss = abs(float(np.sum(losses)))
+        profit_factor = gross_profit / max(gross_loss, 1e-12)
 
-        # Equity Curve and Max Drawdown
-        equity_curve = np.cumprod(1.0 + (r_arr / 100.0))
+        equity_curve = 1.0 + np.cumsum(bar_returns)
+        if not np.isfinite(equity_curve).all() or equity_curve[-1] <= 0.0:
+            return self._empty_metrics()
         peak = np.maximum.accumulate(equity_curve)
         drawdowns = (peak - equity_curve) / peak
-        max_dd_pct = float(np.max(drawdowns)) * 100.0 if len(drawdowns) > 0 else 0.0
+        max_dd_pct = float(np.max(drawdowns)) * 100.0
+        total_net_pnl_pct = (equity_curve[-1] - 1.0) * 100.0
 
-        # Annualized Metrics
-        mean_ret = float(np.mean(r_arr))
-        std_ret = float(np.std(r_arr)) if len(r_arr) > 1 else 1.0
-        ann_factor = math.sqrt(self.annualization_factor / holding_bars)
+        mean_bar = float(np.mean(bar_returns))
+        std_bar = float(np.std(bar_returns, ddof=1)) if n_bars > 1 else 0.0
+        sharpe_per_period = mean_bar / std_bar if std_bar > 1e-12 else 0.0
+        sharpe_annualized = sharpe_per_period * math.sqrt(self.annualization_factor)
 
-        sharpe_annualized = (mean_ret / std_ret) * ann_factor if std_ret > 1e-9 else 0.0
-        
-        # FIX [C5]: For DSR, use per-period Sharpe (not annualized) since returns are per-trade
-        # Bailey & López de Prado require consistent frequency between SR and returns
-        sharpe_per_period = (mean_ret / std_ret) if std_ret > 1e-9 else 0.0
+        downside = np.minimum(bar_returns, 0.0)
+        downside_deviation = math.sqrt(float(np.mean(downside ** 2)))
+        sortino = (mean_bar / downside_deviation) * math.sqrt(self.annualization_factor) if downside_deviation > 1e-12 else 0.0
 
-        # Downside risk for Sortino
-        downside_diffs = r_arr[r_arr < 0]
-        downside_std = float(np.std(downside_diffs)) if len(downside_diffs) > 1 else std_ret
-        sortino = (mean_ret / downside_std) * ann_factor if downside_std > 1e-9 else 0.0
-
-        # Deflated Sharpe Ratio calculation
-        # Use per-period Sharpe with per-period returns (r_arr/100 converts % to decimal)
         dsr, skew, kurt = compute_deflated_sharpe_ratio(
-            observed_sr=sharpe_per_period, returns=r_arr / 100.0, n_trials=n_trials
+            observed_sr=sharpe_per_period,
+            returns=bar_returns,
+            n_trials=n_trials,
+            var_trials_sr=var_trials_sr,
         )
+
+        annualized_return_pct = float(total_net_pnl_pct * (self.annualization_factor / n_bars))
+        annualized_volatility_pct = std_bar * math.sqrt(self.annualization_factor) * 100.0
 
         return BacktestMetrics(
             total_trades=total_trades,
             winning_trades=win_trades,
             losing_trades=loss_trades,
-            win_rate_pct=round(win_rate, 2),
-            total_net_pnl_pct=round(float(np.sum(r_arr)), 2),
+            win_rate_pct=round((win_trades / total_trades) * 100.0, 2),
+            total_net_pnl_pct=round(total_net_pnl_pct, 2),
             profit_factor=round(profit_factor, 2),
             max_drawdown_pct=round(max_dd_pct, 2),
-            annualized_return_pct=round(mean_ret * (self.annualization_factor / holding_bars), 2),
-            annualized_volatility_pct=round(std_ret * ann_factor, 2),
+            annualized_return_pct=round(annualized_return_pct, 2),
+            annualized_volatility_pct=round(annualized_volatility_pct, 2),
             sharpe_ratio=round(sharpe_annualized, 2),
             sortino_ratio=round(sortino, 2),
             deflated_sharpe_ratio=round(dsr, 4),
-            is_statistically_significant=(dsr >= 0.95),
+            is_statistically_significant=(dsr >= 0.95) if n_trials is not None else False,
             skewness=round(skew, 2),
             kurtosis=round(kurt, 2),
+            n_trials=int(n_trials or 0),
         )
 
     def _empty_metrics(self) -> BacktestMetrics:
@@ -260,4 +328,5 @@ class QuantBacktester:
             is_statistically_significant=False,
             skewness=0.0,
             kurtosis=3.0,
+            n_trials=0,
         )

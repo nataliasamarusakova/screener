@@ -1,21 +1,23 @@
 """
-Quantitative Screener Engine for 100+ Binance Futures Contracts.
-Orchestrates:
-1. Parallel async ingestion of 100+ contracts.
-2. BTC Market Regime & Altcoin Relative Strength (Beta) Filter.
-3. Liquidity & Anti-Spoofing Quality Filter.
-4. Funding Settlement Epoch Countdown Gate.
-5. Wyckoff Spring & Upthrust Liquidity Sweep Reclaim.
-6. Smart Money vs. Retail Sentiment Divergence.
-7. JIT Microstructure, Synthetic Liquidations & Factor Attribution.
+Production 5-minute Quant Screener.
+
+The signal path is fail-closed:
+- current-cycle data uses one completed 5m candle boundary;
+- OI/CVD/VPIN windows are explicit, not 'last N trades';
+- empirical Z-scores use only persisted observations strictly before the decision candle;
+- missing/non-finite data produces no signal;
+- state is still persisted during cold start so distributions can warm up.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import os
+import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import msgspec
 import numpy as np
@@ -32,9 +34,10 @@ from engine.quality_filter import QualityFilter
 from engine.sentiment import SentimentEngine
 from engine.signals import QuantSignalEngine
 
+logger = logging.getLogger("screener")
+
 
 class ScreenerResult(msgspec.Struct, gc=False):
-    """Encapsulates the complete result of a 5-minute screener cycle."""
     timestamp_ms: int
     duration_sec: float
     total_scanned: int
@@ -43,12 +46,14 @@ class ScreenerResult(msgspec.Struct, gc=False):
     synthetic_liqs_count: int
     btc_regime: str
     btc_change_5m_pct: float
+    successful_symbols: int = 0       # Data-valid symbols with a persisted snapshot.
+    rejected_symbols: int = 0         # Fail-closed data-quality/warmup rejects.
+    failed_symbols: int = 0           # Unexpected exceptions.
+    signal_ready_symbols: int = 0     # Symbols with a fully-computed composite signal.
 
 
 class QuantScreener:
-    """
-    High-performance, pure-Python screener scanning 100+ contracts in parallel.
-    """
+    """Bounded asynchronous screener for the highest-volume USDT perpetuals."""
 
     def __init__(
         self,
@@ -59,17 +64,34 @@ class QuantScreener:
         self.state_file = state_file
         self.concurrency_limit = concurrency_limit
         self.top_n_symbols = top_n_symbols
+        self.history_bars = int(os.getenv("SIGNAL_HISTORY_BARS", "60"))
+        self.z_history_min_samples = int(os.getenv("SIGNAL_Z_MIN_SAMPLES", "24"))
+        self.cvd_lookback = int(os.getenv("CVD_LOOKBACK_BARS", "6"))
+        self.vpin_window_baskets = int(os.getenv("VPIN_WINDOW_BASKETS", "10"))  # TODO: calibrate on labelled data.
+        self.beta_min_samples = int(os.getenv("BETA_MIN_SAMPLES", "24"))
+        self.atr_lookback = int(os.getenv("ATR_LOOKBACK_BARS", "12"))
+        self.failure_ratio_limit = float(os.getenv("SCAN_FAILURE_RATIO_LIMIT", "0.10"))
+
+        if self.history_bars <= self.z_history_min_samples:
+            raise ValueError("SIGNAL_HISTORY_BARS must be greater than SIGNAL_Z_MIN_SAMPLES")
+        if self.vpin_window_baskets < 1 or self.cvd_lookback < 2 or self.beta_min_samples < 2 or self.atr_lookback < 2:
+            raise ValueError("Invalid screener window configuration")
+        if not (0.0 <= self.failure_ratio_limit < 1.0):
+            raise ValueError("SCAN_FAILURE_RATIO_LIMIT must be in [0, 1)")
+
         self.ingestion = BinanceFuturesIngestion(symbols=[])
-        self.signal_engine = QuantSignalEngine()
+        self.signal_engine = QuantSignalEngine(z_history_min_samples=self.z_history_min_samples)
         self.liq_detector = SyntheticLiquidationDetector()
         self.regime_engine = MarketRegimeEngine()
         self.funding_filter = FundingFilterEngine(proximity_threshold_minutes=20.0)
-        self.quality_filter = QualityFilter(min_24h_volume_usdt=10_000_000.0, max_spread_bps=3.5)
+        self.quality_filter = QualityFilter(
+            min_24h_volume_usdt=float(os.getenv("MIN_24H_VOLUME_USDT", "10000000")),
+            max_spread_bps=float(os.getenv("MAX_SPREAD_BPS", "3.5")),
+        )
         self.sweep_detector = LiquiditySweepDetector()
         self.sentiment_engine = SentimentEngine()
 
     def load_previous_state(self) -> Dict[str, MarketStateSnapshot]:
-        """Loads state snapshot from previous 5m cron cycle."""
         if not self.state_file.exists():
             return {}
         try:
@@ -77,357 +99,524 @@ class QuantScreener:
             if raw:
                 items = msgspec.json.decode(raw, type=List[MarketStateSnapshot])
                 return {item.symbol: item for item in items}
-        except Exception as exc:
-            print(f"⚠️ [SCREENER] Could not parse state file: {exc}")
+        except (msgspec.DecodeError, OSError, TypeError, ValueError) as exc:
+            logger.error("state_load_failed path=%s error=%s", self.state_file, exc)
         return {}
 
     def save_current_state(self, snapshots: List[MarketStateSnapshot]) -> None:
-        """Atomically saves state snapshot to disk via temp file."""
+        """Atomically and durably replace state with a unique fsynced temp file."""
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
         encoded = msgspec.json.encode(snapshots)
-        temp_file = self.state_file.with_suffix(".tmp")
-        temp_file.write_bytes(encoded)
-        temp_file.replace(self.state_file)
+        fd, temp_name = tempfile.mkstemp(
+            dir=str(self.state_file.parent),
+            prefix=f".{self.state_file.name}.",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "wb") as temp:
+                temp.write(encoded)
+                temp.flush()
+                os.fsync(temp.fileno())
+            os.replace(temp_name, self.state_file)
+            dir_fd = os.open(self.state_file.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        finally:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _parse_kline(row: list) -> Tuple[int, float, float, float, float, float, float, float]:
+        if not isinstance(row, list) or len(row) < 12:
+            raise ValueError("Malformed kline")
+        open_ms = int(row[0])
+        open_price = float(row[1])
+        high = float(row[2])
+        low = float(row[3])
+        close = float(row[4])
+        volume = float(row[5])
+        taker_buy = float(row[9])
+        taker_sell = volume - taker_buy
+        values = (open_price, high, low, close, volume, taker_buy, taker_sell)
+        if not all(math.isfinite(x) for x in values):
+            raise ValueError("Non-finite kline")
+        if min(open_price, high, low, close) <= 0.0 or volume < 0.0 or taker_buy < 0.0 or taker_sell < 0.0:
+            raise ValueError("Invalid kline values")
+        return open_ms, open_price, high, low, close, volume, taker_buy, taker_sell
+
+    @classmethod
+    def _atr_pct(cls, klines: List[list], lookback: int) -> float:
+        parsed = [cls._parse_kline(row) for row in klines[-lookback:]]
+        if len(parsed) < lookback:
+            raise ValueError("Insufficient ATR history")
+        true_ranges: List[float] = []
+        prev_close: Optional[float] = None
+        for _, _, high, low, close, *_ in parsed:
+            tr = high - low if prev_close is None else max(high - low, abs(high - prev_close), abs(low - prev_close))
+            true_ranges.append(tr)
+            prev_close = close
+        return (sum(true_ranges) / len(true_ranges)) / parsed[-1][4]
 
     async def scan(self) -> Tuple[List[SignalEvent], List[SyntheticLiquidation], ScreenerResult]:
-        """
-        Executes full institutional screener cycle with all gates and filters.
-        """
         t0 = time.time()
         prev_state = self.load_previous_state()
-
-        # Step 1: Fetch 24hr tickers (Single HTTP call)
-        all_tickers = await self.ingestion.fetch_universe_tickers()
-        if not all_tickers:
-            await self.ingestion.stop()
-            raise RuntimeError("Failed to retrieve 24hr tickers from Binance Futures.")
-
-        # Rank universe by quoteVolume
-        sorted_symbols = sorted(
-            all_tickers.keys(),
-            key=lambda s: float(all_tickers[s].get("quoteVolume", 0.0)),
-            reverse=True,
-        )[:self.top_n_symbols]
-
-        # Step 2: Fetch Premium Index (Single HTTP call)
-        all_premium = await self.ingestion.fetch_universe_premium_index()
-
-        # Step 3: Evaluate Bitcoin Macro Regime
-        btc_ticker = all_tickers.get("BTCUSDT", {})
-        btc_last_p = float(btc_ticker.get("lastPrice", 0.0))
-        btc_prev_p = prev_state.get("BTCUSDT").last_price if "BTCUSDT" in prev_state else btc_last_p
-        btc_24h_chg = float(btc_ticker.get("priceChangePercent", 0.0))
-
-        btc_regime = self.regime_engine.evaluate_btc_regime(
-            btc_last_price=btc_last_p,
-            btc_prev_price=btc_prev_p,
-            btc_change_24h_pct=btc_24h_chg,
-        )
-
-        # Step 4: Parallel bounded scan across universe
-        sem = asyncio.Semaphore(self.concurrency_limit)
         signals: List[SignalEvent] = []
         synthetic_liqs: List[SyntheticLiquidation] = []
-        new_snapshots: List[MarketStateSnapshot] = []
 
-        async def analyze_symbol(symbol: str) -> None:
-            async with sem:
-                ticker = all_tickers.get(symbol, {})
-                premium = all_premium.get(symbol, {})
+        try:
+            all_tickers = await self.ingestion.fetch_universe_tickers()
+            if not all_tickers:
+                raise RuntimeError("Failed to retrieve 24h tickers from Binance Futures")
 
-                last_price = float(ticker.get("lastPrice", 0.0))
-                if last_price <= 0.0:
-                    return
+            sorted_symbols = sorted(
+                all_tickers.keys(),
+                key=lambda s: float(all_tickers[s].get("quoteVolume", 0.0)),
+                reverse=True,
+            )[:self.top_n_symbols]
+            all_premium = await self.ingestion.fetch_universe_premium_index()
+            funding_info = await self.ingestion.fetch_universe_funding_info()
+            if funding_info is None:
+                raise RuntimeError("Funding interval metadata unavailable; refusing to normalize funding to 8h")
 
-                quote_vol_24h = float(ticker.get("quoteVolume", 0.0))
-                high_price = float(ticker.get("highPrice", last_price * 1.01))
-                low_price = float(ticker.get("lowPrice", last_price * 0.99))
-                price_change_pct = float(ticker.get("priceChangePercent", 0.0))
+            if "BTCUSDT" not in all_tickers or "BTCUSDT" not in all_premium:
+                raise RuntimeError("BTC market data unavailable; cannot establish macro regime")
 
-                # Funding 8h & Basis spread
-                raw_funding = float(premium.get("lastFundingRate", 0.0))
-                mark_price = float(premium.get("markPrice", last_price))
-                index_price = float(premium.get("indexPrice", last_price))
-                next_funding_time_ms = int(premium.get("nextFundingTime", 0))
-                norm_8h_funding = (1.0 + raw_funding) - 1.0
-                basis_bps = ((mark_price - index_price) / index_price * 10000.0) if index_price > 0 else 0.0
+            interval_ms = 5 * 60 * 1000
+            decision_time_ms = int(time.time() * 1000)
+            now_ms = decision_time_ms
+            current_open_ms = (now_ms // interval_ms) * interval_ms
+            closed_open_ms = current_open_ms - interval_ms
+            closed_end_ms = current_open_ms - 1
+            kline_history = max(self.history_bars + 1, self.atr_lookback + 1)
 
-                # Open Interest
-                oi_data = await self.ingestion.fetch_symbol_open_interest(symbol)
-                curr_oi = float(oi_data.get("openInterest", 0.0)) if oi_data else 0.0
+            btc_klines = await self.ingestion.fetch_symbol_closed_5m_klines(
+                "BTCUSDT", closed_open_ms, history_bars=kline_history
+            )
+            if btc_klines is None:
+                raise RuntimeError("BTC 5m candle history unavailable")
+            btc_parsed = [self._parse_kline(row) for row in btc_klines]
+            btc_last_close = btc_parsed[-1][4]
+            btc_prev_close = btc_parsed[-2][4]
+            btc_change_5m_pct = (btc_last_close / btc_prev_close - 1.0) * 100.0
+            try:
+                btc_24h_chg = float(all_tickers["BTCUSDT"]["priceChangePercent"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError("BTC 24h price-change field is missing or malformed") from exc
+            if not math.isfinite(btc_24h_chg):
+                raise RuntimeError("Non-finite BTC 24h change")
 
-                p_snap = prev_state.get(symbol)
-                delta_oi_5m = (curr_oi - p_snap.open_interest) if p_snap else 0.0
+            btc_regime = self.regime_engine.evaluate_btc_regime(
+                btc_last_price=btc_last_close,
+                btc_prev_price=btc_prev_close,
+                btc_change_24h_pct=btc_24h_chg,
+            )
 
-                # Order Book Depth & Spread (Numba JIT)
-                ob = await self.ingestion.fetch_symbol_orderbook_top(symbol, limit=20)
-                spread_bps = ob.spread_bps if ob else 1.0
-                if ob and len(ob.bids) > 0 and len(ob.asks) > 0:
-                    bids_qty = np.array([q for _, q in ob.bids], dtype=np.float64)
-                    asks_qty = np.array([q for _, q in ob.asks], dtype=np.float64)
-                    obi = compute_weighted_obi_jit(bids_qty, asks_qty, decay=0.85)
-                else:
-                    obi = 0.0
+            sem = asyncio.Semaphore(self.concurrency_limit)
+            Result = Union[None, Tuple[Optional[SignalEvent], MarketStateSnapshot, Optional[SyntheticLiquidation]], Exception]
 
-                # Anti-Spoofing & Quality Gate
-                q_res = self.quality_filter.evaluate(
-                    symbol=symbol,
-                    quote_volume_24h=quote_vol_24h,
-                    spread_bps=spread_bps,
-                    funding_rate_8h=norm_8h_funding,
-                )
-                if not q_res.is_valid:
-                    # Skip low-liquidity or wide-spread spoofed books
-                    return
+            async def analyze_symbol(symbol: str) -> Result:
+                async with sem:
+                    try:
+                        ticker = all_tickers.get(symbol)
+                        premium = all_premium.get(symbol)
+                        if not ticker or not premium:
+                            return None
 
-                # Calculate 5m Price Change & Relative Strength vs BTC
-                alt_change_5m_pct = ((last_price - p_snap.last_price) / p_snap.last_price * 100.0) if p_snap else 0.0
-                rs_to_btc = self.regime_engine.calculate_relative_strength(
-                    alt_change_5m_pct=alt_change_5m_pct,
-                    btc_change_5m_pct=btc_regime.btc_change_5m_pct,
-                )
+                        try:
+                            quote_vol_24h = float(ticker["quoteVolume"])
+                            high_24h = float(ticker["highPrice"])
+                            low_24h = float(ticker["lowPrice"])
+                            price_change_pct_24h = float(ticker["priceChangePercent"])
+                            raw_funding = float(premium["lastFundingRate"])
+                            mark_price = float(premium["markPrice"])
+                            index_price = float(premium["indexPrice"])
+                            next_funding_time_ms = int(premium["nextFundingTime"])
+                        except (KeyError, TypeError, ValueError) as exc:
+                            logger.warning("symbol_rejected symbol=%s reason=malformed_market_payload error=%s", symbol, exc)
+                            return None
 
-                # Trades, VPIN & CVD (limit 100 for minimal API weight)
-                session = await self.ingestion._get_session()
-                url = f"{self.ingestion.REST_BASE_URL}/fapi/v1/aggTrades"
-                trade_qtys = []
-                is_buyer = []
-                taker_buy = 0.0
-                taker_sell = 0.0
+                        if not all(math.isfinite(x) for x in (quote_vol_24h, high_24h, low_24h, price_change_pct_24h, raw_funding, mark_price, index_price)):
+                            logger.warning("symbol_rejected symbol=%s reason=non_finite_market_payload", symbol)
+                            return None
+                        if quote_vol_24h < 0.0 or index_price <= 0.0 or mark_price <= 0.0:
+                            logger.warning("symbol_rejected symbol=%s reason=invalid_market_payload", symbol)
+                            return None
 
-                try:
-                    async with session.get(url, params={"symbol": symbol, "limit": "100"}) as resp:
-                        if resp.status == 200:
-                            raw_trades = await resp.json()
-                            for t in raw_trades:
-                                q = float(t.get("q", 0.0))
-                                m = bool(t.get("m", False))
-                                trade_qtys.append(q)
-                                b = not m
-                                is_buyer.append(b)
-                                if b:
-                                    taker_buy += q
-                                else:
-                                    taker_sell += q
-                        elif resp.status == 429:
-                            await asyncio.sleep(0.5)
-                except Exception:
-                    pass
+                        funding_interval_h = funding_info.get(symbol, 8.0)
+                        if not math.isfinite(funding_interval_h) or funding_interval_h <= 0.0 or 1.0 + raw_funding <= 0.0:
+                            logger.warning("symbol_rejected symbol=%s reason=invalid_funding_normalization_metadata", symbol)
+                            return None
+                        norm_8h_funding = (1.0 + raw_funding) ** (8.0 / funding_interval_h) - 1.0
+                        if not math.isfinite(norm_8h_funding):
+                            return None
+                        basis_bps = (mark_price - index_price) / index_price * 10000.0
 
-                tot_taker = taker_buy + taker_sell
-                cvd = taker_buy - taker_sell
+                        p_snap = prev_state.get(symbol)
+                        expected_prev_open_ms = closed_open_ms - interval_ms
+                        prev_contiguous = p_snap is not None and p_snap.candle_open_time_ms == expected_prev_open_ms
 
-                if trade_qtys and tot_taker > 0.0:
-                    t_arr = np.array(trade_qtys, dtype=np.float64)
-                    b_arr = np.array(is_buyer, dtype=np.bool_)
-                    bucket_vol = max(tot_taker / 10.0, 1e-4)
-                    vpin = compute_vpin_numba(t_arr, b_arr, bucket_vol=bucket_vol, window_baskets=10)
-                else:
-                    vpin = 0.3
+                        klines = await self.ingestion.fetch_symbol_closed_5m_klines(
+                            symbol, closed_open_ms, history_bars=kline_history
+                        )
+                        if klines is None:
+                            return None
+                        parsed = [self._parse_kline(row) for row in klines]
+                        if parsed[-1][0] != closed_open_ms:
+                            logger.warning("symbol_rejected symbol=%s reason=wrong_closed_candle", symbol)
+                            return None
 
-                # CVD Divergence Check
-                # FIX [C1]: Need at least 4-12 points of history for meaningful divergence detection.
-                # Previously: only 2 points (prev + current) were passed with lookback=2,
-                # but detect_cvd_divergence_jit returns 0.0 when n < 4.
-                # Solution: Build history from stored state if available, otherwise skip.
-                div_score = 0.0
-                if p_snap is not None and hasattr(p_snap, 'cvd_history_5m') and p_snap.cvd_history_5m:
-                    # Use stored 5m CVD history (should have 4-12 points)
-                    cvd_hist = list(p_snap.cvd_history_5m) + [cvd]
-                    price_hist = list(p_snap.price_history_5m) + [last_price]
-                    if len(cvd_hist) >= 4:
-                        prices_arr = np.array(price_hist[-12:], dtype=np.float64)  # Last 12 points max
-                        cvd_arr = np.array(cvd_hist[-12:], dtype=np.float64)
-                        lookback = min(6, len(prices_arr) - 1)  # Use 6 or less depending on data
-                        div_score, _ = detect_cvd_divergence_jit(prices_arr, cvd_arr, lookback=lookback)
+                        candle_open, _, candle_high, candle_low, candle_close, volume_5m, taker_buy, taker_sell = parsed[-1]
+                        alt_change_5m_pct = (candle_close / parsed[-2][4] - 1.0) * 100.0
+                        atr_pct = self._atr_pct(parsed, self.atr_lookback)
 
-                # Liquidity Sweep & Reclaim Check (Wyckoff Spring / Upthrust)
-                # FIX [C2]: Use 5m OHLC from historical bars, not 24h ticker extremes.
-                # Previously: high_price/low_price were 24h extremes from ticker, causing false
-                # sweep detection at 24h window boundaries.
-                # Solution: Store and use actual 5m swing highs/lows from recent bars.
-                # For now, we use a conservative approach: only detect sweeps if we have
-                # stored swing levels from previous cycles that are distinct from current 24h range.
-                
-                has_sweep_reclaim = False
-                if p_snap and p_snap.low_24h > 0.0 and p_snap.high_24h > 0.0:
-                    # Check if 24h extremes are meaningfully different from current bar
-                    # to avoid false positives at 24h window boundaries
-                    swing_range_pct = ((p_snap.high_24h - p_snap.low_24h) / p_snap.low_24h) * 100.0
-                    curr_range_pct = ((high_price - low_price) / low_price) * 100.0
-                    
-                    # Only use 24h extremes as swing levels if they represent a wider range
-                    # than the current bar (i.e., not just boundary artifacts)
-                    if swing_range_pct > curr_range_pct * 1.5:  # 24h range should be significantly wider
-                        recent_low_swing = p_snap.low_24h
-                        recent_high_swing = p_snap.high_24h
-                    else:
-                        # Fall back to current bar - no sweep detection this cycle
-                        recent_low_swing = low_price
-                        recent_high_swing = high_price
-                else:
-                    # First run: no prior state, skip sweep detection
-                    recent_low_swing = low_price
-                    recent_high_swing = high_price
+                        # OI statistics are timestamped at the 5m period end boundary,
+                        # which is the current_open_ms after the previous candle has closed.
+                        curr_oi = await self.ingestion.fetch_symbol_closed_5m_open_interest(symbol, current_open_ms)
+                        if curr_oi is None:
+                            return None
+                        delta_oi_5m = 0.0
+                        delta_oi_pct: Optional[float] = None
+                        if prev_contiguous and p_snap and p_snap.open_interest > 0.0:
+                            delta_oi_5m = curr_oi - p_snap.open_interest
+                            delta_oi_pct = delta_oi_5m / p_snap.open_interest
 
-                # Only attempt sweep detection if swing levels are meaningful
-                if recent_low_swing != low_price or recent_high_swing != high_price:
-                    sweep_event = self.sweep_detector.detect(
-                        symbol=symbol,
-                        current_price=last_price,
-                        current_high=high_price,
-                        current_low=low_price,
-                        recent_swing_high=recent_high_swing,
-                        recent_swing_low=recent_low_swing,
-                        cvd_delta=cvd,
-                    )
-                    has_sweep_reclaim = sweep_event is not None and sweep_event.is_confirmed
+                        ob = await self.ingestion.fetch_symbol_orderbook_top(symbol, limit=20)
+                        if ob is None:
+                            return None
+                        bids_qty = np.asarray([q for _, q in ob.bids], dtype=np.float64)
+                        asks_qty = np.asarray([q for _, q in ob.asks], dtype=np.float64)
+                        if bids_qty.size == 0 or asks_qty.size == 0:
+                            return None
+                        obi = float(compute_weighted_obi_jit(bids_qty, asks_qty, decay=0.85))
+                        if not math.isfinite(obi) or not math.isfinite(ob.spread_bps):
+                            return None
 
-                # Synthetic Liquidation Check
-                liq = self.liq_detector.detect(
-                    symbol=symbol,
-                    current_price=last_price,
-                    price_change_pct=price_change_pct,
-                    delta_oi=delta_oi_5m,
-                    taker_buy_vol=taker_buy,
-                    taker_sell_vol=taker_sell,
-                )
-                if liq:
+                        q_res = self.quality_filter.evaluate(
+                            symbol=symbol,
+                            quote_volume_24h=quote_vol_24h,
+                            spread_bps=ob.spread_bps,
+                            funding_rate_8h=norm_8h_funding,
+                        )
+                        if not q_res.is_valid:
+                            return None
+
+                        # CVD is a true completed-5m kline aggregation. Kline [9] is taker-buy base volume.
+                        current_cvd_delta = taker_buy - taker_sell
+                        current_cvd = (p_snap.cumulative_cvd_5m + current_cvd_delta) if prev_contiguous and p_snap else current_cvd_delta
+                        prev_cvd_hist = tuple(p_snap.cvd_history_5m) if p_snap and prev_contiguous else ()
+                        prev_price_hist = tuple(p_snap.price_history_5m) if p_snap and prev_contiguous else ()
+                        prev_times = tuple(p_snap.candle_open_times_5m) if p_snap and prev_contiguous else ()
+                        cvd_hist = prev_cvd_hist[-self.history_bars + 1:] + (current_cvd,)
+                        price_hist = prev_price_hist[-self.history_bars + 1:] + (candle_close,)
+                        time_hist = prev_times[-self.history_bars + 1:] + (closed_open_ms,)
+
+                        div_score: Optional[float] = None
+                        if prev_contiguous and len(prev_cvd_hist) >= self.cvd_lookback + 1 and len(prev_cvd_hist) == len(prev_price_hist) == len(prev_times):
+                            if prev_times[-1] == expected_prev_open_ms:
+                                div_window = max(self.cvd_lookback + 1, 4)
+                                prices_arr = np.asarray(price_hist[-div_window:], dtype=np.float64)
+                                cvd_arr = np.asarray(cvd_hist[-div_window:], dtype=np.float64)
+                                div_score_raw, _ = detect_cvd_divergence_jit(
+                                    prices_arr,
+                                    cvd_arr,
+                                    lookback=min(self.cvd_lookback, len(prices_arr) - 1),
+                                )
+                                div_score = float(div_score_raw)
+                                if not math.isfinite(div_score):
+                                    return None
+
+                        # Real 5m aggregate-trade window only for VPIN; never use the latest-N-trades shortcut.
+                        closed_trades = await self.ingestion.fetch_5m_agg_trades(symbol, closed_open_ms, closed_end_ms)
+                        if closed_trades is None or not closed_trades:
+                            return None
+                        trade_qtys: List[float] = []
+                        is_buyer: List[bool] = []
+                        for trade in closed_trades:
+                            q = float(trade["q"])
+                            if not math.isfinite(q) or q <= 0.0:
+                                return None
+                            trade_qtys.append(q)
+                            is_buyer.append(not bool(trade["m"]))
+                        total_trade_qty = sum(trade_qtys)
+                        bucket_volume = total_trade_qty / self.vpin_window_baskets
+                        if bucket_volume <= 0.0:
+                            return None
+                        vpin = float(
+                            compute_vpin_numba(
+                                np.asarray(trade_qtys, dtype=np.float64),
+                                np.asarray(is_buyer, dtype=np.bool_),
+                                bucket_vol=bucket_volume,
+                                window_baskets=self.vpin_window_baskets,
+                            )
+                        )
+                        if not math.isfinite(vpin) or not 0.0 <= vpin <= 1.0:
+                            return None
+
+                        sweep_event = None
+                        swing_bars = parsed[-(self.cvd_lookback + 1):-1]
+                        if len(swing_bars) >= self.cvd_lookback:
+                            recent_high_swing = max(bar[2] for bar in swing_bars)
+                            recent_low_swing = min(bar[3] for bar in swing_bars)
+                            sweep_event = self.sweep_detector.detect(
+                                symbol=symbol,
+                                current_price=candle_close,
+                                current_high=candle_high,
+                                current_low=candle_low,
+                                recent_swing_high=recent_high_swing,
+                                recent_swing_low=recent_low_swing,
+                                cvd_delta=current_cvd_delta,
+                            )
+                        sweep_reclaim = sweep_event is not None and sweep_event.is_confirmed
+                        sweep_pattern = sweep_event.pattern_type if sweep_event is not None else "NONE"
+
+                        liq = None
+                        if delta_oi_pct is not None:
+                            liq = self.liq_detector.detect(
+                                symbol=symbol,
+                                current_price=candle_close,
+                                price_change_pct=alt_change_5m_pct,
+                                delta_oi=delta_oi_5m,
+                                taker_buy_vol=taker_buy,
+                                taker_sell_vol=taker_sell,
+                            )
+
+                        rolling_beta = None
+                        btc_state = prev_state.get("BTCUSDT")
+                        if symbol != "BTCUSDT" and p_snap is not None and btc_state is not None and prev_contiguous:
+                            rolling_beta = self.regime_engine.calculate_rolling_beta(
+                                p_snap.candle_open_times_5m,
+                                p_snap.price_history_5m,
+                                btc_state.candle_open_times_5m,
+                                btc_state.price_history_5m,
+                                min_samples=self.beta_min_samples,
+                            )
+                        if symbol == "BTCUSDT":
+                            rs_to_btc = 0.0
+                        elif rolling_beta is not None:
+                            rs_to_btc = self.regime_engine.calculate_relative_strength(
+                                alt_change_5m_pct=alt_change_5m_pct,
+                                btc_change_5m_pct=btc_change_5m_pct,
+                                beta=rolling_beta,
+                            )
+                        else:
+                            rs_to_btc = 0.0
+
+                        btc_long_allowed, btc_long_reason = self.regime_engine.check_signal_gate(
+                            symbol=symbol,
+                            signal_type="STRONG_LONG",
+                            btc_regime=btc_regime,
+                            alt_change_5m_pct=alt_change_5m_pct,
+                            beta=rolling_beta,
+                        ) if symbol == "BTCUSDT" or rolling_beta is not None else (False, "INSUFFICIENT_ROLLING_BETA")
+                        btc_short_allowed, btc_short_reason = self.regime_engine.check_signal_gate(
+                            symbol=symbol,
+                            signal_type="STRONG_SHORT",
+                            btc_regime=btc_regime,
+                            alt_change_5m_pct=alt_change_5m_pct,
+                            beta=rolling_beta,
+                        ) if symbol == "BTCUSDT" or rolling_beta is not None else (False, "INSUFFICIENT_ROLLING_BETA")
+
+                        funding_gate_long = self.funding_filter.evaluate_funding_gate(
+                            symbol=symbol,
+                            signal_type="STRONG_LONG",
+                            funding_rate_8h=norm_8h_funding,
+                            next_funding_time_ms=next_funding_time_ms,
+                        )
+                        funding_gate_short = self.funding_filter.evaluate_funding_gate(
+                            symbol=symbol,
+                            signal_type="STRONG_SHORT",
+                            funding_rate_8h=norm_8h_funding,
+                            next_funding_time_ms=next_funding_time_ms,
+                        )
+                        gate_long_status = btc_long_reason if not btc_long_allowed else (funding_gate_long.gate_reason if not funding_gate_long.allow_long else "PASSED")
+                        gate_short_status = btc_short_reason if not btc_short_allowed else (funding_gate_short.gate_reason if not funding_gate_short.allow_short else "PASSED")
+
+                        sent = await self.sentiment_engine.fetch_sentiment_divergence(
+                            symbol,
+                            start_time_ms=closed_open_ms,
+                            end_time_ms=current_open_ms,
+                        )
+                        if sent is None:
+                            return None
+                        whale_divergence = float(sent.divergence_score)
+                        if not math.isfinite(whale_divergence):
+                            return None
+
+                        # Rolling factor histories are valid only while the 5m clock is contiguous.
+                        # A missed cron cycle creates a temporal gap; keeping pre-gap samples would make
+                        # a later point look evenly spaced and could contaminate empirical distributions.
+                        base_funding_hist = p_snap.funding_history_5m if (p_snap and prev_contiguous) else ()
+                        base_basis_hist = p_snap.basis_history_5m if (p_snap and prev_contiguous) else ()
+                        base_micro_hist = p_snap.micro_factor_history_5m if (p_snap and prev_contiguous) else ()
+                        base_whale_hist = p_snap.whale_divergence_history_5m if (p_snap and prev_contiguous) else ()
+                        base_delta_hist = p_snap.delta_oi_pct_history_5m if (p_snap and prev_contiguous) else ()
+                        base_div_hist = p_snap.cvd_divergence_history_5m if (p_snap and prev_contiguous) else ()
+
+                        funding_hist = base_funding_hist[-self.history_bars + 1:] + (norm_8h_funding,)
+                        basis_hist = base_basis_hist[-self.history_bars + 1:] + (basis_bps,)
+                        micro_factor = obi * (1.0 - vpin)
+                        micro_hist = base_micro_hist[-self.history_bars + 1:] + (micro_factor,)
+                        whale_hist = base_whale_hist[-self.history_bars + 1:] + (whale_divergence,)
+                        delta_hist = (base_delta_hist[-self.history_bars + 1:] + (delta_oi_pct,)) if delta_oi_pct is not None else base_delta_hist
+                        div_hist = (base_div_hist[-self.history_bars + 1:] + (div_score,)) if div_score is not None else base_div_hist
+
+                        signal: Optional[SignalEvent] = None
+                        signal_ready = (
+                            delta_oi_pct is not None
+                            and (rolling_beta is not None or symbol == "BTCUSDT")
+                        ) and (
+                            len(funding_hist) - 1 >= self.z_history_min_samples
+                            and len(basis_hist) - 1 >= self.z_history_min_samples
+                            and len(delta_hist) - 1 >= self.z_history_min_samples
+                            and len(micro_hist) - 1 >= self.z_history_min_samples
+                            and len(whale_hist) - 1 >= self.z_history_min_samples
+                            and len(div_hist) - 1 >= self.z_history_min_samples
+                            and div_score is not None
+                        )
+
+                        if signal_ready:
+                            z_cvd, z_fund, z_oi, z_micro, z_whale = self.signal_engine.calculate_factor_zscores(
+                                funding_rate_8h=norm_8h_funding,
+                                basis_spread_bps=basis_bps,
+                                delta_oi_pct=delta_oi_pct if delta_oi_pct is not None else 0.0,
+                                obi=obi,
+                                vpin=vpin,
+                                cvd_divergence_score=div_score if div_score is not None else 0.0,
+                                whale_divergence_score=whale_divergence,
+                                funding_history=funding_hist[:-1],
+                                basis_history=basis_hist[:-1],
+                                delta_oi_pct_history=delta_hist[:-1],
+                                micro_factor_history=micro_hist[:-1],
+                                cvd_history=div_hist[:-1],
+                                whale_history=whale_hist[:-1],
+                            )
+                            signal = self.signal_engine.compute_signal(
+                                symbol=symbol,
+                                current_price=candle_close,
+                                funding_rate_8h=norm_8h_funding,
+                                basis_spread_bps=basis_bps,
+                                delta_oi=delta_oi_5m,
+                                oi_total=curr_oi,
+                                obi=obi,
+                                vpin=vpin,
+                                cvd_divergence_score=div_score if div_score is not None else 0.0,
+                                recent_high=recent_high_swing,
+                                recent_low=recent_low_swing,
+                                z_whale_sentiment=whale_divergence,
+                                relative_strength=rs_to_btc,
+                                sweep_reclaim=sweep_reclaim,
+                                sweep_pattern=sweep_pattern,
+                                atr_pct=atr_pct,
+                                gate_long_status=gate_long_status,
+                                gate_short_status=gate_short_status,
+                                z_cvd_override=z_cvd,
+                                z_fund_override=z_fund,
+                                z_delta_oi_override=z_oi,
+                                z_micro_override=z_micro,
+                                z_whale_override=z_whale,
+                                timestamp_ms=int(time.time() * 1000),
+                            )
+
+                        snapshot = MarketStateSnapshot(
+                            symbol=symbol,
+                            timestamp_ms=closed_end_ms,
+                            last_price=candle_close,
+                            open_interest=curr_oi,
+                            delta_oi_5m=delta_oi_5m,
+                            cumulative_cvd_5m=current_cvd,
+                            funding_rate_8h=norm_8h_funding,
+                            basis_bps=basis_bps,
+                            vpin_estimate=vpin,
+                            obi_score=obi,
+                            composite_score=signal.composite_score if signal is not None else 0.0,
+                            low_24h=low_24h,
+                            high_24h=high_24h,
+                            whale_sentiment_z=signal.z_whale_sentiment if signal is not None else 0.0,
+                            cvd_history_5m=tuple(cvd_hist[-self.history_bars:]),
+                            price_history_5m=tuple(price_hist[-self.history_bars:]),
+                            funding_history_5m=tuple(funding_hist[-self.history_bars:]),
+                            basis_history_5m=tuple(basis_hist[-self.history_bars:]),
+                            delta_oi_pct_history_5m=tuple(delta_hist[-self.history_bars:]),
+                            micro_factor_history_5m=tuple(micro_hist[-self.history_bars:]),
+                            whale_divergence_history_5m=tuple(whale_hist[-self.history_bars:]),
+                            cvd_divergence_history_5m=tuple(div_hist[-self.history_bars:]),
+                            candle_open_time_ms=candle_open,
+                            candle_open_times_5m=tuple(time_hist[-self.history_bars:]),
+                            candle_high_5m=candle_high,
+                            candle_low_5m=candle_low,
+                            signal_ready=signal is not None,
+                        )
+                        return signal, snapshot, liq
+                    except Exception as exc:
+                        logger.exception("symbol_analysis_failed symbol=%s error=%s", symbol, exc)
+                        return exc
+
+            results = await asyncio.gather(*(analyze_symbol(sym) for sym in sorted_symbols))
+            successful_symbols = 0
+            rejected_symbols = 0
+            failed_symbols = 0
+            signal_ready_symbols = 0
+            new_snapshots: List[MarketStateSnapshot] = []
+
+            for result in results:
+                if isinstance(result, Exception):
+                    failed_symbols += 1
+                    continue
+                if result is None:
+                    rejected_symbols += 1
+                    continue
+                successful_symbols += 1
+                signal, snapshot, liq = result
+                new_snapshots.append(snapshot)
+                if signal is not None:
+                    signal_ready_symbols += 1
+                    signals.append(signal)
+                if liq is not None:
                     synthetic_liqs.append(liq)
 
-                # Gate Evaluations (BTC Correlation & Funding Epoch)
-                # FIX Bug 3: Gates are evaluated for BOTH directions and combined.
-                # Previously, we pre-guessed signal direction from div_score alone,
-                # which could be wrong when whale sentiment overrides the CVD direction.
-                # Now we evaluate both directions and let compute_signal() decide which applies.
-                btc_long_allowed, btc_long_reason = self.regime_engine.check_signal_gate(
-                    symbol=symbol,
-                    signal_type="STRONG_LONG",
-                    btc_regime=btc_regime,
-                    alt_change_5m_pct=alt_change_5m_pct,
+            failure_ratio = failed_symbols / max(len(sorted_symbols), 1)
+            if failure_ratio > self.failure_ratio_limit:
+                raise RuntimeError(
+                    f"Unexpected symbol failure ratio {failure_ratio:.2%} exceeds {self.failure_ratio_limit:.2%}"
                 )
-                btc_short_allowed, btc_short_reason = self.regime_engine.check_signal_gate(
-                    symbol=symbol,
-                    signal_type="STRONG_SHORT",
-                    btc_regime=btc_regime,
-                    alt_change_5m_pct=alt_change_5m_pct,
-                )
+            if sorted_symbols and successful_symbols == 0:
+                raise RuntimeError("No symbol produced a valid market snapshot; refusing to persist an empty state")
 
-                funding_gate_long = self.funding_filter.evaluate_funding_gate(
-                    symbol=symbol,
-                    signal_type="STRONG_LONG",
-                    funding_rate_8h=norm_8h_funding,
-                    next_funding_time_ms=next_funding_time_ms,
-                )
-                funding_gate_short = self.funding_filter.evaluate_funding_gate(
-                    symbol=symbol,
-                    signal_type="STRONG_SHORT",
-                    funding_rate_8h=norm_8h_funding,
-                    next_funding_time_ms=next_funding_time_ms,
-                )
+            # Preserve previous snapshots for symbols that failed this cycle. Their stale
+            # candle_open_time forces `prev_contiguous=False` on the next successful cycle,
+            # so retention preserves continuity data without allowing stale inputs into signals.
+            current_symbols = set(sorted_symbols)
+            merged_state: Dict[str, MarketStateSnapshot] = {
+                symbol: snapshot
+                for symbol, snapshot in prev_state.items()
+                if symbol in current_symbols
+            }
+            merged_state.update({snapshot.symbol: snapshot for snapshot in new_snapshots})
+            self.save_current_state(list(merged_state.values()))
+            signals.sort(key=lambda s: s.composite_score, reverse=True)
+            strong_longs = [s for s in signals if s.signal_type == "STRONG_LONG"]
+            strong_shorts = [s for s in signals if s.signal_type == "STRONG_SHORT"]
+            duration = time.time() - t0
 
-                # Build separate gate_status strings for each direction.
-                # compute_signal() will apply the correct one based on the final signal type.
-                if not btc_long_allowed:
-                    gate_long_status = btc_long_reason
-                elif not funding_gate_long.allow_long:
-                    gate_long_status = funding_gate_long.gate_reason
-                else:
-                    gate_long_status = "PASSED"
-
-                if not btc_short_allowed:
-                    gate_short_status = btc_short_reason
-                elif not funding_gate_short.allow_short:
-                    gate_short_status = funding_gate_short.gate_reason
-                else:
-                    gate_short_status = "PASSED"
-
-                # Sentiment Divergence:
-                # Fetch for BTC/ETH/SOL always (macro anchors) and for any symbol
-                # showing meaningful CVD divergence direction (|div_score| > 0.3).
-                # Lower threshold vs. previous 0.5 ensures whale factor is included
-                # early enough to boost/block signals before they cross the 75pt gate.
-                z_whale = 0.0
-                if symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT") or abs(div_score) > 0.3:
-                    sent = await self.sentiment_engine.fetch_sentiment_divergence(symbol)
-                    if sent:
-                        z_whale = sent.z_whale_sentiment
-
-                # Compute Final Institutional Signal
-                sig = self.signal_engine.compute_signal(
-                    symbol=symbol,
-                    current_price=last_price,
-                    funding_rate_8h=norm_8h_funding,
-                    basis_spread_bps=basis_bps,
-                    delta_oi=delta_oi_5m,
-                    oi_total=curr_oi,
-                    obi=obi,
-                    vpin=vpin,
-                    cvd_divergence_score=div_score,
-                    recent_high=high_price,
-                    recent_low=low_price,
-                    z_whale_sentiment=z_whale,
-                    relative_strength=rs_to_btc,
-                    sweep_reclaim=has_sweep_reclaim,
-                    gate_long_status=gate_long_status,
-                    gate_short_status=gate_short_status,
-                )
-                signals.append(sig)
-
-                # FIX [C1]: Maintain rolling 5m CVD/price history for divergence detection
-                # Keep last N=12 points (enough for lookback=6 with n>=4 requirement)
-                MAX_HISTORY = 12
-                if p_snap is not None and hasattr(p_snap, 'cvd_history_5m') and p_snap.cvd_history_5m:
-                    cvd_hist = list(p_snap.cvd_history_5m)[-MAX_HISTORY+1:] + [cvd]
-                    price_hist = list(p_snap.price_history_5m)[-MAX_HISTORY+1:] + [last_price]
-                else:
-                    cvd_hist = [cvd]
-                    price_hist = [last_price]
-
-                new_snapshots.append(
-                    MarketStateSnapshot(
-                        symbol=symbol,
-                        timestamp_ms=int(time.time() * 1000),
-                        last_price=last_price,
-                        open_interest=curr_oi,
-                        delta_oi_5m=delta_oi_5m,
-                        cumulative_cvd_5m=cvd,
-                        funding_rate_8h=norm_8h_funding,
-                        basis_bps=basis_bps,
-                        vpin_estimate=vpin,
-                        obi_score=obi,
-                        composite_score=sig.composite_score,
-                        low_24h=low_price,
-                        high_24h=high_price,
-                        whale_sentiment_z=z_whale,
-                        cvd_history_5m=tuple(cvd_hist[-MAX_HISTORY:]),
-                        price_history_5m=tuple(price_hist[-MAX_HISTORY:]),
-                    )
-                )
-
-        tasks = [analyze_symbol(sym) for sym in sorted_symbols]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await self.ingestion.stop()
-        await self.sentiment_engine.close()
-
-        # Step 5: Persist state
-        self.save_current_state(new_snapshots)
-
-        # Sort signals descending by score
-        signals.sort(key=lambda s: s.composite_score, reverse=True)
-
-        strong_longs = [s for s in signals if s.signal_type == "STRONG_LONG"]
-        strong_shorts = [s for s in signals if s.signal_type == "STRONG_SHORT"]
-        duration = time.time() - t0
-
-        summary = ScreenerResult(
-            timestamp_ms=int(time.time() * 1000),
-            duration_sec=round(duration, 2),
-            total_scanned=len(signals),
-            strong_longs_count=len(strong_longs),
-            strong_shorts_count=len(strong_shorts),
-            synthetic_liqs_count=len(synthetic_liqs),
-            btc_regime=btc_regime.status,
-            btc_change_5m_pct=btc_regime.btc_change_5m_pct,
-        )
-
-        return signals, synthetic_liqs, summary
+            summary = ScreenerResult(
+                timestamp_ms=closed_end_ms,
+                duration_sec=round(duration, 2),
+                total_scanned=len(sorted_symbols),
+                strong_longs_count=len(strong_longs),
+                strong_shorts_count=len(strong_shorts),
+                synthetic_liqs_count=len(synthetic_liqs),
+                btc_regime=btc_regime.status,
+                btc_change_5m_pct=btc_regime.btc_change_5m_pct,
+                successful_symbols=successful_symbols,
+                rejected_symbols=rejected_symbols,
+                failed_symbols=failed_symbols,
+                signal_ready_symbols=signal_ready_symbols,
+            )
+            return signals, synthetic_liqs, summary
+        finally:
+            await self.ingestion.stop()
+            await self.sentiment_engine.close()

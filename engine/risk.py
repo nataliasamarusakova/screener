@@ -1,25 +1,27 @@
 """
 Dynamic Risk Management & Position Sizing Engine.
-Models:
-1. Invalidation-based Position Sizing (Fixed Fractional Risk / Volatility Sizing).
-2. Liquidity Constraints & Maximum Market Impact Limits.
-3. Dynamic Leverage calculation bounded by risk parameters.
+
+Production invariants:
+- Invalid directional stop/target inputs are rejected, never silently rewritten.
+- Explicit zero/NaN/Inf values are never substituted with configuration defaults.
+- Liquidity caps are applied only when real liquidity input is supplied.
 """
 from __future__ import annotations
 
 import math
 from typing import Optional
+
 import msgspec
 
 
 class PositionSizeRecommendation(msgspec.Struct, gc=False):
     symbol: str
-    side: str                            # "LONG" or "SHORT"
+    side: str
     entry_price: float
     invalidation_price: float
     target_price: float
-    stop_distance_pct: float             # abs(entry - invalidation) / entry * 100
-    target_distance_pct: float           # abs(target - entry) / entry * 100
+    stop_distance_pct: float
+    target_distance_pct: float
     risk_reward_ratio: float
     account_capital_usdt: float
     risk_per_trade_usdt: float
@@ -31,16 +33,14 @@ class PositionSizeRecommendation(msgspec.Struct, gc=False):
 
 
 class DynamicRiskEngine:
-    """
-    Computes mathematically rigorous position sizing based on structural invalidation levels.
-    """
+    """Computes position sizing from validated structural invalidation levels."""
 
     def __init__(
         self,
         default_account_capital: float = 10000.0,
-        risk_per_trade_pct: float = 1.0,         # 1% equity at risk per trade
-        max_leverage: float = 10.0,              # Maximum margin leverage
-        max_liquidity_impact_pct: float = 1.5,   # Maximum % of 5m taker volume
+        risk_per_trade_pct: float = 1.0,
+        max_leverage: float = 10.0,
+        max_liquidity_impact_pct: float = 1.5,
     ) -> None:
         self.default_account_capital = default_account_capital
         self.risk_per_trade_pct = risk_per_trade_pct
@@ -50,63 +50,79 @@ class DynamicRiskEngine:
     def calculate_sizing(
         self,
         symbol: str,
-        signal_type: str,                        # "STRONG_LONG" or "STRONG_SHORT"
+        signal_type: str,
         entry_price: float,
         invalidation_price: float,
         target_price: float,
         available_liquidity_usdt: Optional[float] = None,
         account_capital: Optional[float] = None,
     ) -> Optional[PositionSizeRecommendation]:
-        """
-        Calculates exact position sizing based on risk-to-invalidation distance.
-        """
-        if entry_price <= 0.0 or invalidation_price <= 0.0:
+        """Calculate position size; return None for any invalid risk contract."""
+        if signal_type not in ("STRONG_LONG", "STRONG_SHORT"):
             return None
 
-        capital = account_capital or self.default_account_capital
-        risk_budget = capital * (self.risk_per_trade_pct / 100.0)
+        values = (
+            entry_price,
+            invalidation_price,
+            target_price,
+            self.risk_per_trade_pct,
+            self.max_leverage,
+            self.max_liquidity_impact_pct,
+        )
+        if not all(math.isfinite(float(x)) for x in values):
+            return None
+        if entry_price <= 0.0 or invalidation_price <= 0.0 or target_price <= 0.0:
+            return None
 
-        side = "LONG" if signal_type == "STRONG_LONG" else "SHORT"
+        capital = self.default_account_capital if account_capital is None else float(account_capital)
+        if not math.isfinite(capital) or capital <= 0.0:
+            return None
+        if not (0.0 < self.risk_per_trade_pct <= 100.0):
+            return None
+        if self.max_leverage <= 0.0:
+            return None
+        if self.max_liquidity_impact_pct <= 0.0:
+            return None
 
-        # Validate directional consistency
-        if side == "LONG":
-            if invalidation_price >= entry_price:
-                # Invalidation must be below entry for longs
-                invalidation_price = entry_price * 0.985
-            if target_price <= entry_price:
-                target_price = entry_price * 1.03
+        if signal_type == "STRONG_LONG":
+            side = "LONG"
+            if invalidation_price >= entry_price or target_price <= entry_price:
+                return None
         else:
-            if invalidation_price <= entry_price:
-                # Invalidation must be above entry for shorts
-                invalidation_price = entry_price * 1.015
-            if target_price >= entry_price:
-                target_price = entry_price * 0.97
+            side = "SHORT"
+            if invalidation_price <= entry_price or target_price >= entry_price:
+                return None
 
+        if available_liquidity_usdt is not None:
+            if not math.isfinite(float(available_liquidity_usdt)) or available_liquidity_usdt <= 0.0:
+                return None
+
+        risk_budget = capital * (self.risk_per_trade_pct / 100.0)
         stop_distance_dollar = abs(entry_price - invalidation_price)
         target_distance_dollar = abs(target_price - entry_price)
+        if stop_distance_dollar <= 0.0 or target_distance_dollar <= 0.0:
+            return None
 
         stop_pct = (stop_distance_dollar / entry_price) * 100.0
         target_pct = (target_distance_dollar / entry_price) * 100.0
-        rrr = (target_distance_dollar / stop_distance_dollar) if stop_distance_dollar > 0 else 0.0
+        rrr = target_distance_dollar / stop_distance_dollar
 
-        # Unconstrained Quantity: Risk Budget / Stop Distance per contract
-        unconstrained_qty = risk_budget / stop_distance_dollar if stop_distance_dollar > 0 else 0.0
+        unconstrained_qty = risk_budget / stop_distance_dollar
         unconstrained_notional = unconstrained_qty * entry_price
-
-        # Check Maximum Leverage Cap
         max_permitted_notional = capital * self.max_leverage
         notional = min(unconstrained_notional, max_permitted_notional)
 
-        # Check Liquidity Impact Cap
         liquidity_applied = False
-        if available_liquidity_usdt is not None and available_liquidity_usdt > 0.0:
+        if available_liquidity_usdt is not None:
             max_liquidity_notional = available_liquidity_usdt * (self.max_liquidity_impact_pct / 100.0)
+            if not math.isfinite(max_liquidity_notional) or max_liquidity_notional <= 0.0:
+                return None
             if notional > max_liquidity_notional:
                 notional = max_liquidity_notional
                 liquidity_applied = True
 
         final_qty = notional / entry_price
-        effective_leverage = notional / capital if capital > 0 else 0.0
+        effective_leverage = notional / capital
 
         return PositionSizeRecommendation(
             symbol=symbol,

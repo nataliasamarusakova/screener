@@ -7,6 +7,8 @@ Exports latest scan results to JSON for external APIs/frontends.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import List
@@ -185,6 +187,10 @@ def export_json(
             "synthetic_liqs": summary.synthetic_liqs_count,
             "btc_regime": summary.btc_regime,
             "btc_change_5m_pct": summary.btc_change_5m_pct,
+            "successful_symbols": summary.successful_symbols,
+            "rejected_symbols": summary.rejected_symbols,
+            "failed_symbols": summary.failed_symbols,
+            "signal_ready_symbols": summary.signal_ready_symbols,
         },
         "signals": [
             {
@@ -222,4 +228,23 @@ def export_json(
         ],
     }
     raw = msgspec.json.encode(payload)
-    target_path.write_bytes(raw)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        dir=str(target_path.parent), prefix=f".{target_path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as temp:
+            temp.write(raw)
+            temp.flush()
+            os.fsync(temp.fileno())
+        os.replace(temp_name, target_path)
+        dir_fd = os.open(target_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass

@@ -41,10 +41,13 @@ class SyntheticLiquidationDetector:
         Evaluate if a delta OI drop constitutes a synthetic liquidation.
         Returns SyntheticLiquidation event if anomaly detected, else None.
         """
-        if current_price <= 0.0:
+        values = (current_price, price_change_pct, delta_oi, taker_buy_vol, taker_sell_vol)
+        if not all(math.isfinite(float(x)) for x in values):
+            return None
+        if current_price <= 0.0 or taker_buy_vol < 0.0 or taker_sell_vol < 0.0:
             return None
 
-        now_ms = timestamp_ms or int(time.time() * 1000)
+        now_ms = timestamp_ms if timestamp_ms is not None else int(time.time() * 1000)
 
         # Liquidation cascades MUST result in net open interest destruction (ΔOI < 0)
         if delta_oi >= 0.0 or abs(delta_oi) < self.min_oi_drop_threshold:
@@ -52,10 +55,12 @@ class SyntheticLiquidationDetector:
 
         abs_oi_drop = abs(delta_oi)
         total_taker_vol = taker_buy_vol + taker_sell_vol
-        safe_taker_vol = max(total_taker_vol, 1e-6)
+        # Zero visible taker volume is an unknown denominator, not a tiny volume.
+        if total_taker_vol <= 0.0:
+            return None
 
         # Anomaly ratio: how severely the OI depletion outstrips visible taker volume
-        anomaly_ratio = abs_oi_drop / safe_taker_vol
+        anomaly_ratio = abs_oi_drop / total_taker_vol
 
         # Case 1: Long Liquidation Cascade (Price dumped + massive OI reduction)
         if price_change_pct <= -self.volatility_shock_pct:

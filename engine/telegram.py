@@ -10,6 +10,7 @@ import html
 import json
 import logging
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -42,18 +43,40 @@ class TelegramAlerter:
         self.cache: Dict[str, Dict[str, float]] = self._load_cache()
 
     def _load_cache(self) -> Dict[str, Dict[str, float]]:
-        if ALERT_CACHE_FILE.exists():
-            try:
-                return json.loads(ALERT_CACHE_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        return {}
+        if not ALERT_CACHE_FILE.exists():
+            return {}
+        try:
+            data = json.loads(ALERT_CACHE_FILE.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("alert cache root must be an object")
+            return data
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("telegram_alert_cache_load_failed path=%s error=%s", ALERT_CACHE_FILE, exc)
+            return {}
 
     def _save_cache(self) -> None:
+        target = ALERT_CACHE_FILE
+        target.parent.mkdir(parents=True, exist_ok=True)
+        raw = json.dumps(self.cache, ensure_ascii=False, separators=(",", ":"))
+        fd, temp_name = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp")
         try:
-            ALERT_CACHE_FILE.write_text(json.dumps(self.cache), encoding="utf-8")
-        except Exception:
-            pass
+            with os.fdopen(fd, "w", encoding="utf-8") as temp:
+                temp.write(raw)
+                temp.flush()
+                os.fsync(temp.fileno())
+            os.replace(temp_name, target)
+            dir_fd = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.error("telegram_alert_cache_save_failed path=%s error=%s", target, exc)
+        finally:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
 
     def _should_alert(self, symbol: str, current_score: float) -> bool:
         """Throttles repeated alerts unless score moves significantly or cooldown expires."""
