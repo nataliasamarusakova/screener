@@ -94,15 +94,15 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Официальный способ аутентификации push через токен GitHub Actions:
+          # Авторизация через x-access-token
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
-          # Добавляем только существующие файлы
-          for f in .market_state.bin .signals_latest.json .alert_cache.json; do
-            if [ -f "$f" ]; then
-              git add -f "$f"
-            fi
-          done
+          # Добавляем папку data/ в Git
+          if [ -d "data" ]; then
+            git add -f data/
+          fi
+          # Удаляем старые файлы из корня репозитория (если они были созданы ранее)
+          git rm -f .market_state.bin .signals_latest.json .alert_cache.json 2>/dev/null || true
 
           if git diff --cached --quiet; then
             echo "No state changes to commit."
