@@ -10,7 +10,12 @@ import math
 import numpy as np
 import pytest
 
-from binance_ingestion import BinanceFuturesIngestion, BinanceOrderBookFSM, OrderBookFSMState
+from binance_ingestion import (
+    BinanceFuturesIngestion,
+    BinanceOrderBookFSM,
+    BinanceRestrictedLocationError,
+    OrderBookFSMState,
+)
 from contracts import MarketStateSnapshot
 from engine.divergence import detect_cvd_divergence_jit
 from engine.funding_filter import FundingFilterEngine
@@ -615,6 +620,8 @@ def test_screener_offline_single_symbol_scan_persists_closed_candle(tmp_path):
         assert summary.signal_ready_symbols == 0
         state = screener.load_previous_state()
         assert state["BTCUSDT"].candle_open_time_ms == summary.timestamp_ms + 1 - 300_000
+        assert screener.ingestion.stopped is False
+        await screener.close()
         assert screener.ingestion.stopped is True
 
     asyncio.run(run())
@@ -653,3 +660,11 @@ def test_signal_rejects_nonfinite_configuration():
         QuantSignalEngine(w_cvd=-1.0)
     with pytest.raises(ValueError, match="strong_signal_threshold"):
         QuantSignalEngine(strong_signal_threshold=101.0)
+
+
+def test_binance_451_is_a_distinct_restricted_location_failure():
+    exc = BinanceRestrictedLocationError(
+        "Binance Futures rejected the request with HTTP 451 (restricted location)"
+    )
+    assert "HTTP 451" in str(exc)
+    assert "restricted location" in str(exc)
