@@ -1,11 +1,8 @@
 name: Quant Screener Engine
 
 on:
-  schedule:
-    # Trigger automatically every 5 minutes
-    - cron: '*/5 * * * *'
-  workflow_dispatch:
-  repository_dispatch:
+  # no in-repo cron schedule is wanted).
+  repository_dispatch: 
     types: [run_quant_engine]
 
 permissions:
