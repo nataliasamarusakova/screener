@@ -92,7 +92,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           export GITHUB_TOKEN="${GITHUB_TOKEN:?GITHUB_TOKEN is required}"
-          git add -f .market_state.bin .signals_latest.json .alert_cache.json 2>/dev/null || true
+          
+          # Безопасное добавление только существующих файлов
+          for f in .market_state.bin .signals_latest.json .alert_cache.json; do
+            if [ -f "$f" ]; then
+              git add -f "$f"
+            fi
+          done
+
           if git diff --cached --quiet; then
             echo "No state changes to commit."
             exit 0
