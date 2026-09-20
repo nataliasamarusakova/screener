@@ -56,7 +56,7 @@ def save_latest_scan_json(
     signals: List[SignalEvent],
     synthetic_liqs: List[SyntheticLiquidation],
     summary: ScreenerResult,
-    target_path: Path = Path(".signals_latest.json"),
+    target_path: Path = Path("data/signals_latest.json"),
 ) -> None:
     """Persist the latest screener result atomically for downstream consumers."""
     payload = {
