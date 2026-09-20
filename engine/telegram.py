@@ -20,7 +20,7 @@ import aiohttp
 from contracts import SignalEvent, SyntheticLiquidation
 
 logger = logging.getLogger("telegram_alerter")
-ALERT_CACHE_FILE = Path(".alert_cache.json")
+ALERT_CACHE_FILE = Path("data/alert_cache.json")
 
 
 def _get_chat_ids() -> List[str]:
