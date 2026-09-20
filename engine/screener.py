@@ -138,7 +138,7 @@ class QuantScreener:
 
     def __init__(
         self,
-        state_file: Path = Path(".market_state.bin"),
+        state_file: Path = Path("data/market_state.bin"),
         concurrency_limit: int = 25,
         top_n_symbols: int = 100,
     ) -> None:
