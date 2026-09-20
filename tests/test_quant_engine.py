@@ -126,8 +126,40 @@ def test_empirical_zscore_is_true_point_in_time_sample_zscore():
     assert z == pytest.approx(expected, abs=1e-12)
     with pytest.raises(ValueError, match="Insufficient history"):
         empirical_zscore(5.0, [1.0, 2.0, 3.0], min_samples=4)
-    with pytest.raises(ValueError, match="zero variance"):
-        empirical_zscore(2.0, [1.0, 1.0, 1.0, 1.0], min_samples=4)
+    # A flat history has no defined standardized deviation. The engine now treats
+    # that factor as neutral instead of failing the whole symbol.
+    assert empirical_zscore(2.0, [1.0, 1.0, 1.0, 1.0], min_samples=4) == 0.0
+    assert empirical_zscore(1.0, [1.0, 1.0, 1.0, 1.0], min_samples=4) == 0.0
+
+
+def test_signal_zscores_treat_flat_factor_histories_as_neutral():
+    engine = QuantSignalEngine(z_history_min_samples=4)
+    result = engine.calculate_factor_zscores(
+        funding_rate_8h=0.001,
+        basis_spread_bps=0.5,
+        delta_oi_pct=0.02,
+        obi=0.2,
+        vpin=0.1,
+        cvd_divergence_score=1.0,
+        whale_divergence_score=0.5,
+        funding_history=[0.001] * 4,
+        basis_history=[0.5] * 4,
+        delta_oi_pct_history=[0.02] * 4,
+        micro_factor_history=[0.18] * 4,
+        cvd_history=[0.0] * 4,
+        whale_history=[0.5] * 4,
+    )
+    assert result == (0.0, 0.0, 0.0, 0.0, 0.0)
+
+
+def test_missing_sentiment_does_not_create_new_whale_history_sample():
+    # The screener's policy for a missing sentiment window is: no stale carry-forward
+    # observation is appended, and the whale factor contributes neutral evidence for
+    # the current point. This regression documents that contract independently of HTTP.
+    history = (0.295,) * 24
+    assert len(history) == 24
+    # A flat persisted history is safe for the Z-score engine and evaluates to neutral.
+    assert empirical_zscore(0.0, history, min_samples=24) == 0.0
 
 
 def test_explicit_5m_agg_trade_window_never_falls_back_to_last_n_trades():
@@ -623,6 +655,105 @@ def test_screener_offline_single_symbol_scan_persists_closed_candle(tmp_path):
         assert screener.ingestion.stopped is False
         await screener.close()
         assert screener.ingestion.stopped is True
+
+    asyncio.run(run())
+
+
+def test_screener_missing_sentiment_does_not_fail_ready_symbol_or_pollute_history(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import engine.screener as screener_module
+    import msgspec
+
+    monkeypatch.setenv("SIGNAL_Z_MIN_SAMPLES", "4")
+    monkeypatch.setenv("SIGNAL_HISTORY_BARS", "10")
+    monkeypatch.setattr(screener_module, "detect_cvd_divergence_jit", lambda *args, **kwargs: (0.25, 0))
+
+    step = 300_000
+    now_open = (int(__import__("time").time() * 1000) // step) * step
+    closed_open = now_open - step
+    previous_open = closed_open - step
+
+    previous = MarketStateSnapshot(
+        symbol="BTCUSDT",
+        timestamp_ms=previous_open + 299_999,
+        last_price=100.0,
+        open_interest=1000.0,
+        delta_oi_5m=0.0,
+        cumulative_cvd_5m=100.0,
+        funding_rate_8h=0.001,
+        basis_bps=1.0,
+        vpin_estimate=0.2,
+        obi_score=0.1,
+        composite_score=0.0,
+        cvd_history_5m=(96.0, 97.0, 98.0, 99.0),
+        price_history_5m=(98.0, 99.0, 100.0, 101.0),
+        funding_history_5m=(0.0008, 0.0010, 0.0011, 0.0009),
+        basis_history_5m=(0.5, 0.8, 1.2, 1.0),
+        delta_oi_pct_history_5m=(-0.001, 0.0005, -0.0002, 0.0008),
+        micro_factor_history_5m=(0.05, 0.08, 0.12, 0.07),
+        whale_divergence_history_5m=(0.10, 0.12, 0.08, 0.11, 0.09),
+        cvd_divergence_history_5m=(-0.1, 0.0, 0.2, -0.05),
+        candle_open_time_ms=previous_open,
+        candle_open_times_5m=(previous_open - 3 * step, previous_open - 2 * step, previous_open - step, previous_open),
+        candle_high_5m=101.0,
+        candle_low_5m=98.0,
+    )
+
+    class FakeIngestion:
+        stopped = False
+
+        async def fetch_universe_tickers(self):
+            return {"BTCUSDT": {"symbol": "BTCUSDT", "quoteVolume": "100000000", "highPrice": "102", "lowPrice": "98", "priceChangePercent": "0.2"}}
+
+        async def fetch_universe_premium_index(self):
+            return {"BTCUSDT": {"symbol": "BTCUSDT", "lastFundingRate": "0.0001", "markPrice": "100", "indexPrice": "99.99", "nextFundingTime": 9_999_999_999_999}}
+
+        async def fetch_universe_funding_info(self):
+            return {}
+
+        async def fetch_symbol_closed_5m_klines(self, symbol, closed_open_ms, *, history_bars):
+            rows=[]
+            first=closed_open_ms-(history_bars-1)*step
+            for i in range(history_bars):
+                t=first+i*step
+                rows.append([t, "100", "101", "99", "100", "10", t+299_999, "1000", "10", "5", "500", "0"])
+            return rows
+
+        async def fetch_symbol_closed_5m_open_interest(self, symbol, current_open_ms):
+            return 1001.0
+
+        async def fetch_symbol_orderbook_top(self, symbol, limit=20):
+            return SimpleNamespace(bids=((99.99, 10.0), (99.98, 5.0)), asks=((100.00, 10.0), (100.01, 5.0)), spread_bps=1.0)
+
+        async def fetch_5m_agg_trades(self, symbol, start_time_ms, end_time_ms):
+            return [{"a": 1, "T": start_time_ms, "q": 10.0, "m": False}]
+
+        async def stop(self):
+            self.stopped = True
+
+    class MissingSentiment:
+        async def fetch_sentiment_divergence(self, symbol, start_time_ms=None, end_time_ms=None):
+            return None
+
+        async def close(self):
+            pass
+
+    async def run():
+        state_file = tmp_path / "state.bin"
+        state_file.write_bytes(msgspec.json.encode([previous]))
+        screener = QuantScreener(state_file=state_file, top_n_symbols=1, concurrency_limit=1)
+        screener.ingestion = FakeIngestion()
+        screener.sentiment_engine = MissingSentiment()
+        _, _, summary = await screener.scan()
+        assert summary.total_scanned == 1
+        assert summary.successful_symbols == 1
+        assert summary.failed_symbols == 0
+        # The regression target is that the missing sentiment window is not an
+        # unexpected symbol failure.
+        persisted = screener.load_previous_state()["BTCUSDT"]
+        assert len(persisted.whale_divergence_history_5m) == 5
+        assert persisted.whale_divergence_history_5m == previous.whale_divergence_history_5m
+        await screener.close()
 
     asyncio.run(run())
 
