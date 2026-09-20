@@ -555,14 +555,16 @@ class QuantScreener:
                             start_time_ms=closed_open_ms,
                             end_time_ms=current_open_ms,
                         )
-                        if sent is not None:
+                        sentiment_available = sent is not None
+                        if sentiment_available:
                             whale_divergence = float(sent.divergence_score)
-                        elif p_snap is not None and p_snap.whale_divergence_history_5m:
-                            # Берем сентимент прошлой свечи, если Binance задерживает расчет
-                            whale_divergence = float(p_snap.whale_divergence_history_5m[-1])
                         else:
-                            whale_divergence = 0.0  # Нейтральный сентимент по умолчанию 
-                        
+                            # Do not carry-forward a stale observation into the PIT history.
+                            # Binance can publish the three sentiment series with a delay; treating
+                            # the missing point as neutral for the current score avoids both stale
+                            # directional input and artificial zero-variance histories.
+                            whale_divergence = 0.0
+
                         if not math.isfinite(whale_divergence):
                             return None
 
@@ -580,7 +582,11 @@ class QuantScreener:
                         basis_hist = base_basis_hist[-self.history_bars + 1:] + (basis_bps,)
                         micro_factor = obi * (1.0 - vpin)
                         micro_hist = base_micro_hist[-self.history_bars + 1:] + (micro_factor,)
-                        whale_hist = base_whale_hist[-self.history_bars + 1:] + (whale_divergence,)
+                        whale_hist = (
+                            base_whale_hist[-self.history_bars + 1:] + (whale_divergence,)
+                            if sentiment_available
+                            else base_whale_hist[-self.history_bars:]
+                        )
                         delta_hist = (base_delta_hist[-self.history_bars + 1:] + (delta_oi_pct,)) if delta_oi_pct is not None else base_delta_hist
                         div_hist = (base_div_hist[-self.history_bars + 1:] + (div_score,)) if div_score is not None else base_div_hist
 
@@ -614,6 +620,11 @@ class QuantScreener:
                                 cvd_history=div_hist[:-1],
                                 whale_history=whale_hist[:-1],
                             )
+                            if not sentiment_available:
+                                # No fresh PIT sentiment observation: remove that factor's
+                                # directional contribution rather than deriving a score from a
+                                # fabricated/stale current value.
+                                z_whale = 0.0
                             signal = self.signal_engine.compute_signal(
                                 symbol=symbol,
                                 current_price=candle_close,

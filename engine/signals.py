@@ -28,8 +28,11 @@ def empirical_zscore(value: float, history: Sequence[float], min_samples: int = 
     """
     Compute a point-in-time sample Z-score from *previous* observations only.
 
-    `history` must not contain the current observation. The function deliberately
-    fails closed when there is not enough variance/history to estimate a distribution.
+    `history` must not contain the current observation. Missing/insufficient history
+    remains a hard error, but a zero-variance history is treated as a neutral factor
+    (Z=0) rather than crashing the entire symbol scan. With zero variance there is no
+    statistically defined standardized deviation; returning zero therefore means
+    "this factor contributes no directional evidence until its history varies".
     """
     if not math.isfinite(value):
         raise ValueError("Non-finite factor value")
@@ -49,7 +52,12 @@ def empirical_zscore(value: float, history: Sequence[float], min_samples: int = 
     variance = sum_sq / (len(history_values) - 1)
     std = math.sqrt(variance)
     if std <= 1e-12:
-        raise ValueError("Factor history has zero variance")
+        # A standardized score is undefined when the historical sample has no
+        # dispersion. Do not manufacture a huge z-score from an arbitrary epsilon:
+        # treat the factor as neutral until the point-in-time history contains
+        # meaningful variation. This keeps one flat factor from aborting the
+        # complete symbol scan while remaining fail-closed against invented edge.
+        return 0.0
 
     return _clip((value - mean) / std, -Z_CLIP, Z_CLIP)
 
