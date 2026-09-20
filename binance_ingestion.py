@@ -764,14 +764,14 @@ class BinanceFuturesIngestion:
             if not isinstance(item, dict):
                 continue
             symbol = item.get("symbol")
+            if not isinstance(symbol, str) or not symbol.endswith("USDT"):
+                continue
             try:
                 interval_h = float(item["fundingIntervalHours"])
             except (KeyError, TypeError, ValueError):
-                return None
-            if not isinstance(symbol, str) or not symbol.endswith("USDT"):
-                return None
+                continue
             if not math.isfinite(interval_h) or interval_h <= 0.0:
-                return None
+                continue
             out[symbol] = interval_h
         return out
 
