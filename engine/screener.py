@@ -555,9 +555,14 @@ class QuantScreener:
                             start_time_ms=closed_open_ms,
                             end_time_ms=current_open_ms,
                         )
-                        if sent is None:
-                            return None
-                        whale_divergence = float(sent.divergence_score)
+                        if sent is not None:
+                            whale_divergence = float(sent.divergence_score)
+                        elif p_snap is not None and p_snap.whale_divergence_history_5m:
+                            # Берем сентимент прошлой свечи, если Binance задерживает расчет
+                            whale_divergence = float(p_snap.whale_divergence_history_5m[-1])
+                        else:
+                            whale_divergence = 0.0  # Нейтральный сентимент по умолчанию 
+                        
                         if not math.isfinite(whale_divergence):
                             return None
 
