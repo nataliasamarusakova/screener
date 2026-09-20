@@ -1,7 +1,6 @@
 name: Quant Screener Engine
 
 on:
-  # no in-repo cron schedule is wanted).
   repository_dispatch: 
     types: [run_quant_engine]
 
@@ -54,6 +53,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "${BINANCE_API_KEY:-}"
+          test -n "${{ secrets.WIREGUARD_CONF }}"
 
       - name: Install dependencies
         run: |
@@ -66,8 +66,23 @@ jobs:
       - name: Execute pytest test suite
         run: python -m pytest -q
 
+      - name: Connect WireGuard VPN (Proton Netherlands)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y wireguard resolvconf
+          echo "${{ secrets.WIREGUARD_CONF }}" | sudo tee /etc/wireguard/wg0.conf > /dev/null
+          sudo wg-quick up wg0
+          echo "=== Active Outbound IP via VPN ==="
+          curl -s --max-time 10 https://ipinfo.io/json | grep -E "ip|country|city|org" || true
+
       - name: Run 5-Minute Quant Screener
         run: python cron_runner.py
+
+      - name: Disconnect WireGuard VPN
+        if: always()
+        run: |
+          sudo wg-quick down wg0 2>/dev/null || true
 
       - name: Persist market state & latest signals
         if: success()
