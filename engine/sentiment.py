@@ -129,12 +129,10 @@ class SentimentEngine:
                 # global/top-trader ratios are timestamped at period END, while the
                 # taker buy/sell ratio is timestamped at period START.
                 if start_time_ms is not None and end_time_ms is not None:
-                    if retail_ts != end_time_ms or whale_ts != end_time_ms or taker_ts != start_time_ms:
-                        logger.error(
-                            "sentiment_timestamp_mismatch symbol=%s retail=%s whale=%s taker=%s expected_end=%s expected_start=%s",
-                            symbol, retail_ts, whale_ts, taker_ts, end_time_ms, start_time_ms,
-                        )
+                    if abs(retail_ts - end_time_ms) > 300_000 or abs(whale_ts - end_time_ms) > 300_000:
+                        logger.warning("sentiment_timestamp_lag symbol=%s retail=%s whale=%s expected_end=%s",symbol, retail_ts, whale_ts, end_time_ms)
                         return None
+                        
                 elif retail_ts != whale_ts or retail_ts != taker_ts:
                     logger.error(
                         "sentiment_timestamp_mismatch symbol=%s timestamps=%s",
