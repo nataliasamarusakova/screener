@@ -34,7 +34,7 @@ jobs:
         with:
           fetch-depth: 1
           ref: main
-          persist-credentials: false
+          persist-credentials: true
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -87,13 +87,17 @@ jobs:
       - name: Persist market state & latest signals
         if: success()
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          export GITHUB_TOKEN="${GITHUB_TOKEN:?GITHUB_TOKEN is required}"
           
-          # Безопасное добавление только существующих файлов
+          # Официальный способ аутентификации push через токен GitHub Actions:
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          # Добавляем только существующие файлы
           for f in .market_state.bin .signals_latest.json .alert_cache.json; do
             if [ -f "$f" ]; then
               git add -f "$f"
@@ -104,11 +108,13 @@ jobs:
             echo "No state changes to commit."
             exit 0
           fi
+
           git commit -m "chore(state): update quant market snapshot [skip ci]"
+
           for attempt in 1 2 3 4 5; do
-            git -c http.extraheader="AUTHORIZATION: bearer ${GITHUB_TOKEN}" fetch origin main
+            git fetch origin main
             if git rebase origin/main; then
-              if git -c http.extraheader="AUTHORIZATION: bearer ${GITHUB_TOKEN}" push origin HEAD:main; then
+              if git push origin HEAD:main; then
                 echo "State snapshot committed successfully."
                 exit 0
               fi
@@ -117,5 +123,6 @@ jobs:
             fi
             sleep $((attempt * 2))
           done
+
           echo "ERROR: Could not push state changes after all retries." >&2
           exit 1
