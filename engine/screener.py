@@ -177,15 +177,19 @@ class QuantScreener:
         self.sentiment_engine = SentimentEngine()
 
     def load_previous_state(self) -> Dict[str, MarketStateSnapshot]:
-        if not self.state_file.exists():
+        target = self.state_file
+        # Мягкая миграция: если в data/ еще нет файла, берем из корня
+        if not target.exists() and Path(".market_state.bin").exists():
+            target = Path(".market_state.bin")
+        if not target.exists():
             return {}
         try:
-            raw = self.state_file.read_bytes()
+            raw = target.read_bytes()
             if raw:
                 items = msgspec.json.decode(raw, type=List[MarketStateSnapshot])
                 return {item.symbol: item for item in items}
         except (msgspec.DecodeError, OSError, TypeError, ValueError) as exc:
-            logger.error("state_load_failed path=%s error=%s", self.state_file, exc)
+            logger.error("state_load_failed path=%s error=%s", target, exc)
         return {}
 
     def save_current_state(self, snapshots: List[MarketStateSnapshot]) -> None:
