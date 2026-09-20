@@ -728,6 +728,6 @@ class QuantScreener:
                 signal_ready_symbols=signal_ready_symbols,
             )
             return signals, synthetic_liqs, summary
-        finally:
-            await self.ingestion.stop()
-            await self.sentiment_engine.close()
+        except Exception:
+            logger.exception("Screener scan failed")
+            raise
