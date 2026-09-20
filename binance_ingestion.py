@@ -45,6 +45,10 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
+class BinanceRestrictedLocationError(RuntimeError):
+    """Binance rejected this request because the client egress is geo-restricted."""
+
+
 class OrderBookFSMState(enum.Enum):
     DISCONNECTED = "DISCONNECTED"
     BUFFERING = "BUFFERING"
@@ -416,6 +420,17 @@ class BinanceFuturesIngestion:
             async with session.request(method, url, params=params) as resp:
                 if resp.status == 200:
                     return await resp.json(content_type=None)
+
+                if resp.status == 451:
+                    body = await resp.text()
+                    logger.critical(
+                        "binance_restricted_location status=451 symbol=%s body=%s",
+                        symbol, body[:500],
+                    )
+                    raise BinanceRestrictedLocationError(
+                        "Binance Futures rejected the request with HTTP 451 "
+                        "(restricted location)"
+                    )
 
                 retry_after_raw = resp.headers.get("Retry-After")
                 try:
