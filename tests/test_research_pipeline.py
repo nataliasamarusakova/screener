@@ -190,3 +190,28 @@ def test_research_history_roundtrip_supports_state_recovery(tmp_path):
     )
     assert len(restored["BTCUSDT"]) == 4
     assert restored["BTCUSDT"][-1]["basis_bps"] == -3.7
+
+
+def test_state_recovery_prefers_longer_durable_history():
+    from engine.screener import QuantScreener
+    state_values = (0.1, 0.2, 0.3)
+    persisted = [
+        {"funding_rate_8h": 0.01, "basis_bps": 1.0, "obi": 0.1, "vpin": 0.2},
+        {"funding_rate_8h": 0.02, "basis_bps": 2.0, "obi": 0.2, "vpin": 0.2},
+        {"funding_rate_8h": 0.03, "basis_bps": 3.0, "obi": 0.3, "vpin": 0.2},
+        {"funding_rate_8h": 0.04, "basis_bps": 4.0, "obi": 0.4, "vpin": 0.2},
+    ]
+    hist, source = QuantScreener._select_recoverable_history(
+        state_values, persisted, lambda row: row.get("funding_rate_8h"), True
+    )
+    assert len(hist) == 4
+    assert source == "RESEARCH"
+
+
+def test_state_recovery_uses_empty_when_no_prior_rows():
+    from engine.screener import QuantScreener
+    hist, source = QuantScreener._select_recoverable_history(
+        (), [], lambda row: row.get("funding_rate_8h"), False
+    )
+    assert hist == ()
+    assert source == "EMPTY"
