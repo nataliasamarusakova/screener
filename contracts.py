@@ -8,9 +8,7 @@ import msgspec
 
 
 class NormalizedTrade(msgspec.Struct, gc=False):
-    """
-    Normalized taker trade event from crypto derivative exchanges.
-    """
+    """Normalized taker trade event from crypto derivative exchanges."""
     symbol: str
     price: float
     quantity: float
@@ -28,90 +26,84 @@ class OrderBookLevel(msgspec.Struct, gc=False):
 
 
 class OrderBookSnapshot(msgspec.Struct, gc=False):
-    """
-    Synchronized L2 OrderBook snapshot with microstructure metrics.
-    """
+    """Synchronized L2 OrderBook snapshot with microstructure metrics."""
     symbol: str
     last_update_id: int
     timestamp_ms: int
-    bids: tuple[tuple[float, float], ...]  # Tuple of (price, qty)
-    asks: tuple[tuple[float, float], ...]  # Tuple of (price, qty)
+    bids: tuple[tuple[float, float], ...]
+    asks: tuple[tuple[float, float], ...]
     best_bid: float
     best_ask: float
     mid_price: float
     spread: float
     spread_bps: float
-    obi_depth5: float       # Order Book Imbalance across top 5 levels: (BidQty - AskQty) / (BidQty + AskQty)
-    obi_depth10: float      # Order Book Imbalance across top 10 levels
+    obi_depth5: float
+    obi_depth10: float
 
 
 class NormalizedFunding(msgspec.Struct, gc=False):
-    """
-    Normalized funding rate brought to a unified 8-hour basis and annualized scale.
-    Includes Perp vs Spot Index basis spread.
-    """
+    """Normalized funding rate brought to a unified 8-hour basis."""
     symbol: str
     raw_rate: float
     interval_hours: float
-    normalized_8h_rate: float   # Normalized to 8h: (1 + raw)^(8 / interval_h) - 1
-    annualized_rate: float      # Annualized percentage (normalized_8h_rate * 3 * 365 * 100)
+    normalized_8h_rate: float
+    annualized_rate: float
     mark_price: float
     index_price: float
-    basis_spread: float         # mark_price - index_price
-    basis_spread_bps: float     # ((mark_price - index_price) / index_price) * 10000
+    basis_spread: float
+    basis_spread_bps: float
     next_funding_time_ms: int
     timestamp_ms: int
 
 
 class SyntheticLiquidation(msgspec.Struct, gc=False):
-    """
-    Reconstructed synthetic liquidation event.
-    """
+    """Reconstructed synthetic liquidation event."""
     symbol: str
     timestamp_ms: int
     price: float
-    delta_oi: float                     # Negative drop in Open Interest
-    taker_volume: float                 # Recorded market taker volume in the same interval
-    side: str                           # "LONG_LIQUIDATION" (forced sell) or "SHORT_LIQUIDATION" (forced buy)
-    estimated_liquidation_volume: float # Reconstructed volume
-    anomaly_ratio: float                # abs(delta_oi) / taker_volume
-    is_synthetic: bool                  # True if reconstructed, False if from official forceOrder stream
+    delta_oi: float
+    taker_volume: float
+    side: str
+    estimated_liquidation_volume: float
+    anomaly_ratio: float
+    is_synthetic: bool
 
 
 class SignalEvent(msgspec.Struct, gc=False):
-    """
-    Composite Quantitative Signal (-100 to +100) with breakdown of factors and risk parameters.
-    """
+    """Composite Quantitative Signal (-100 to +100) with breakdown of factors and risk parameters."""
     symbol: str
     timestamp_ms: int
     signal_type: str            # "STRONG_LONG", "STRONG_SHORT", "NEUTRAL"
-    composite_score: float      # Score in range [-100.0, +100.0]
-    z_cvd_div: float            # Z-Score of Price vs CVD divergence
-    z_fund_trap: float          # Z-Score of funding trap detection
-    z_delta_oi: float           # Z-Score of Open Interest accumulation/depletion
-    z_micro: float              # Z-Score of Microstructure (OBI, VPIN, Spread)
-    vpin: float                 # Volume-Synchronized Probability of Informed Trading
-    obi: float                  # Order Book Imbalance [-1.0, 1.0]
-    funding_8h: float           # 8h normalized funding rate
-    basis_bps: float            # Perp vs Index basis spread in bps
-    price: float                # Current reference price
-    invalidation_price: float   # Hard stop / invalidation level
-    target_price: float         # Model target price based on volatility / structure
-    risk_reward_ratio: float    # Projected Net R:R ratio (friction-adjusted)
-    decision_timestamp_ms: int  # Point-in-time timestamp
-    z_whale_sentiment: float = 0.0 # Z-Score of Smart Money vs Retail positioning divergence
-    relative_strength: float = 0.0 # Beta-adjusted Relative Strength vs BTC (%)
-    sweep_reclaim: bool = False    # True if Wyckoff Spring / Upthrust liquidity sweep confirmed
-    gate_status: str = "PASSED"    # "PASSED", "BLOCKED_BY_BTC_DUMP", "BLOCKED_PRE_FUNDING_PAYOUT", etc.
-    sweep_pattern: str = "NONE"     # "BULLISH_SWEEP_RECLAIM", "BEARISH_SWEEP_RECLAIM", or "NONE"
-    suggested_position_usd: float = 0.0  # Recommended position notional in USD based on 1% risk
-    suggested_leverage: int = 1          # Recommended leverage
+    composite_score: float
+    z_cvd_div: float
+    z_fund_trap: float
+    z_delta_oi: float
+    z_micro: float
+    vpin: float
+    obi: float
+    funding_8h: float
+    basis_bps: float
+    price: float
+    invalidation_price: float
+    target_price: float
+    risk_reward_ratio: float    # Net R:R (friction-adjusted). 0.0 for NEUTRAL.
+    decision_timestamp_ms: int
+    z_whale_sentiment: float = 0.0
+    relative_strength: float = 0.0
+    sweep_reclaim: bool = False
+    gate_status: str = "PASSED"
+    sweep_pattern: str = "NONE"
+    suggested_position_usd: float = 0.0
+    suggested_leverage: int = 1
+    # NEW: Trailing stop parameters (activates when price reaches activation threshold)
+    trailing_stop_activation_pct: float = 0.0   # In fraction of price (e.g. 0.005 = 0.5%)
+    trailing_stop_distance_pct: float = 0.0     # Distance from peak (e.g. 0.003 = 0.3%)
+    # NEW: Friction model that was actually applied
+    applied_friction_rt_pct: float = 0.0
 
 
 class MarketStateSnapshot(msgspec.Struct, gc=False):
-    """
-    State cache representation for 5-minute cron persistence.
-    """
+    """State cache representation for 5-minute cron persistence."""
     symbol: str
     timestamp_ms: int
     last_price: float
