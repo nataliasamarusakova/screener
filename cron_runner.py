@@ -70,6 +70,14 @@ async def main() -> None:
         print(f"📊 [SCAN COMPLETE] Scanned {summary.total_scanned} symbols in {summary.duration_sec}s")
         print(f"🪙 BTC Regime: {summary.btc_regime} ({summary.btc_change_5m_pct:+.2f}%)")
         print(f"📈 Successful: {summary.successful_symbols} | Rejected: {summary.rejected_symbols} | Signals Ready: {summary.signal_ready_symbols}")
+        if summary.signal_ready_symbols == 0 and summary.signal_readiness_reasons:
+            top_reasons = ", ".join(f"{k}={v}" for k, v in list(summary.signal_readiness_reasons.items())[:8])
+            print(f"🧭 Signal readiness blockers: {top_reasons}")
+        if summary.state_recovery_sources:
+            recovery_text = ", ".join(f"{k}={v}" for k, v in summary.state_recovery_sources.items())
+            print(f"🗃️ State history sources: {recovery_text}")
+        if summary.stale_state_symbols_dropped > 0:
+            print(f"🧹 Stale state symbols dropped: {summary.stale_state_symbols_dropped}")
         print(f"⚡ Strong Longs: {summary.strong_longs_count} | Strong Shorts: {summary.strong_shorts_count} | Liqs: {summary.synthetic_liqs_count}")
         if summary.portfolio_limited_symbols > 0:
             print(f"🚫 Portfolio-limited (downgraded): {summary.portfolio_limited_symbols}")
