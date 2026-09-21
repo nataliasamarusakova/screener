@@ -1,6 +1,6 @@
 """
 Core typed data contracts for Quantitative Crypto Derivatives Platform.
-Uses msgspec.Struct(gc=False) for bounded object-model overhead; hot-path NumPy buffers may still allocate.
+Uses msgspec.Struct(gc=False) for bounded object-model overhead.
 """
 from __future__ import annotations
 from typing import Optional
@@ -10,7 +10,6 @@ import msgspec
 class NormalizedTrade(msgspec.Struct, gc=False):
     """
     Normalized taker trade event from crypto derivative exchanges.
-    msgspec.Struct minimizes Python object overhead; this does not guarantee zero allocations end-to-end.
     """
     symbol: str
     price: float
@@ -31,7 +30,6 @@ class OrderBookLevel(msgspec.Struct, gc=False):
 class OrderBookSnapshot(msgspec.Struct, gc=False):
     """
     Synchronized L2 OrderBook snapshot with microstructure metrics.
-    msgspec Struct keeps Python object overhead bounded; callers must still account for numeric buffer allocations.
     """
     symbol: str
     last_update_id: int
@@ -68,8 +66,6 @@ class NormalizedFunding(msgspec.Struct, gc=False):
 class SyntheticLiquidation(msgspec.Struct, gc=False):
     """
     Reconstructed synthetic liquidation event.
-    Detects hidden liquidation cascades throttled by exchange WebSocket endpoints.
-    Triggered when -DeltaOI anomalously outstrips market taker volume during volatility spikes.
     """
     symbol: str
     timestamp_ms: int
@@ -101,19 +97,20 @@ class SignalEvent(msgspec.Struct, gc=False):
     price: float                # Current reference price
     invalidation_price: float   # Hard stop / invalidation level
     target_price: float         # Model target price based on volatility / structure
-    risk_reward_ratio: float    # Projected R:R ratio
-    decision_timestamp_ms: int  # Point-in-time timestamp (must be < execution_timestamp_ms)
+    risk_reward_ratio: float    # Projected Net R:R ratio (friction-adjusted)
+    decision_timestamp_ms: int  # Point-in-time timestamp
     z_whale_sentiment: float = 0.0 # Z-Score of Smart Money vs Retail positioning divergence
     relative_strength: float = 0.0 # Beta-adjusted Relative Strength vs BTC (%)
     sweep_reclaim: bool = False    # True if Wyckoff Spring / Upthrust liquidity sweep confirmed
-    gate_status: str = "PASSED"    # "PASSED", "GATED_BTC_DUMP", "GATED_PRE_FUNDING", etc.
+    gate_status: str = "PASSED"    # "PASSED", "BLOCKED_BY_BTC_DUMP", "BLOCKED_PRE_FUNDING_PAYOUT", etc.
     sweep_pattern: str = "NONE"     # "BULLISH_SWEEP_RECLAIM", "BEARISH_SWEEP_RECLAIM", or "NONE"
+    suggested_position_usd: float = 0.0  # Recommended position notional in USD based on 1% risk
+    suggested_leverage: int = 1          # Recommended leverage
 
 
 class MarketStateSnapshot(msgspec.Struct, gc=False):
     """
     State cache representation for 5-minute cron persistence.
-    Allows zero-docker cron execution without losing historical delta context.
     """
     symbol: str
     timestamp_ms: int
@@ -126,20 +123,19 @@ class MarketStateSnapshot(msgspec.Struct, gc=False):
     vpin_estimate: float
     obi_score: float
     composite_score: float
-    low_24h: float = 0.0       # 24h low — used as swing low reference for Wyckoff sweep detection
-    high_24h: float = 0.0      # 24h high — used as swing high reference for Wyckoff sweep detection
+    low_24h: float = 0.0
+    high_24h: float = 0.0
     whale_sentiment_z: float = 0.0
-    # FIX [C1]: History buffers for CVD divergence detection (need 4-12 points minimum)
-    cvd_history_5m: tuple = ()  # Tuple of last N CVD values (5m snapshots)
-    price_history_5m: tuple = ()  # Tuple of last N prices (5m snapshots)
-    funding_history_5m: tuple = ()  # Historical 8h funding observations for empirical Z-scores
-    basis_history_5m: tuple = ()  # Historical basis bps observations for empirical Z-scores
-    delta_oi_pct_history_5m: tuple = ()  # Historical DeltaOI/OI observations for empirical Z-scores
-    micro_factor_history_5m: tuple = ()  # Historical OBI*(1-VPIN) observations for empirical Z-scores
-    whale_divergence_history_5m: tuple = ()  # Historical raw whale-retail divergence observations
-    cvd_divergence_history_5m: tuple = ()  # Historical CVD divergence factor observations
-    candle_open_time_ms: int = 0  # Open time of the most recently persisted closed 5m candle
-    candle_open_times_5m: tuple = ()  # Closed 5m candle open times aligned with price_history_5m
+    cvd_history_5m: tuple = ()
+    price_history_5m: tuple = ()
+    funding_history_5m: tuple = ()
+    basis_history_5m: tuple = ()
+    delta_oi_pct_history_5m: tuple = ()
+    micro_factor_history_5m: tuple = ()
+    whale_divergence_history_5m: tuple = ()
+    cvd_divergence_history_5m: tuple = ()
+    candle_open_time_ms: int = 0
+    candle_open_times_5m: tuple = ()
     candle_high_5m: float = 0.0
     candle_low_5m: float = 0.0
     signal_ready: bool = False
