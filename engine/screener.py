@@ -1,6 +1,7 @@
 """
 Production 5-minute Quant Screener.
-Fail-closed pipeline with robust lag recovery, friction-adjusted scoring, and position sizing.
+Fail-closed pipeline with robust lag recovery, friction-adjusted scoring,
+per-symbol cost model, portfolio correlation limit, and position sizing.
 """
 from __future__ import annotations
 
@@ -44,6 +45,7 @@ class ScreenerResult(msgspec.Struct, gc=False):
     rejected_symbols: int = 0
     failed_symbols: int = 0
     signal_ready_symbols: int = 0
+    portfolio_limited_symbols: int = 0   # NEW: count of signals downgraded by correlation limit
 
 
 def save_latest_scan_json(
@@ -66,6 +68,7 @@ def save_latest_scan_json(
             "rejected_symbols": summary.rejected_symbols,
             "failed_symbols": summary.failed_symbols,
             "signal_ready_symbols": summary.signal_ready_symbols,
+            "portfolio_limited_symbols": summary.portfolio_limited_symbols,
         },
         "signals": [
             {
@@ -89,6 +92,9 @@ def save_latest_scan_json(
                 "risk_reward_ratio": s.risk_reward_ratio,
                 "suggested_position_usd": s.suggested_position_usd,
                 "suggested_leverage": s.suggested_leverage,
+                "trailing_stop_activation_pct": s.trailing_stop_activation_pct,
+                "trailing_stop_distance_pct": s.trailing_stop_distance_pct,
+                "applied_friction_rt_pct": s.applied_friction_rt_pct,
             }
             for s in signals
         ],
@@ -140,12 +146,14 @@ class QuantScreener:
         self.top_n_symbols = top_n_symbols
         self.history_bars = int(os.getenv("SIGNAL_HISTORY_BARS", "60"))
         self.z_history_min_samples = int(os.getenv("SIGNAL_Z_MIN_SAMPLES", "24"))
-        self.cvd_lookback = int(os.getenv("CVD_LOOKBACK_BARS", "12")) # Raised from 6 to 12
+        self.cvd_lookback = int(os.getenv("CVD_LOOKBACK_BARS", "12"))
         self.vpin_window_baskets = int(os.getenv("VPIN_WINDOW_BASKETS", "10"))
         self.beta_min_samples = int(os.getenv("BETA_MIN_SAMPLES", "24"))
         self.atr_lookback = int(os.getenv("ATR_LOOKBACK_BARS", "12"))
         self.failure_ratio_limit = float(os.getenv("SCAN_FAILURE_RATIO_LIMIT", "0.10"))
         self.account_equity = float(os.getenv("ACCOUNT_EQUITY_USDT", "10000.0"))
+        # NEW: correlation limit
+        self.max_strong_per_direction = int(os.getenv("MAX_STRONG_PER_DIRECTION", "3"))
 
         if self.concurrency_limit < 1:
             raise ValueError("SCAN_CONCURRENCY must be >= 1")
@@ -153,8 +161,11 @@ class QuantScreener:
             raise ValueError("TOP_N_SYMBOLS must be >= 1")
         if self.history_bars <= self.z_history_min_samples:
             raise ValueError("SIGNAL_HISTORY_BARS must be greater than SIGNAL_Z_MIN_SAMPLES")
+        if self.max_strong_per_direction < 1:
+            raise ValueError("MAX_STRONG_PER_DIRECTION must be >= 1")
 
         self.ingestion = BinanceFuturesIngestion(symbols=[])
+        # FIX: read min_effective_rrr and friction from env
         self.signal_engine = QuantSignalEngine(
             z_history_min_samples=self.z_history_min_samples,
             min_effective_rrr=float(os.getenv("MIN_EFFECTIVE_RRR", "1.30")),
@@ -165,7 +176,7 @@ class QuantScreener:
         self.funding_filter = FundingFilterEngine(proximity_threshold_minutes=20.0)
         self.quality_filter = QualityFilter(
             min_24h_volume_usdt=float(os.getenv("MIN_24H_VOLUME_USDT", "10000000")),
-            max_spread_bps=float(os.getenv("MAX_SPREAD_BPS", "2.5")), # Tightened to 2.5 bps
+            max_spread_bps=float(os.getenv("MAX_SPREAD_BPS", "2.5")),
         )
         self.sweep_detector = LiquiditySweepDetector()
         self.sentiment_engine = SentimentEngine()
@@ -199,7 +210,7 @@ class QuantScreener:
                 temp.flush()
                 os.fsync(temp.fileno())
             os.replace(temp_name, self.state_file)
-            dir_fd = os.open(target_parent := self.state_file.parent, os.O_RDONLY)
+            dir_fd = os.open(self.state_file.parent, os.O_RDONLY)
             try:
                 os.fsync(dir_fd)
             finally:
@@ -246,12 +257,57 @@ class QuantScreener:
             prev_close = close
         return (sum(true_ranges) / len(true_ranges)) / parsed[-1][4]
 
+    @staticmethod
+    def _compute_friction_rt(ob_spread_bps: float, atr_pct: float) -> float:
+        """
+        NEW: per-symbol friction model.
+        commission (taker×2) + 2×spread + slippage estimate.
+        Slippage ~15% of ATR, capped at 30 bps.
+        """
+        commission_rt = 0.0010  # 5 bps × 2
+        spread_cost_rt = (ob_spread_bps * 2.0) / 10000.0
+        slippage_rt = min(atr_pct * 0.15, 0.0030)
+        return commission_rt + spread_cost_rt + slippage_rt
+
     async def close(self) -> None:
         await asyncio.gather(
             self.ingestion.stop(),
             self.sentiment_engine.close(),
             return_exceptions=False,
         )
+
+    def _apply_portfolio_correlation_limit(
+        self, signals: List[SignalEvent]
+    ) -> Tuple[List[SignalEvent], int]:
+        """
+        NEW: cap number of STRONG signals per direction.
+        Prevents opening 10 correlated longs.
+        Downgrades excess STRONG signals to NEUTRAL.
+        """
+        strong_longs = [s for s in signals if s.signal_type == "STRONG_LONG"]
+        strong_shorts = [s for s in signals if s.signal_type == "STRONG_SHORT"]
+
+        long_kept = {
+            s.symbol for s in sorted(strong_longs, key=lambda s: -s.composite_score)[
+                : self.max_strong_per_direction
+            ]
+        }
+        short_kept = {
+            s.symbol for s in sorted(strong_shorts, key=lambda s: s.composite_score)[
+                : self.max_strong_per_direction
+            ]
+        }
+        kept = long_kept | short_kept
+
+        downgraded = 0
+        for s in signals:
+            if s.signal_type in ("STRONG_LONG", "STRONG_SHORT") and s.symbol not in kept:
+                s.signal_type = "NEUTRAL"
+                s.gate_status = "BLOCKED_PORTFOLIO_CORRELATION_LIMIT"
+                s.suggested_position_usd = 0.0
+                s.suggested_leverage = 1
+                downgraded += 1
+        return signals, downgraded
 
     async def scan(self) -> Tuple[List[SignalEvent], List[SyntheticLiquidation], ScreenerResult]:
         t0 = time.time()
@@ -433,6 +489,10 @@ class QuantScreener:
                                 recent_swing_low=recent_low_swing,
                                 cvd_delta=current_cvd_delta,
                             )
+                        else:
+                            # fallback: use 24h extremes from ticker
+                            recent_high_swing = high_24h
+                            recent_low_swing = low_24h
                         sweep_reclaim = sweep_event is not None and sweep_event.is_confirmed
                         sweep_pattern = sweep_event.pattern_type if sweep_event is not None else "NONE"
 
@@ -482,7 +542,7 @@ class QuantScreener:
                             alt_change_5m_pct=alt_change_5m_pct,
                             beta=rolling_beta,
                         ) if symbol == "BTCUSDT" or rolling_beta is not None else (False, "INSUFFICIENT_ROLLING_BETA")
-                        
+
                         btc_short_allowed, btc_short_reason = self.regime_engine.check_signal_gate(
                             symbol=symbol,
                             signal_type="STRONG_SHORT",
@@ -525,8 +585,6 @@ class QuantScreener:
                         basis_hist = base_basis_hist[-self.history_bars + 1:] + (basis_bps,)
                         micro_factor = obi * (1.0 - vpin)
                         micro_hist = base_micro_hist[-self.history_bars + 1:] + (micro_factor,)
-                        
-                        # Preserve existing contract: append whale sample only if fresh sentiment loaded
                         whale_hist = (
                             base_whale_hist[-self.history_bars + 1:] + (whale_divergence,)
                             if sentiment_available
@@ -536,9 +594,6 @@ class QuantScreener:
                         div_hist = (base_div_hist[-self.history_bars + 1:] + (div_score,)) if div_score is not None else base_div_hist
 
                         signal: Optional[SignalEvent] = None
-                        
-                        # FIX: Do NOT block entire signal_ready state if whale sentiment is lagged/unavailable.
-                        # As long as the core 5 factors (funding, basis, delta OI, micro, div) have 24 bars, signal is ready!
                         signal_ready = (
                             delta_oi_pct is not None
                             and (rolling_beta is not None or symbol == "BTCUSDT")
@@ -570,6 +625,9 @@ class QuantScreener:
                             if not sentiment_available or len(whale_hist) - 1 < self.z_history_min_samples:
                                 z_whale = 0.0
 
+                            # NEW: per-symbol friction
+                            friction_rt = self._compute_friction_rt(ob.spread_bps, atr_pct)
+
                             signal = self.signal_engine.compute_signal(
                                 symbol=symbol,
                                 current_price=candle_close,
@@ -596,6 +654,8 @@ class QuantScreener:
                                 z_whale_override=z_whale,
                                 timestamp_ms=int(time.time() * 1000),
                                 account_equity=self.account_equity,
+                                whale_history_length=len(whale_hist) - 1,
+                                friction_round_trip_pct=friction_rt,
                             )
 
                         snapshot = MarketStateSnapshot(
@@ -671,6 +731,9 @@ class QuantScreener:
             self.save_current_state(list(merged_state.values()))
 
             signals.sort(key=lambda s: s.composite_score, reverse=True)
+            # NEW: portfolio correlation limit BEFORE counting strong
+            signals, portfolio_limited = self._apply_portfolio_correlation_limit(signals)
+
             strong_longs = [s for s in signals if s.signal_type == "STRONG_LONG"]
             strong_shorts = [s for s in signals if s.signal_type == "STRONG_SHORT"]
             duration = time.time() - t0
@@ -688,6 +751,7 @@ class QuantScreener:
                 rejected_symbols=rejected_symbols,
                 failed_symbols=failed_symbols,
                 signal_ready_symbols=signal_ready_symbols,
+                portfolio_limited_symbols=portfolio_limited,
             )
             return signals, synthetic_liqs, summary
         except Exception:
