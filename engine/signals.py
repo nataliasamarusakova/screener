@@ -1,7 +1,7 @@
 """
 Quantitative Signal Engine.
-Calculates empirical factor Z-scores, realistic net R:R ratios with fee/friction modeling,
-and position sizing based on fractional capital risk.
+Calculates empirical factor Z-scores, friction-adjusted Net R:R, position sizing,
+and trailing-stop parameters.
 """
 from __future__ import annotations
 
@@ -26,8 +26,9 @@ def empirical_zscore(
     min_std_floor: float = 0.05,
 ) -> float:
     """
-    Compute a point-in-time sample Z-score from prior observations.
-    Employs min_std_floor to prevent explosive division on sparse indicator histories.
+    Point-in-time sample Z-score with a minimum std floor.
+    NOTE: for bimodal distributions (e.g. CVD divergence which is often 0 or ±1)
+    prefer `percentile_score` instead; Z-score is retained for compatibility.
     """
     if not math.isfinite(value):
         raise ValueError("Non-finite factor value")
@@ -47,9 +48,33 @@ def empirical_zscore(
     if std <= 1e-12:
         return 0.0
 
-    # Minimum standard deviation floor prevents synthetic +3.0 / -3.0 pin on sparse zeros
     effective_std = max(std, min_std_floor)
     return _clip((value - mean) / effective_std, -Z_CLIP, Z_CLIP)
+
+
+def percentile_score(
+    value: float,
+    history: Sequence[float],
+    min_samples: int = 24,
+) -> float:
+    """
+    NEW: rank-based score in [-Z_CLIP, +Z_CLIP].
+    Robust to bimodal / heavy-tailed distributions where Z-score explodes.
+    score = ((percentile_rank - 0.5) * 2) * Z_CLIP, clipped.
+    """
+    if not math.isfinite(value):
+        raise ValueError("Non-finite factor value")
+    if min_samples < 3:
+        raise ValueError("min_samples must be >= 3")
+
+    hist = [float(x) for x in history if math.isfinite(float(x))]
+    if len(hist) < min_samples:
+        raise ValueError(f"Insufficient history: {len(hist)} < {min_samples}")
+
+    below = sum(1 for x in hist if x < value)
+    equal = sum(1 for x in hist if x == value)
+    pct = (below + 0.5 * equal) / len(hist)
+    return _clip((pct - 0.5) * 2.0 * Z_CLIP, -Z_CLIP, Z_CLIP)
 
 
 def calculate_position_size(
@@ -60,11 +85,13 @@ def calculate_position_size(
     max_leverage: int = 3,
 ) -> Tuple[float, int]:
     """
-    Calculates position size in USD such that reaching invalidation_price
-    loses exactly risk_per_trade_pct of account_equity.
+    Fixed-fractional position sizing: reaching invalidation_price loses exactly
+    risk_per_trade_pct of account_equity.
     """
+    if account_equity <= 0.0 or current_price <= 0.0:
+        return 0.0, 1
     stop_dist_pct = abs(current_price - invalidation_price) / current_price
-    if stop_dist_pct <= 1e-6 or account_equity <= 0.0 or current_price <= 0.0:
+    if stop_dist_pct <= 1e-6:
         return 0.0, 1
     target_risk_usd = account_equity * risk_per_trade_pct
     position_usd = target_risk_usd / stop_dist_pct
@@ -76,7 +103,7 @@ def calculate_position_size(
 
 
 class QuantSignalEngine:
-    """Computes empirical factor Z-scores, friction-adjusted R:R and SignalEvents."""
+    """Computes empirical factor Z-scores, friction-adjusted R:R, and SignalEvents."""
 
     calculate_position_size = staticmethod(calculate_position_size)
 
@@ -98,19 +125,23 @@ class QuantSignalEngine:
         max_atr_multiplier: float = 2.50,
         target_risk_reward: float = 2.0,
         friction_round_trip_pct: float = 0.0018,
-        min_effective_rrr: float = 0.0,
+        min_effective_rrr: float = 1.30,   # FIX: default now 1.30, was 0.0 (dead code)
+        trailing_activation_r: float = 0.5,  # NEW: activate trailing at +0.5R
+        trailing_distance_r: float = 0.7,    # NEW: trail width = 0.7R
     ) -> None:
         numeric_config = (
             w_cvd, w_fund, w_oi, w_micro, w_whale,
             funding_weight, basis_weight, score_tanh_scale,
             sweep_booster_points, strong_signal_threshold,
             swing_buffer_bps, atr_stop_multiplier, max_atr_multiplier,
-            target_risk_reward, friction_round_trip_pct, min_effective_rrr
+            target_risk_reward, friction_round_trip_pct, min_effective_rrr,
+            trailing_activation_r, trailing_distance_r,
         )
         if not all(math.isfinite(float(x)) for x in numeric_config):
             raise ValueError("Signal configuration must be finite")
         if any(float(x) < 0.0 for x in (w_cvd, w_fund, w_oi, w_micro, w_whale)):
             raise ValueError("Signal weights must be non-negative")
+
         self.w_cvd = float(w_cvd)
         self.w_fund = float(w_fund)
         self.w_oi = float(w_oi)
@@ -129,6 +160,8 @@ class QuantSignalEngine:
         self.target_risk_reward = float(target_risk_reward)
         self.friction_round_trip_pct = float(friction_round_trip_pct)
         self.min_effective_rrr = float(min_effective_rrr)
+        self.trailing_activation_r = float(trailing_activation_r)
+        self.trailing_distance_r = float(trailing_distance_r)
 
         if self.total_weights <= 0.0:
             raise ValueError("Signal weights must sum to a positive value")
@@ -140,8 +173,12 @@ class QuantSignalEngine:
             raise ValueError("score_tanh_scale and target_risk_reward must be positive")
         if not (0.0 < self.strong_signal_threshold <= 100.0):
             raise ValueError("strong_signal_threshold must be in (0, 100]")
-        if self.swing_buffer_bps < 0.0 or self.atr_stop_multiplier <= 0.0 or self.max_atr_multiplier < self.atr_stop_multiplier:
+        if self.swing_buffer_bps < 0.0 or self.atr_stop_multiplier <= 0.0:
             raise ValueError("Risk-level configuration has invalid bounds")
+        if self.max_atr_multiplier < self.atr_stop_multiplier:
+            raise ValueError("max_atr_multiplier must be >= atr_stop_multiplier")
+        if self.trailing_activation_r <= 0.0 or self.trailing_distance_r <= 0.0:
+            raise ValueError("Trailing stop parameters must be positive")
 
     def calculate_factor_zscores(
         self,
@@ -159,12 +196,21 @@ class QuantSignalEngine:
         micro_factor_history: Sequence[float],
         cvd_history: Sequence[float],
         whale_history: Sequence[float],
+        use_percentile_for_cvd: bool = True,  # NEW: use percentile for bimodal CVD
     ) -> Tuple[float, float, float, float, float]:
         micro_factor = obi * (1.0 - vpin)
         if not math.isfinite(micro_factor):
             raise ValueError("Non-finite microstructure factor")
 
-        z_cvd = empirical_zscore(cvd_divergence_score, cvd_history, self.z_history_min_samples)
+        # FIX: CVD divergence is bimodal — use percentile_score instead of Z-score.
+        if use_percentile_for_cvd:
+            try:
+                z_cvd = percentile_score(cvd_divergence_score, cvd_history, self.z_history_min_samples)
+            except ValueError:
+                z_cvd = empirical_zscore(cvd_divergence_score, cvd_history, self.z_history_min_samples)
+        else:
+            z_cvd = empirical_zscore(cvd_divergence_score, cvd_history, self.z_history_min_samples)
+
         z_funding = empirical_zscore(funding_rate_8h, funding_history, self.z_history_min_samples)
         z_basis = empirical_zscore(basis_spread_bps, basis_history, self.z_history_min_samples)
         z_fund_trap = _clip(
@@ -174,12 +220,12 @@ class QuantSignalEngine:
         )
         z_delta_oi = empirical_zscore(delta_oi_pct, delta_oi_pct_history, self.z_history_min_samples)
         z_micro = empirical_zscore(micro_factor, micro_factor_history, self.z_history_min_samples)
-        
+
         if len(whale_history) >= self.z_history_min_samples:
             z_whale = empirical_zscore(whale_divergence_score, whale_history, self.z_history_min_samples)
         else:
             z_whale = 0.0
-            
+
         return z_cvd, z_fund_trap, z_delta_oi, z_micro, z_whale
 
     def compute_signal(
@@ -210,6 +256,8 @@ class QuantSignalEngine:
         sweep_pattern: str = "NONE",
         atr_pct: Optional[float] = None,
         account_equity: float = 10000.0,
+        whale_history_length: int = 0,       # NEW: for weight renormalization
+        friction_round_trip_pct: Optional[float] = None,  # NEW: per-symbol override
     ) -> SignalEvent:
         now_ms = timestamp_ms if timestamp_ms is not None else int(time.time() * 1000)
 
@@ -241,12 +289,18 @@ class QuantSignalEngine:
         z_micro = _clip(float(z_micro_override), -Z_CLIP, Z_CLIP)
         z_whale = _clip(float(z_whale_override), -Z_CLIP, Z_CLIP)
 
+        # FIX: renormalize denominator when whale factor has no history
+        whale_active = whale_history_length >= self.z_history_min_samples
+        active_weight_total = self.total_weights - (0.0 if whale_active else self.w_whale)
+        if active_weight_total <= 0.0:
+            active_weight_total = self.total_weights
+
         raw_weighted = (
             self.w_cvd * z_cvd_div
             + self.w_fund * z_fund_trap
             + self.w_oi * z_delta_oi
             + self.w_micro * z_micro
-            + self.w_whale * z_whale
+            + (self.w_whale * z_whale if whale_active else 0.0)
         )
 
         if sweep_reclaim:
@@ -260,7 +314,7 @@ class QuantSignalEngine:
             raise ValueError("sweep_pattern must be NONE when sweep_reclaim=False")
 
         normalized_score = _clip(
-            100.0 * math.tanh(raw_weighted / (self.total_weights * self.score_tanh_scale)),
+            100.0 * math.tanh(raw_weighted / (active_weight_total * self.score_tanh_scale)),
             -100.0,
             100.0,
         )
@@ -290,6 +344,12 @@ class QuantSignalEngine:
         suggested_pos_usd = 0.0
         suggested_lev = 1
         effective_rrr = 0.0
+        trailing_activation_pct = 0.0
+        trailing_distance_pct = 0.0
+        applied_friction = (
+            friction_round_trip_pct if friction_round_trip_pct is not None
+            else self.friction_round_trip_pct
+        )
 
         if candidate_type in ("STRONG_LONG", "STRONG_SHORT"):
             if atr_pct is None or not math.isfinite(atr_pct) or atr_pct <= 0.0:
@@ -303,14 +363,20 @@ class QuantSignalEngine:
 
             if candidate_type == "STRONG_LONG":
                 structural_stop = recent_low * (1.0 - buffer)
-                invalidation_price = min(current_price - min_risk_dist, max(current_price - max_risk_dist, structural_stop))
+                invalidation_price = min(
+                    current_price - min_risk_dist,
+                    max(current_price - max_risk_dist, structural_stop),
+                )
                 if invalidation_price <= 0.0 or invalidation_price >= current_price:
                     raise ValueError("Invalid long invalidation level")
                 gross_risk = current_price - invalidation_price
                 target_price = current_price + gross_risk * self.target_risk_reward
             else:
                 structural_stop = recent_high * (1.0 + buffer)
-                invalidation_price = max(current_price + min_risk_dist, min(current_price + max_risk_dist, structural_stop))
+                invalidation_price = max(
+                    current_price + min_risk_dist,
+                    min(current_price + max_risk_dist, structural_stop),
+                )
                 if invalidation_price <= current_price:
                     raise ValueError("Invalid short invalidation level")
                 gross_risk = invalidation_price - current_price
@@ -320,13 +386,17 @@ class QuantSignalEngine:
 
             gross_risk_pct = gross_risk / current_price
             gross_reward_pct = abs(target_price - current_price) / current_price
-            net_risk_pct = gross_risk_pct + self.friction_round_trip_pct
-            net_reward_pct = max(0.0, gross_reward_pct - self.friction_round_trip_pct)
+            net_risk_pct = gross_risk_pct + applied_friction
+            net_reward_pct = max(0.0, gross_reward_pct - applied_friction)
             effective_rrr = net_reward_pct / net_risk_pct if net_risk_pct > 0.0 else 0.0
 
             if self.min_effective_rrr > 0.0 and effective_rrr < self.min_effective_rrr:
                 signal_type = "NEUTRAL"
-                final_gate = f"BLOCKED_UNPROFITABLE_AFTER_FEES (Net R:R {effective_rrr:.2f}x < {self.min_effective_rrr:.2f}x)"
+                final_gate = (
+                    f"BLOCKED_UNPROFITABLE_AFTER_FEES "
+                    f"(Net R:R {effective_rrr:.2f}x < {self.min_effective_rrr:.2f}x, "
+                    f"friction {applied_friction*100:.3f}%)"
+                )
                 invalidation_price = current_price
                 target_price = current_price
                 effective_rrr = 0.0
@@ -337,6 +407,9 @@ class QuantSignalEngine:
                     current_price=current_price,
                     invalidation_price=invalidation_price,
                 )
+                # NEW: trailing stop in fraction of price
+                trailing_activation_pct = gross_risk_pct * self.trailing_activation_r
+                trailing_distance_pct = gross_risk_pct * self.trailing_distance_r
         else:
             signal_type = "NEUTRAL"
             invalidation_price = current_price
@@ -358,6 +431,7 @@ class QuantSignalEngine:
             price=current_price,
             invalidation_price=round(invalidation_price, 4),
             target_price=round(target_price, 4),
+            # FIX: no fallback to target_risk_reward for NEUTRAL — was a lie in output
             risk_reward_ratio=round(effective_rrr, 2),
             decision_timestamp_ms=now_ms,
             z_whale_sentiment=round(z_whale, 2),
@@ -367,12 +441,16 @@ class QuantSignalEngine:
             sweep_pattern=sweep_pattern,
             suggested_position_usd=suggested_pos_usd,
             suggested_leverage=suggested_lev,
+            trailing_stop_activation_pct=round(trailing_activation_pct, 6),
+            trailing_stop_distance_pct=round(trailing_distance_pct, 6),
+            applied_friction_rt_pct=round(applied_friction, 6),
         )
 
 
 __all__ = [
     "QuantSignalEngine",
     "empirical_zscore",
+    "percentile_score",
     "calculate_position_size",
     "Z_CLIP",
 ]
