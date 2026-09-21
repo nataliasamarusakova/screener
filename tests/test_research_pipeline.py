@@ -126,3 +126,67 @@ def test_research_recorder_is_idempotent(tmp_path):
     out = tmp_path / "features.jsonl"
     assert recorder.export_jsonl(out) == 1
     assert len(out.read_text().splitlines()) == 1
+
+
+def test_sentiment_bucket_normalization_respects_endpoint_timestamp_semantics():
+    from engine.sentiment import SentimentEngine
+    interval = 5 * 60 * 1000
+    bar_open = (1_700_000_000_000 // 300_000) * 300_000
+    assert SentimentEngine._bucket_open_ms(bar_open, timestamp_is_period_end=False) == bar_open
+    assert SentimentEngine._bucket_open_ms(bar_open + interval - 1, timestamp_is_period_end=True) == bar_open
+    assert SentimentEngine._bucket_open_ms(bar_open + interval, timestamp_is_period_end=True) == bar_open
+
+
+def test_research_recorder_persists_idempotent_hourly_shard(tmp_path):
+    from engine.research_recorder import ResearchRecorder
+    db = tmp_path / "features.sqlite3"
+    shards = tmp_path / "shards"
+    recorder = ResearchRecorder(db, shards)
+    row = {"timestamp_ms": 1_700_000_299_999, "symbol": "BTCUSDT", "close": 100.0}
+    assert recorder.append_rows([row, row]) == 1
+    shard_files = list(shards.rglob("*.jsonl"))
+    assert len(shard_files) == 1
+    assert len(shard_files[0].read_text().splitlines()) == 1
+    assert recorder.append_rows([row]) == 0
+    assert len(shard_files[0].read_text().splitlines()) == 1
+
+
+def test_beta_diagnostic_reports_noncontiguous_history():
+    from engine.market_regime import MarketRegimeEngine
+    base = 1_700_000_000_000
+    times = [base + i * 300_000 for i in range(30)]
+    broken = times[:10] + times[11:]
+    beta, reason = MarketRegimeEngine.calculate_rolling_beta_with_reason(
+        broken, [100 + i for i in range(len(broken))],
+        times, [200 + i for i in range(len(times))],
+        min_samples=24,
+    )
+    assert beta is None
+    assert reason == "NONCONTIGUOUS_HISTORY"
+
+
+def test_research_history_roundtrip_supports_state_recovery(tmp_path):
+    from engine.research_recorder import ResearchRecorder
+
+    rec = ResearchRecorder(tmp_path / "features.sqlite3")
+    rows = []
+    start = 1_800_000_000_000
+    for i in range(4):
+        rows.append({
+            "symbol": "BTCUSDT",
+            "timestamp_ms": start + i * 300_000,
+            "funding_rate_8h": 0.0001 + i * 1e-6,
+            "basis_bps": -4.0 + i * 0.1,
+            "obi": 0.1 + i * 0.01,
+            "vpin": 0.2,
+            "whale_divergence_score": 0.0,
+            "sentiment_available": True,
+        })
+    rec.append_rows(rows)
+    restored = rec.load_recent_histories(
+        before_timestamp_ms=start + 4 * 300_000,
+        symbols=["BTCUSDT"],
+        limit=4,
+    )
+    assert len(restored["BTCUSDT"]) == 4
+    assert restored["BTCUSDT"][-1]["basis_bps"] == -3.7
