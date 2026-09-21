@@ -582,11 +582,14 @@ class QuantScreener:
                         basis_hist = base_basis_hist[-self.history_bars + 1:] + (basis_bps,)
                         micro_factor = obi * (1.0 - vpin)
                         micro_hist = base_micro_hist[-self.history_bars + 1:] + (micro_factor,)
-                        whale_hist = (
-                            base_whale_hist[-self.history_bars + 1:] + (whale_divergence,)
-                            if sentiment_available
-                            else base_whale_hist[-self.history_bars:]
-                        )
+                        if sentiment_available:
+                            decayed_whale = whale_divergence
+                        else:
+                            # Берем последнее известное значение с затуханием 80% или нейтральное 0.0
+                            last_val = base_whale_hist[-1] if base_whale_hist else 0.0
+                            decayed_whale = last_val * 0.8  # Постепенно возвращаем к нейтрали
+                        
+                        whale_hist = base_whale_hist[-self.history_bars + 1:] + (decayed_whale,)
                         delta_hist = (base_delta_hist[-self.history_bars + 1:] + (delta_oi_pct,)) if delta_oi_pct is not None else base_delta_hist
                         div_hist = (base_div_hist[-self.history_bars + 1:] + (div_score,)) if div_score is not None else base_div_hist
 
