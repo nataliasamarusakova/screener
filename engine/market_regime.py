@@ -104,29 +104,26 @@ class MarketRegimeEngine:
         return alt_change_5m_pct - (beta_value * btc_change_5m_pct)
 
     @staticmethod
-    def calculate_rolling_beta(
+    def calculate_rolling_beta_with_reason(
         alt_times_ms: Sequence[int],
         alt_prices: Sequence[float],
         btc_times_ms: Sequence[int],
         btc_prices: Sequence[float],
         min_samples: int = 24,
-    ) -> Optional[float]:
-        """
-        Estimate beta from aligned historical 5m closes.
-        Permits negative beta for inverse ETFs and commodities.
-        """
+    ) -> tuple[Optional[float], str]:
+        """Estimate beta and expose a precise fail-closed reason for diagnostics."""
         if min_samples < 2:
             raise ValueError("min_samples must be >= 2")
         alt_map = {int(t): float(p) for t, p in zip(alt_times_ms, alt_prices) if float(p) > 0.0 and math.isfinite(float(p))}
         btc_map = {int(t): float(p) for t, p in zip(btc_times_ms, btc_prices) if float(p) > 0.0 and math.isfinite(float(p))}
         common = sorted(set(alt_map) & set(btc_map))
         if len(common) < min_samples + 1:
-            return None
+            return None, f"INSUFFICIENT_COMMON_SAMPLES_{len(common)}/{min_samples + 1}"
 
         common = common[-(min_samples + 1):]
         step_ms = 5 * 60 * 1000
         if any(cur_t - prev_t != step_ms for prev_t, cur_t in zip(common[:-1], common[1:])):
-            return None
+            return None, "NONCONTIGUOUS_HISTORY"
 
         alt_rets = []
         btc_rets = []
@@ -134,17 +131,29 @@ class MarketRegimeEngine:
             alt_rets.append((alt_map[cur_t] / alt_map[prev_t]) - 1.0)
             btc_rets.append((btc_map[cur_t] / btc_map[prev_t]) - 1.0)
         if len(alt_rets) < min_samples:
-            return None
+            return None, f"INSUFFICIENT_RETURN_SAMPLES_{len(alt_rets)}/{min_samples}"
 
         alt_mean = sum(alt_rets) / len(alt_rets)
         btc_mean = sum(btc_rets) / len(btc_rets)
         cov = sum((a - alt_mean) * (b - btc_mean) for a, b in zip(alt_rets, btc_rets))
         var_btc = sum((b - btc_mean) ** 2 for b in btc_rets)
         if var_btc <= 1e-16:
-            return None
+            return None, "BTC_ZERO_VARIANCE"
         beta = cov / var_btc
-        # FIX: Removed `and beta > 0.0`. Validates that beta is finite (can be negative).
-        return beta if math.isfinite(beta) else None
+        return (beta, "OK") if math.isfinite(beta) else (None, "NONFINITE_BETA")
+
+    @staticmethod
+    def calculate_rolling_beta(
+        alt_times_ms: Sequence[int],
+        alt_prices: Sequence[float],
+        btc_times_ms: Sequence[int],
+        btc_prices: Sequence[float],
+        min_samples: int = 24,
+    ) -> Optional[float]:
+        beta, _ = MarketRegimeEngine.calculate_rolling_beta_with_reason(
+            alt_times_ms, alt_prices, btc_times_ms, btc_prices, min_samples=min_samples
+        )
+        return beta
 
     def check_signal_gate(
         self,

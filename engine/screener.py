@@ -12,6 +12,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
+from collections import Counter
 from typing import Dict, List, Optional, Tuple, Union
 
 import msgspec
@@ -46,7 +47,10 @@ class ScreenerResult(msgspec.Struct, gc=False):
     rejected_symbols: int = 0
     failed_symbols: int = 0
     signal_ready_symbols: int = 0
-    portfolio_limited_symbols: int = 0   # NEW: count of signals downgraded by correlation limit
+    portfolio_limited_symbols: int = 0
+    signal_readiness_reasons: Dict[str, int] = msgspec.field(default_factory=dict)
+    stale_state_symbols_dropped: int = 0
+    state_recovery_sources: Dict[str, int] = msgspec.field(default_factory=dict)
 
 
 def save_latest_scan_json(
@@ -70,6 +74,9 @@ def save_latest_scan_json(
             "failed_symbols": summary.failed_symbols,
             "signal_ready_symbols": summary.signal_ready_symbols,
             "portfolio_limited_symbols": summary.portfolio_limited_symbols,
+            "signal_readiness_reasons": summary.signal_readiness_reasons,
+            "stale_state_symbols_dropped": summary.stale_state_symbols_dropped,
+            "state_recovery_sources": summary.state_recovery_sources,
         },
         "signals": [
             {
@@ -469,6 +476,14 @@ class QuantScreener:
                 btc_change_24h_pct=btc_24h_chg,
             )
 
+            # Durable research rows are the recovery source for state-only
+            # histories after a missed/reset 5m cycle.
+            research_history = self.research_recorder.load_recent_histories(
+                before_timestamp_ms=closed_end_ms,
+                symbols=sorted_symbols,
+                limit=self.history_bars,
+            )
+
             sem = asyncio.Semaphore(self.concurrency_limit)
             Result = Union[None, Tuple[Optional[SignalEvent], MarketStateSnapshot, Optional[SyntheticLiquidation], dict], Exception]
 
@@ -615,8 +630,9 @@ class QuantScreener:
                             )
 
                         rolling_beta = None
+                        rolling_beta_reason = "BTC_SELF"
                         if symbol != "BTCUSDT":
-                            rolling_beta = self.regime_engine.calculate_rolling_beta(
+                            rolling_beta, rolling_beta_reason = self.regime_engine.calculate_rolling_beta_with_reason(
                                 time_hist,
                                 price_hist,
                                 [row[0] for row in btc_parsed[-self.history_bars:]],
@@ -674,10 +690,27 @@ class QuantScreener:
                         sentiment_available = sent is not None
                         whale_divergence = float(sent.divergence_score) if sentiment_available else 0.0
 
-                        base_funding_hist = p_snap.funding_history_5m if (p_snap and prev_contiguous) else ()
-                        base_basis_hist = p_snap.basis_history_5m if (p_snap and prev_contiguous) else ()
-                        base_micro_hist = p_snap.micro_factor_history_5m if (p_snap and prev_contiguous) else ()
-                        base_whale_hist = p_snap.whale_divergence_history_5m if (p_snap and prev_contiguous) else ()
+                        persisted_rows = research_history.get(symbol, [])
+                        if prev_contiguous and p_snap is not None:
+                            base_funding_hist = p_snap.funding_history_5m
+                            base_basis_hist = p_snap.basis_history_5m
+                            base_micro_hist = p_snap.micro_factor_history_5m
+                            base_whale_hist = p_snap.whale_divergence_history_5m
+                            recovery_source = "STATE"
+                        else:
+                            base_funding_hist = tuple(float(row["funding_rate_8h"]) for row in persisted_rows if "funding_rate_8h" in row)
+                            base_basis_hist = tuple(float(row["basis_bps"]) for row in persisted_rows if "basis_bps" in row)
+                            base_micro_hist = tuple(
+                                float(row["obi"]) * (1.0 - float(row["vpin"]))
+                                for row in persisted_rows
+                                if "obi" in row and "vpin" in row
+                            )
+                            base_whale_hist = tuple(
+                                float(row["whale_divergence_score"])
+                                for row in persisted_rows
+                                if "whale_divergence_score" in row and bool(row.get("sentiment_available", False))
+                            )
+                            recovery_source = "RESEARCH" if persisted_rows else "EMPTY"
 
                         funding_hist = base_funding_hist[-self.history_bars + 1:] + (norm_8h_funding,)
                         basis_hist = base_basis_hist[-self.history_bars + 1:] + (basis_bps,)
@@ -696,16 +729,25 @@ class QuantScreener:
                         div_hist = tuple(div_hist_from_klines[-self.history_bars:])
 
                         signal: Optional[SignalEvent] = None
-                        signal_ready = (
-                            delta_oi_pct is not None
-                            and (rolling_beta is not None or symbol == "BTCUSDT")
-                            and len(funding_hist) - 1 >= self.z_history_min_samples
-                            and len(basis_hist) - 1 >= self.z_history_min_samples
-                            and len(delta_hist) - 1 >= self.z_history_min_samples
-                            and len(micro_hist) - 1 >= self.z_history_min_samples
-                            and len(div_hist) - 1 >= self.z_history_min_samples
-                            and div_score is not None
-                        )
+                        readiness_reasons: List[str] = []
+                        min_prior = self.z_history_min_samples
+                        if delta_oi_pct is None:
+                            readiness_reasons.append("MISSING_CURRENT_OI_DELTA")
+                        if symbol != "BTCUSDT" and rolling_beta is None:
+                            readiness_reasons.append(f"BETA_{rolling_beta_reason}")
+                        if len(funding_hist) - 1 < min_prior:
+                            readiness_reasons.append(f"FUNDING_HISTORY_{len(funding_hist) - 1}/{min_prior}")
+                        if len(basis_hist) - 1 < min_prior:
+                            readiness_reasons.append(f"BASIS_HISTORY_{len(basis_hist) - 1}/{min_prior}")
+                        if len(delta_hist) - 1 < min_prior:
+                            readiness_reasons.append(f"OI_HISTORY_{len(delta_hist) - 1}/{min_prior}")
+                        if len(micro_hist) - 1 < min_prior:
+                            readiness_reasons.append(f"MICRO_HISTORY_{len(micro_hist) - 1}/{min_prior}")
+                        if len(div_hist) - 1 < min_prior:
+                            readiness_reasons.append(f"CVD_HISTORY_{len(div_hist) - 1}/{min_prior}")
+                        if div_score is None:
+                            readiness_reasons.append("MISSING_CURRENT_CVD_DIVERGENCE")
+                        signal_ready = not readiness_reasons
 
                         if signal_ready:
                             z_cvd, z_fund, z_oi, z_micro, z_whale = self.signal_engine.calculate_factor_zscores(
@@ -816,6 +858,12 @@ class QuantScreener:
                             "sweep_pattern": str(sweep_pattern),
                             "recorded_signal_type": signal.signal_type if signal is not None else "NONE",
                             "recorded_score": signal.composite_score if signal is not None else 0.0,
+                            "signal_ready": bool(signal_ready),
+                            "signal_readiness_reasons": list(readiness_reasons),
+                            "sentiment_available": bool(sentiment_available),
+                            "sentiment_observation_timestamp_ms": int(sent.observation_timestamp_ms) if sent is not None else None,
+                            "state_recovery_source": recovery_source,
+                            "persisted_research_rows_available": len(persisted_rows),
                         }
                         return signal, snapshot, liq, research_row
                     except Exception as exc:
@@ -827,6 +875,8 @@ class QuantScreener:
             rejected_symbols = 0
             failed_symbols = 0
             signal_ready_symbols = 0
+            readiness_counter: Counter[str] = Counter()
+            recovery_counter: Counter[str] = Counter()
             new_snapshots: List[MarketStateSnapshot] = []
             research_rows: List[dict] = []
 
@@ -841,6 +891,10 @@ class QuantScreener:
                 signal, snapshot, liq, research_row = result
                 new_snapshots.append(snapshot)
                 research_rows.append(research_row)
+                row_reasons = research_row.get("signal_readiness_reasons", [])
+                for reason in row_reasons:
+                    readiness_counter[str(reason)] += 1
+                recovery_counter[str(research_row.get("state_recovery_source", "UNKNOWN"))] += 1
                 if signal is not None:
                     signal_ready_symbols += 1
                     signals.append(signal)
@@ -853,15 +907,16 @@ class QuantScreener:
             if sorted_symbols and successful_symbols == 0:
                 raise RuntimeError("No symbol produced a valid market snapshot")
 
-            current_symbols = set(sorted_symbols)
-            merged_state: Dict[str, MarketStateSnapshot] = {
-                symbol: snapshot
-                for symbol, snapshot in prev_state.items()
-                if symbol in current_symbols
-            }
-            merged_state.update({snapshot.symbol: snapshot for snapshot in new_snapshots})
-            self.save_current_state(list(merged_state.values()))
+            previous_state_symbols = set(prev_state)
+            successful_state_symbols = {snapshot.symbol for snapshot in new_snapshots}
+            stale_state_symbols_dropped = len(previous_state_symbols - successful_state_symbols)
+            self.save_current_state(new_snapshots)
             self.research_recorder.append_rows(research_rows)
+            if stale_state_symbols_dropped:
+                logger.warning(
+                    "stale_state_symbols_dropped count=%s",
+                    stale_state_symbols_dropped,
+                )
 
             signals.sort(key=lambda s: s.composite_score, reverse=True)
             snapshot_map = {snapshot.symbol: snapshot for snapshot in new_snapshots}
@@ -885,6 +940,9 @@ class QuantScreener:
                 failed_symbols=failed_symbols,
                 signal_ready_symbols=signal_ready_symbols,
                 portfolio_limited_symbols=portfolio_limited,
+                signal_readiness_reasons=dict(readiness_counter.most_common()),
+                stale_state_symbols_dropped=stale_state_symbols_dropped,
+                state_recovery_sources=dict(recovery_counter.most_common()),
             )
             return signals, synthetic_liqs, summary
         except Exception:

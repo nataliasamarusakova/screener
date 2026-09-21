@@ -76,6 +76,39 @@ class SentimentEngine:
         candidates.sort(key=lambda x: x[0])
         return candidates[-1][1]
 
+    @staticmethod
+    def _bucket_open_ms(timestamp_ms: int, *, timestamp_is_period_end: bool) -> int:
+        interval_ms = 5 * 60 * 1000
+        if timestamp_is_period_end:
+            # Binance ratio endpoints timestamp completed periods at their end.
+            return ((timestamp_ms - 1) // interval_ms) * interval_ms
+        return (timestamp_ms // interval_ms) * interval_ms
+
+    @classmethod
+    def _select_observation_for_bucket(
+        cls,
+        data: object,
+        expected_open_ms: int,
+        *,
+        timestamp_is_period_end: bool,
+    ) -> Optional[dict]:
+        if not isinstance(data, list):
+            return None
+        candidates = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            try:
+                ts = int(item["timestamp"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if cls._bucket_open_ms(ts, timestamp_is_period_end=timestamp_is_period_end) == expected_open_ms:
+                candidates.append((ts, item))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        return candidates[-1][1]
+
     async def fetch_sentiment_divergence(
         self,
         symbol: str,
@@ -95,9 +128,12 @@ class SentimentEngine:
         retail_url = f"{self.BASE_URL}/futures/data/globalLongShortAccountRatio"
         whale_url = f"{self.BASE_URL}/futures/data/topLongShortPositionRatio"
         taker_url = f"{self.BASE_URL}/futures/data/takerlongshortRatio"
-        params = {"symbol": symbol, "period": "5m", "limit": "1"}
+        interval_ms = 5 * 60 * 1000
+        params = {"symbol": symbol, "period": "5m", "limit": "3"}
         if start_time_ms is not None and end_time_ms is not None:
-            params["startTime"] = str(start_time_ms)
+            # Request a narrow boundary window; select observations by their canonical
+            # 5m bucket instead of relying on endpoint-specific raw timestamp conventions.
+            params["startTime"] = str(max(0, start_time_ms - interval_ms))
             params["endTime"] = str(end_time_ms)
 
         try:
@@ -114,9 +150,21 @@ class SentimentEngine:
                 data_r = await resp_r.json()
                 data_w = await resp_w.json()
                 data_t = await resp_t.json()
-                r_item = self._select_observation(data_r, start_time_ms, end_time_ms)
-                w_item = self._select_observation(data_w, start_time_ms, end_time_ms)
-                t_item = self._select_observation(data_t, start_time_ms, end_time_ms)
+                if start_time_ms is not None:
+                    expected_open_ms = int(start_time_ms)
+                    r_item = self._select_observation_for_bucket(
+                        data_r, expected_open_ms, timestamp_is_period_end=True
+                    )
+                    w_item = self._select_observation_for_bucket(
+                        data_w, expected_open_ms, timestamp_is_period_end=True
+                    )
+                    t_item = self._select_observation_for_bucket(
+                        data_t, expected_open_ms, timestamp_is_period_end=False
+                    )
+                else:
+                    r_item = self._select_observation(data_r, None, None)
+                    w_item = self._select_observation(data_w, None, None)
+                    t_item = self._select_observation(data_t, None, None)
                 if r_item is None or w_item is None or t_item is None:
                     logger.error("sentiment_missing_window symbol=%s start=%s end=%s", symbol, start_time_ms, end_time_ms)
                     return None
@@ -125,23 +173,20 @@ class SentimentEngine:
                 whale_ts = int(w_item["timestamp"])
                 taker_ts = int(t_item["timestamp"])
 
-                # Binance uses different timestamp semantics for these 5m endpoints:
-                # global/top-trader ratios are timestamped at period END, while the
-                # taker buy/sell ratio is timestamped at period START.
-                if start_time_ms is not None and end_time_ms is not None:
-                    if retail_ts != end_time_ms or whale_ts != end_time_ms or taker_ts != start_time_ms:
+                # Binance timestamps differ by endpoint: long/short account and
+                # top-trader position ratios use period-end timestamps, while the
+                # taker long/short endpoint uses period-start timestamps.
+                if start_time_ms is not None:
+                    if (
+                        self._bucket_open_ms(retail_ts, timestamp_is_period_end=True) != start_time_ms
+                        or self._bucket_open_ms(whale_ts, timestamp_is_period_end=True) != start_time_ms
+                        or self._bucket_open_ms(taker_ts, timestamp_is_period_end=False) != start_time_ms
+                    ):
                         logger.error(
-                            "sentiment_timestamp_mismatch symbol=%s retail=%s whale=%s taker=%s expected_end=%s expected_start=%s",
-                            symbol, retail_ts, whale_ts, taker_ts, end_time_ms, start_time_ms,
+                            "sentiment_timestamp_mismatch symbol=%s retail=%s whale=%s taker=%s expected_open=%s",
+                            symbol, retail_ts, whale_ts, taker_ts, start_time_ms,
                         )
                         return None
-                        
-                elif retail_ts != whale_ts or retail_ts != taker_ts:
-                    logger.error(
-                        "sentiment_timestamp_mismatch symbol=%s timestamps=%s",
-                        symbol, (retail_ts, whale_ts, taker_ts),
-                    )
-                    return None
 
                 retail_ls = float(r_item["longShortRatio"])
                 retail_long = float(r_item["longAccount"]) * 100.0
