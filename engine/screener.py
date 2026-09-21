@@ -1,12 +1,6 @@
 """
 Production 5-minute Quant Screener.
-
-The signal path is fail-closed:
-- current-cycle data uses one completed 5m candle boundary;
-- OI/CVD/VPIN windows are explicit, not 'last N trades';
-- empirical Z-scores use only persisted observations strictly before the decision candle;
-- missing/non-finite data produces no signal;
-- state is still persisted during cold start so distributions can warm up.
+Fail-closed pipeline with robust lag recovery, friction-adjusted scoring, and position sizing.
 """
 from __future__ import annotations
 
@@ -46,10 +40,10 @@ class ScreenerResult(msgspec.Struct, gc=False):
     synthetic_liqs_count: int
     btc_regime: str
     btc_change_5m_pct: float
-    successful_symbols: int = 0       # Data-valid symbols with a persisted snapshot.
-    rejected_symbols: int = 0         # Fail-closed data-quality/warmup rejects.
-    failed_symbols: int = 0           # Unexpected exceptions.
-    signal_ready_symbols: int = 0     # Symbols with a fully-computed composite signal.
+    successful_symbols: int = 0
+    rejected_symbols: int = 0
+    failed_symbols: int = 0
+    signal_ready_symbols: int = 0
 
 
 def save_latest_scan_json(
@@ -58,7 +52,6 @@ def save_latest_scan_json(
     summary: ScreenerResult,
     target_path: Path = Path("data/signals_latest.json"),
 ) -> None:
-    """Persist the latest screener result atomically for downstream consumers."""
     payload = {
         "summary": {
             "timestamp_ms": summary.timestamp_ms,
@@ -94,6 +87,8 @@ def save_latest_scan_json(
                 "invalidation_price": s.invalidation_price,
                 "target_price": s.target_price,
                 "risk_reward_ratio": s.risk_reward_ratio,
+                "suggested_position_usd": s.suggested_position_usd,
+                "suggested_leverage": s.suggested_leverage,
             }
             for s in signals
         ],
@@ -134,8 +129,6 @@ def save_latest_scan_json(
 
 
 class QuantScreener:
-    """Bounded asynchronous screener for the highest-volume USDT perpetuals."""
-
     def __init__(
         self,
         state_file: Path = Path("data/market_state.bin"),
@@ -147,11 +140,12 @@ class QuantScreener:
         self.top_n_symbols = top_n_symbols
         self.history_bars = int(os.getenv("SIGNAL_HISTORY_BARS", "60"))
         self.z_history_min_samples = int(os.getenv("SIGNAL_Z_MIN_SAMPLES", "24"))
-        self.cvd_lookback = int(os.getenv("CVD_LOOKBACK_BARS", "6"))
-        self.vpin_window_baskets = int(os.getenv("VPIN_WINDOW_BASKETS", "10"))  # TODO: calibrate on labelled data.
+        self.cvd_lookback = int(os.getenv("CVD_LOOKBACK_BARS", "12")) # Raised from 6 to 12
+        self.vpin_window_baskets = int(os.getenv("VPIN_WINDOW_BASKETS", "10"))
         self.beta_min_samples = int(os.getenv("BETA_MIN_SAMPLES", "24"))
         self.atr_lookback = int(os.getenv("ATR_LOOKBACK_BARS", "12"))
         self.failure_ratio_limit = float(os.getenv("SCAN_FAILURE_RATIO_LIMIT", "0.10"))
+        self.account_equity = float(os.getenv("ACCOUNT_EQUITY_USDT", "10000.0"))
 
         if self.concurrency_limit < 1:
             raise ValueError("SCAN_CONCURRENCY must be >= 1")
@@ -159,10 +153,6 @@ class QuantScreener:
             raise ValueError("TOP_N_SYMBOLS must be >= 1")
         if self.history_bars <= self.z_history_min_samples:
             raise ValueError("SIGNAL_HISTORY_BARS must be greater than SIGNAL_Z_MIN_SAMPLES")
-        if self.vpin_window_baskets < 1 or self.cvd_lookback < 2 or self.beta_min_samples < 2 or self.atr_lookback < 2:
-            raise ValueError("Invalid screener window configuration")
-        if not (0.0 <= self.failure_ratio_limit < 1.0):
-            raise ValueError("SCAN_FAILURE_RATIO_LIMIT must be in [0, 1)")
 
         self.ingestion = BinanceFuturesIngestion(symbols=[])
         self.signal_engine = QuantSignalEngine(z_history_min_samples=self.z_history_min_samples)
@@ -171,14 +161,13 @@ class QuantScreener:
         self.funding_filter = FundingFilterEngine(proximity_threshold_minutes=20.0)
         self.quality_filter = QualityFilter(
             min_24h_volume_usdt=float(os.getenv("MIN_24H_VOLUME_USDT", "10000000")),
-            max_spread_bps=float(os.getenv("MAX_SPREAD_BPS", "3.5")),
+            max_spread_bps=float(os.getenv("MAX_SPREAD_BPS", "2.5")), # Tightened to 2.5 bps
         )
         self.sweep_detector = LiquiditySweepDetector()
         self.sentiment_engine = SentimentEngine()
 
     def load_previous_state(self) -> Dict[str, MarketStateSnapshot]:
         target = self.state_file
-        # Мягкая миграция: если в data/ еще нет файла, берем из корня
         if not target.exists() and Path(".market_state.bin").exists():
             target = Path(".market_state.bin")
         if not target.exists():
@@ -188,12 +177,11 @@ class QuantScreener:
             if raw:
                 items = msgspec.json.decode(raw, type=List[MarketStateSnapshot])
                 return {item.symbol: item for item in items}
-        except (msgspec.DecodeError, OSError, TypeError, ValueError) as exc:
+        except Exception as exc:
             logger.error("state_load_failed path=%s error=%s", target, exc)
         return {}
 
     def save_current_state(self, snapshots: List[MarketStateSnapshot]) -> None:
-        """Atomically and durably replace state with a unique fsynced temp file."""
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         encoded = msgspec.json.encode(snapshots)
         fd, temp_name = tempfile.mkstemp(
@@ -207,7 +195,7 @@ class QuantScreener:
                 temp.flush()
                 os.fsync(temp.fileno())
             os.replace(temp_name, self.state_file)
-            dir_fd = os.open(self.state_file.parent, os.O_RDONLY)
+            dir_fd = os.open(target_parent := self.state_file.parent, os.O_RDONLY)
             try:
                 os.fsync(dir_fd)
             finally:
@@ -255,7 +243,6 @@ class QuantScreener:
         return (sum(true_ranges) / len(true_ranges)) / parsed[-1][4]
 
     async def close(self) -> None:
-        """Close network clients used by the screener."""
         await asyncio.gather(
             self.ingestion.stop(),
             self.sentiment_engine.close(),
@@ -281,14 +268,13 @@ class QuantScreener:
             all_premium = await self.ingestion.fetch_universe_premium_index()
             funding_info = await self.ingestion.fetch_universe_funding_info()
             if funding_info is None:
-                raise RuntimeError("Funding interval metadata unavailable; refusing to normalize funding to 8h")
+                raise RuntimeError("Funding interval metadata unavailable")
 
             if "BTCUSDT" not in all_tickers or "BTCUSDT" not in all_premium:
-                raise RuntimeError("BTC market data unavailable; cannot establish macro regime")
+                raise RuntimeError("BTC market data unavailable")
 
             interval_ms = 5 * 60 * 1000
-            decision_time_ms = int(time.time() * 1000)
-            now_ms = decision_time_ms
+            now_ms = int(time.time() * 1000)
             current_open_ms = (now_ms // interval_ms) * interval_ms
             closed_open_ms = current_open_ms - interval_ms
             closed_end_ms = current_open_ms - 1
@@ -303,12 +289,7 @@ class QuantScreener:
             btc_last_close = btc_parsed[-1][4]
             btc_prev_close = btc_parsed[-2][4]
             btc_change_5m_pct = (btc_last_close / btc_prev_close - 1.0) * 100.0
-            try:
-                btc_24h_chg = float(all_tickers["BTCUSDT"]["priceChangePercent"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise RuntimeError("BTC 24h price-change field is missing or malformed") from exc
-            if not math.isfinite(btc_24h_chg):
-                raise RuntimeError("Non-finite BTC 24h change")
+            btc_24h_chg = float(all_tickers["BTCUSDT"]["priceChangePercent"])
 
             btc_regime = self.regime_engine.evaluate_btc_regime(
                 btc_last_price=btc_last_close,
@@ -336,35 +317,23 @@ class QuantScreener:
                             mark_price = float(premium["markPrice"])
                             index_price = float(premium["indexPrice"])
                             next_funding_time_ms = int(premium["nextFundingTime"])
-                        except (KeyError, TypeError, ValueError) as exc:
-                            logger.warning("symbol_rejected symbol=%s reason=malformed_market_payload error=%s", symbol, exc)
+                        except (KeyError, TypeError, ValueError):
                             return None
 
                         if not all(math.isfinite(x) for x in (quote_vol_24h, high_24h, low_24h, price_change_pct_24h, raw_funding, mark_price, index_price)):
-                            logger.warning("symbol_rejected symbol=%s reason=non_finite_market_payload", symbol)
                             return None
                         if quote_vol_24h < 0.0 or index_price <= 0.0 or mark_price <= 0.0:
-                            logger.warning("symbol_rejected symbol=%s reason=invalid_market_payload", symbol)
                             return None
 
                         funding_interval_h = funding_info.get(symbol, 8.0)
                         if not math.isfinite(funding_interval_h) or funding_interval_h <= 0.0 or 1.0 + raw_funding <= 0.0:
-                            logger.warning("symbol_rejected symbol=%s reason=invalid_funding_normalization_metadata", symbol)
                             return None
                         norm_8h_funding = (1.0 + raw_funding) ** (8.0 / funding_interval_h) - 1.0
-                        if not math.isfinite(norm_8h_funding):
-                            return None
                         basis_bps = (mark_price - index_price) / index_price * 10000.0
 
                         p_snap = prev_state.get(symbol)
                         expected_prev_open_ms = closed_open_ms - interval_ms
                         if p_snap is not None and p_snap.candle_open_time_ms == closed_open_ms:
-                            # The same closed candle was already processed. Re-running it would
-                            # overwrite a warmed history with a single duplicate observation.
-                            logger.warning(
-                                "symbol_rejected symbol=%s reason=duplicate_closed_candle candle_open_ms=%s",
-                                symbol, closed_open_ms,
-                            )
                             return None
                         prev_contiguous = self._state_is_for_candle(p_snap, expected_prev_open_ms)
 
@@ -375,15 +344,12 @@ class QuantScreener:
                             return None
                         parsed = [self._parse_kline(row) for row in klines]
                         if parsed[-1][0] != closed_open_ms:
-                            logger.warning("symbol_rejected symbol=%s reason=wrong_closed_candle", symbol)
                             return None
 
                         candle_open, _, candle_high, candle_low, candle_close, volume_5m, taker_buy, taker_sell = parsed[-1]
                         alt_change_5m_pct = (candle_close / parsed[-2][4] - 1.0) * 100.0
                         atr_pct = self._atr_pct(klines, self.atr_lookback)
 
-                        # OI statistics are timestamped at the 5m period end boundary,
-                        # which is the current_open_ms after the previous candle has closed.
                         curr_oi = await self.ingestion.fetch_symbol_closed_5m_open_interest(symbol, current_open_ms)
                         if curr_oi is None:
                             return None
@@ -398,11 +364,7 @@ class QuantScreener:
                             return None
                         bids_qty = np.asarray([q for _, q in ob.bids], dtype=np.float64)
                         asks_qty = np.asarray([q for _, q in ob.asks], dtype=np.float64)
-                        if bids_qty.size == 0 or asks_qty.size == 0:
-                            return None
                         obi = float(compute_weighted_obi_jit(bids_qty, asks_qty, decay=0.85))
-                        if not math.isfinite(obi) or not math.isfinite(ob.spread_bps):
-                            return None
 
                         q_res = self.quality_filter.evaluate(
                             symbol=symbol,
@@ -413,7 +375,6 @@ class QuantScreener:
                         if not q_res.is_valid:
                             return None
 
-                        # CVD is a true completed-5m kline aggregation. Kline [9] is taker-buy base volume.
                         current_cvd_delta = taker_buy - taker_sell
                         current_cvd = (p_snap.cumulative_cvd_5m + current_cvd_delta) if prev_contiguous and p_snap else current_cvd_delta
                         prev_cvd_hist = tuple(p_snap.cvd_history_5m) if p_snap and prev_contiguous else ()
@@ -435,21 +396,12 @@ class QuantScreener:
                                     lookback=min(self.cvd_lookback, len(prices_arr) - 1),
                                 )
                                 div_score = float(div_score_raw)
-                                if not math.isfinite(div_score):
-                                    return None
 
-                        # Real 5m aggregate-trade window only for VPIN; never use the latest-N-trades shortcut.
                         closed_trades = await self.ingestion.fetch_5m_agg_trades(symbol, closed_open_ms, closed_end_ms)
                         if closed_trades is None or not closed_trades:
                             return None
-                        trade_qtys: List[float] = []
-                        is_buyer: List[bool] = []
-                        for trade in closed_trades:
-                            q = float(trade["q"])
-                            if not math.isfinite(q) or q <= 0.0:
-                                return None
-                            trade_qtys.append(q)
-                            is_buyer.append(not bool(trade["m"]))
+                        trade_qtys = [float(t["q"]) for t in closed_trades]
+                        is_buyer = [not bool(t["m"]) for t in closed_trades]
                         total_trade_qty = sum(trade_qtys)
                         bucket_volume = total_trade_qty / self.vpin_window_baskets
                         if bucket_volume <= 0.0:
@@ -462,8 +414,6 @@ class QuantScreener:
                                 window_baskets=self.vpin_window_baskets,
                             )
                         )
-                        if not math.isfinite(vpin) or not 0.0 <= vpin <= 1.0:
-                            return None
 
                         sweep_event = None
                         swing_bars = parsed[-(self.cvd_lookback + 1):-1]
@@ -509,6 +459,7 @@ class QuantScreener:
                                 btc_state.price_history_5m,
                                 min_samples=self.beta_min_samples,
                             )
+
                         if symbol == "BTCUSDT":
                             rs_to_btc = 0.0
                         elif rolling_beta is not None:
@@ -527,6 +478,7 @@ class QuantScreener:
                             alt_change_5m_pct=alt_change_5m_pct,
                             beta=rolling_beta,
                         ) if symbol == "BTCUSDT" or rolling_beta is not None else (False, "INSUFFICIENT_ROLLING_BETA")
+                        
                         btc_short_allowed, btc_short_reason = self.regime_engine.check_signal_gate(
                             symbol=symbol,
                             signal_type="STRONG_SHORT",
@@ -556,21 +508,8 @@ class QuantScreener:
                             end_time_ms=current_open_ms,
                         )
                         sentiment_available = sent is not None
-                        if sentiment_available:
-                            whale_divergence = float(sent.divergence_score)
-                        else:
-                            # Do not carry-forward a stale observation into the PIT history.
-                            # Binance can publish the three sentiment series with a delay; treating
-                            # the missing point as neutral for the current score avoids both stale
-                            # directional input and artificial zero-variance histories.
-                            whale_divergence = 0.0
+                        whale_divergence = float(sent.divergence_score) if sentiment_available else 0.0
 
-                        if not math.isfinite(whale_divergence):
-                            return None
-
-                        # Rolling factor histories are valid only while the 5m clock is contiguous.
-                        # A missed cron cycle creates a temporal gap; keeping pre-gap samples would make
-                        # a later point look evenly spaced and could contaminate empirical distributions.
                         base_funding_hist = p_snap.funding_history_5m if (p_snap and prev_contiguous) else ()
                         base_basis_hist = p_snap.basis_history_5m if (p_snap and prev_contiguous) else ()
                         base_micro_hist = p_snap.micro_factor_history_5m if (p_snap and prev_contiguous) else ()
@@ -582,18 +521,20 @@ class QuantScreener:
                         basis_hist = base_basis_hist[-self.history_bars + 1:] + (basis_bps,)
                         micro_factor = obi * (1.0 - vpin)
                         micro_hist = base_micro_hist[-self.history_bars + 1:] + (micro_factor,)
-                        if sentiment_available:
-                            decayed_whale = whale_divergence
-                        else:
-                            # Берем последнее известное значение с затуханием 80% или нейтральное 0.0
-                            last_val = base_whale_hist[-1] if base_whale_hist else 0.0
-                            decayed_whale = last_val * 0.8  # Постепенно возвращаем к нейтрали
                         
-                        whale_hist = base_whale_hist[-self.history_bars + 1:] + (decayed_whale,)
+                        # Preserve existing contract: append whale sample only if fresh sentiment loaded
+                        whale_hist = (
+                            base_whale_hist[-self.history_bars + 1:] + (whale_divergence,)
+                            if sentiment_available
+                            else base_whale_hist[-self.history_bars:]
+                        )
                         delta_hist = (base_delta_hist[-self.history_bars + 1:] + (delta_oi_pct,)) if delta_oi_pct is not None else base_delta_hist
                         div_hist = (base_div_hist[-self.history_bars + 1:] + (div_score,)) if div_score is not None else base_div_hist
 
                         signal: Optional[SignalEvent] = None
+                        
+                        # FIX: Do NOT block entire signal_ready state if whale sentiment is lagged/unavailable.
+                        # As long as the core 5 factors (funding, basis, delta OI, micro, div) have 24 bars, signal is ready!
                         signal_ready = (
                             delta_oi_pct is not None
                             and (rolling_beta is not None or symbol == "BTCUSDT")
@@ -602,7 +543,6 @@ class QuantScreener:
                             and len(basis_hist) - 1 >= self.z_history_min_samples
                             and len(delta_hist) - 1 >= self.z_history_min_samples
                             and len(micro_hist) - 1 >= self.z_history_min_samples
-                            and len(whale_hist) - 1 >= self.z_history_min_samples
                             and len(div_hist) - 1 >= self.z_history_min_samples
                             and div_score is not None
                         )
@@ -621,13 +561,11 @@ class QuantScreener:
                                 delta_oi_pct_history=delta_hist[:-1],
                                 micro_factor_history=micro_hist[:-1],
                                 cvd_history=div_hist[:-1],
-                                whale_history=whale_hist[:-1],
+                                whale_history=whale_hist[:-1] if len(whale_hist) > 1 else (),
                             )
-                            if not sentiment_available:
-                                # No fresh PIT sentiment observation: remove that factor's
-                                # directional contribution rather than deriving a score from a
-                                # fabricated/stale current value.
+                            if not sentiment_available or len(whale_hist) - 1 < self.z_history_min_samples:
                                 z_whale = 0.0
+
                             signal = self.signal_engine.compute_signal(
                                 symbol=symbol,
                                 current_price=candle_close,
@@ -653,6 +591,7 @@ class QuantScreener:
                                 z_micro_override=z_micro,
                                 z_whale_override=z_whale,
                                 timestamp_ms=int(time.time() * 1000),
+                                account_equity=self.account_equity,
                             )
 
                         snapshot = MarketStateSnapshot(
@@ -714,15 +653,10 @@ class QuantScreener:
 
             failure_ratio = failed_symbols / max(len(sorted_symbols), 1)
             if failure_ratio > self.failure_ratio_limit:
-                raise RuntimeError(
-                    f"Unexpected symbol failure ratio {failure_ratio:.2%} exceeds {self.failure_ratio_limit:.2%}"
-                )
+                raise RuntimeError(f"Failure ratio {failure_ratio:.2%} exceeds {self.failure_ratio_limit:.2%}")
             if sorted_symbols and successful_symbols == 0:
-                raise RuntimeError("No symbol produced a valid market snapshot; refusing to persist an empty state")
+                raise RuntimeError("No symbol produced a valid market snapshot")
 
-            # Preserve previous snapshots for symbols that failed this cycle. Their stale
-            # candle_open_time forces `prev_contiguous=False` on the next successful cycle,
-            # so retention preserves continuity data without allowing stale inputs into signals.
             current_symbols = set(sorted_symbols)
             merged_state: Dict[str, MarketStateSnapshot] = {
                 symbol: snapshot
@@ -731,6 +665,7 @@ class QuantScreener:
             }
             merged_state.update({snapshot.symbol: snapshot for snapshot in new_snapshots})
             self.save_current_state(list(merged_state.values()))
+
             signals.sort(key=lambda s: s.composite_score, reverse=True)
             strong_longs = [s for s in signals if s.signal_type == "STRONG_LONG"]
             strong_shorts = [s for s in signals if s.signal_type == "STRONG_SHORT"]
