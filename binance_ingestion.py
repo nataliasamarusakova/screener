@@ -385,10 +385,16 @@ class BinanceFuturesIngestion:
         )
         self._backoff_429_seconds = float(os.getenv("BINANCE_429_BACKOFF_SEC", "1.0"))
         self._cooldown_418_seconds = float(os.getenv("BINANCE_418_COOLDOWN_SEC", "60.0"))
+        self._max_request_retries = int(os.getenv("BINANCE_MAX_REQUEST_RETRIES", "3"))
+        self._retry_backoff_cap_seconds = float(os.getenv("BINANCE_RETRY_BACKOFF_CAP_SEC", "8.0"))
         if not math.isfinite(self._backoff_429_seconds) or self._backoff_429_seconds <= 0.0:
             raise ValueError("BINANCE_429_BACKOFF_SEC must be finite and positive")
         if not math.isfinite(self._cooldown_418_seconds) or self._cooldown_418_seconds <= 0.0:
             raise ValueError("BINANCE_418_COOLDOWN_SEC must be finite and positive")
+        if self._max_request_retries < 0 or self._max_request_retries > 10:
+            raise ValueError("BINANCE_MAX_REQUEST_RETRIES must be between 0 and 10")
+        if not math.isfinite(self._retry_backoff_cap_seconds) or self._retry_backoff_cap_seconds <= 0.0:
+            raise ValueError("BINANCE_RETRY_BACKOFF_CAP_SEC must be finite and positive")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -414,54 +420,88 @@ class BinanceFuturesIngestion:
     ) -> Optional[Any]:
         if weight < 0:
             raise ValueError("request weight must be non-negative")
-        await self._rate_limiter.acquire(weight)
-        session = await self._get_session()
-        try:
-            async with session.request(method, url, params=params) as resp:
-                if resp.status == 200:
-                    return await resp.json(content_type=None)
+        if method.upper() not in {"GET", "HEAD"}:
+            raise ValueError("_request_json is only safe for idempotent GET/HEAD requests")
 
-                if resp.status == 451:
-                    body = await resp.text()
-                    logger.critical(
-                        "binance_restricted_location status=451 symbol=%s body=%s",
-                        symbol, body[:500],
-                    )
-                    raise BinanceRestrictedLocationError(
-                        "Binance Futures rejected the request with HTTP 451 "
-                        "(restricted location)"
-                    )
+        for attempt in range(self._max_request_retries + 1):
+            await self._rate_limiter.acquire(weight)
+            session = await self._get_session()
+            try:
+                async with session.request(method, url, params=params) as resp:
+                    if resp.status == 200:
+                        return await resp.json(content_type=None)
 
-                retry_after_raw = resp.headers.get("Retry-After")
-                try:
-                    retry_after = float(retry_after_raw) if retry_after_raw else 0.0
-                except ValueError:
-                    retry_after = 0.0
+                    if resp.status == 451:
+                        body = await resp.text()
+                        logger.critical(
+                            "binance_restricted_location status=451 symbol=%s body=%s",
+                            symbol, body[:500],
+                        )
+                        raise BinanceRestrictedLocationError(
+                            "Binance Futures rejected the request with HTTP 451 "
+                            "(restricted location)"
+                        )
 
-                if resp.status == 429:
-                    cooldown = max(self._backoff_429_seconds, retry_after)
-                    self._rate_limiter.cooldown(cooldown)
-                    logger.error(
-                        "binance_rate_limited status=429 symbol=%s retry_after=%s cooldown=%.2fs",
-                        symbol, retry_after_raw, cooldown,
-                    )
-                elif resp.status == 418:
-                    cooldown = max(self._cooldown_418_seconds, retry_after)
-                    self._rate_limiter.cooldown(cooldown)
-                    logger.critical(
-                        "binance_ip_banned status=418 symbol=%s retry_after=%s cooldown=%.2fs",
-                        symbol, retry_after_raw, cooldown,
-                    )
-                else:
-                    body = await resp.text()
-                    logger.error(
-                        "binance_http_error status=%s symbol=%s body=%s",
-                        resp.status, symbol, body[:500],
-                    )
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            logger.error("binance_request_failed symbol=%s url=%s error=%s", symbol, url, exc)
-        except (TypeError, ValueError) as exc:
-            logger.error("binance_response_invalid symbol=%s url=%s error=%s", symbol, url, exc)
+                    retry_after_raw = resp.headers.get("Retry-After")
+                    try:
+                        retry_after = float(retry_after_raw) if retry_after_raw else 0.0
+                    except ValueError:
+                        retry_after = 0.0
+
+                    retryable = resp.status == 429 or 500 <= resp.status <= 599
+                    if resp.status == 418:
+                        cooldown = max(self._cooldown_418_seconds, retry_after)
+                        self._rate_limiter.cooldown(cooldown)
+                        logger.critical(
+                            "binance_ip_banned status=418 symbol=%s retry_after=%s cooldown=%.2fs",
+                            symbol, retry_after_raw, cooldown,
+                        )
+                        return None
+                    if retryable:
+                        if resp.status == 429:
+                            cooldown = max(self._backoff_429_seconds, retry_after)
+                            self._rate_limiter.cooldown(cooldown)
+                            logger.warning(
+                                "binance_rate_limited status=429 symbol=%s retry_after=%s cooldown=%.2fs attempt=%d/%d",
+                                symbol, retry_after_raw, cooldown, attempt + 1, self._max_request_retries + 1,
+                            )
+                        else:
+                            body = await resp.text()
+                            logger.warning(
+                                "binance_retryable_http_error status=%s symbol=%s body=%s attempt=%d/%d",
+                                resp.status, symbol, body[:300], attempt + 1, self._max_request_retries + 1,
+                            )
+                        if attempt < self._max_request_retries:
+                            delay = min(
+                                self._retry_backoff_cap_seconds,
+                                max(self._backoff_429_seconds, 2.0 ** attempt),
+                            )
+                            delay += random.uniform(0.0, 0.25 * delay)
+                            await asyncio.sleep(delay)
+                            continue
+                    else:
+                        body = await resp.text()
+                        logger.error(
+                            "binance_http_error status=%s symbol=%s body=%s",
+                            resp.status, symbol, body[:500],
+                        )
+                    return None
+            except BinanceRestrictedLocationError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                logger.warning(
+                    "binance_request_failed symbol=%s url=%s error=%s attempt=%d/%d",
+                    symbol, url, exc, attempt + 1, self._max_request_retries + 1,
+                )
+                if attempt < self._max_request_retries:
+                    delay = min(self._retry_backoff_cap_seconds, max(self._backoff_429_seconds, 2.0 ** attempt))
+                    delay += random.uniform(0.0, 0.25 * delay)
+                    await asyncio.sleep(delay)
+                    continue
+                return None
+            except (TypeError, ValueError) as exc:
+                logger.error("binance_response_invalid symbol=%s url=%s error=%s", symbol, url, exc)
+                return None
         return None
 
     async def fetch_l2_snapshot(self, symbol: str, limit: int = 1000) -> Optional[Dict[str, Any]]:
@@ -843,6 +883,68 @@ class BinanceFuturesIngestion:
             logger.warning("kline_window_gap symbol=%s expected_last=%d actual=%s", symbol, closed_open_ms, opens[-1] if opens else None)
             return None
         return data
+
+    async def fetch_symbol_open_interest_history(
+        self,
+        symbol: str,
+        closed_open_ms: int,
+        *,
+        history_bars: int,
+    ) -> Optional[List[Tuple[int, float]]]:
+        """Return contiguous 5m OI observations ending at the just-closed candle."""
+        interval_ms = 5 * 60 * 1000
+        if history_bars < 2 or closed_open_ms <= 0 or closed_open_ms % interval_ms != 0:
+            raise ValueError("invalid OI history request")
+        if history_bars > 500:
+            raise ValueError("history_bars exceeds Binance openInterestHist limit")
+        start_ms = closed_open_ms - (history_bars - 1) * interval_ms
+        end_ms = closed_open_ms + interval_ms - 1
+        url = f"{self.REST_BASE_URL}/futures/data/openInterestHist"
+        data = await self._request_json(
+            "GET",
+            url,
+            params={
+                "symbol": symbol,
+                "period": "5m",
+                "startTime": str(start_ms),
+                "endTime": str(end_ms),
+                "limit": str(history_bars),
+            },
+            weight=1,
+            symbol=symbol,
+        )
+        if not isinstance(data, list):
+            return None
+        observations: List[Tuple[int, float]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                return None
+            try:
+                ts = int(item["timestamp"])
+                oi = float(item["sumOpenInterest"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if not math.isfinite(oi) or oi <= 0.0:
+                return None
+            # The endpoint timestamp is the end of the 5m bucket. Normalize it to
+            # the candle open so the resulting feature series aligns with klines/state.
+            normalized_open = (ts // interval_ms) * interval_ms
+            if normalized_open < start_ms or normalized_open > closed_open_ms:
+                continue
+            observations.append((normalized_open, oi))
+        observations.sort(key=lambda pair: pair[0])
+        dedup: Dict[int, float] = {}
+        for ts, oi in observations:
+            dedup[ts] = oi
+        observations = sorted(dedup.items())
+        expected = [start_ms + i * interval_ms for i in range(history_bars)]
+        if [ts for ts, _ in observations] != expected:
+            logger.warning(
+                "oi_history_gap symbol=%s expected=%d actual=%d",
+                symbol, history_bars, len(observations),
+            )
+            return None
+        return observations
 
     async def fetch_symbol_closed_5m_open_interest(
         self, symbol: str, current_open_ms: int

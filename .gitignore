@@ -40,3 +40,7 @@ build/
 # System files
 .DS_Store
 Thumbs.db
+# Research runtime data
+/data/research/*.sqlite3
+/data/research/*.jsonl
+/data/research/run/

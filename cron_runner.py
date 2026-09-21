@@ -10,6 +10,8 @@ from binance_ingestion import BinanceRestrictedLocationError
 from engine.circuit_breaker import CircuitBreaker
 from engine.screener import QuantScreener, save_latest_scan_json
 from engine.telegram import TelegramAlerter
+from engine.risk_guard import RiskGuard
+from engine.signal_ledger import append_signal_events
 
 logger = logging.getLogger("cron_runner")
 
@@ -29,8 +31,21 @@ async def main() -> None:
         max_consecutive_failures=int(os.environ.get("CB_MAX_FAILURES", "5")),
         halt_duration_minutes=float(os.environ.get("CB_HALT_MINUTES", "30")),
     )
+    risk_guard = RiskGuard(
+        state_file=data_dir / "equity_state.json",
+        account_equity=float(os.environ.get("ACCOUNT_EQUITY_USDT", "10000.0")),
+        max_drawdown_pct=float(os.environ.get("MAX_DRAWDOWN_PCT", "0.20")),
+        daily_loss_limit_pct=float(os.environ.get("DAILY_LOSS_LIMIT_PCT", "0.08")),
+        paper_trading=paper_trading,
+        kill_switch_file=data_dir / "KILL_SWITCH",
+    )
     if breaker.is_halted():
         print(f"⚠️ [CIRCUIT BREAKER] Halted for {breaker.halt_remaining_minutes():.1f} more minutes. Skipping scan.")
+        return
+
+    risk_allowed, risk_reason = risk_guard.evaluate()
+    if not risk_allowed:
+        print(f"🛑 [RISK GUARD] {risk_reason}. New signals are blocked.")
         return
 
     screener = QuantScreener(
@@ -45,6 +60,9 @@ async def main() -> None:
 
         signals_path = data_dir / ("paper_signals_latest.json" if paper_trading else "signals_latest.json")
         save_latest_scan_json(signals, synthetic_liqs, summary, target_path=signals_path)
+        ledger_count = append_signal_events(data_dir / "signal_ledger.jsonl", signals)
+        if ledger_count:
+            print(f"[LEDGER] Recorded {ledger_count} STRONG signal event(s).")
 
         breaker.record_success()
 
@@ -64,6 +82,13 @@ async def main() -> None:
             for sig in signals:
                 if sig.signal_type in ("STRONG_LONG", "STRONG_SHORT"):
                     sig.gate_status = f"[PAPER] {sig.gate_status}"
+
+        # Re-check immediately before external dispatch so a kill switch or fresh
+        # equity reconciliation received during the scan can still block new risk.
+        risk_allowed, risk_reason = risk_guard.evaluate()
+        if not risk_allowed:
+            print(f"🛑 [RISK GUARD] {risk_reason} after scan. Suppressing alert dispatch.")
+            return
 
         sent_alerts = await alerter.process_and_dispatch_signals(signals, synthetic_liqs)
         if sent_alerts > 0:

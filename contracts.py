@@ -72,7 +72,7 @@ class SyntheticLiquidation(msgspec.Struct, gc=False):
 class SignalEvent(msgspec.Struct, gc=False):
     """Composite Quantitative Signal (-100 to +100) with breakdown of factors and risk parameters."""
     symbol: str
-    timestamp_ms: int
+    timestamp_ms: int          # completed 5m candle close timestamp
     signal_type: str            # "STRONG_LONG", "STRONG_SHORT", "NEUTRAL"
     composite_score: float
     z_cvd_div: float
@@ -87,7 +87,7 @@ class SignalEvent(msgspec.Struct, gc=False):
     invalidation_price: float
     target_price: float
     risk_reward_ratio: float    # Net R:R (friction-adjusted). 0.0 for NEUTRAL.
-    decision_timestamp_ms: int
+    decision_timestamp_ms: int # wall-clock signal generation timestamp
     z_whale_sentiment: float = 0.0
     relative_strength: float = 0.0
     sweep_reclaim: bool = False
