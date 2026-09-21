@@ -1,4 +1,34 @@
-# --- NEW tests to add ---
+import asyncio
+import json
+import math
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from binance_ingestion import (
+    BinanceFuturesIngestion,
+    BinanceOrderBookFSM,
+    BinanceRestrictedLocationError,
+    OrderBookFSMState,
+)
+from contracts import MarketStateSnapshot, SignalEvent
+from engine.circuit_breaker import CircuitBreaker
+from engine.divergence import detect_cvd_divergence_jit
+from engine.funding_filter import FundingFilterEngine
+from engine.liquidations import SyntheticLiquidationDetector
+from engine.liquidity_sweep import LiquiditySweepDetector
+from engine.market_regime import MarketRegimeEngine
+from engine.microstructure_jit import compute_vpin_numba, compute_weighted_obi_jit
+from engine.quality_filter import QualityFilter
+from engine.screener import QuantScreener
+from engine.sentiment import SentimentEngine
+from engine.signals import (
+    QuantSignalEngine,
+    calculate_position_size,
+    empirical_zscore,
+    percentile_score,
+)
 
 def test_percentile_score_handles_bimodal_distribution():
     """CVD divergence is bimodal (mostly 0, occasionally ±1). Z-score explodes; percentile is stable."""
