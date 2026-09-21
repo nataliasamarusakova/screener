@@ -146,7 +146,7 @@ class QuantScreener:
         self.top_n_symbols = top_n_symbols
         self.history_bars = int(os.getenv("SIGNAL_HISTORY_BARS", "60"))
         self.z_history_min_samples = int(os.getenv("SIGNAL_Z_MIN_SAMPLES", "24"))
-        self.cvd_lookback = int(os.getenv("CVD_LOOKBACK_BARS", "12"))
+        self.cvd_lookback = int(os.getenv("CVD_LOOKBACK_BARS", "8"))
         self.vpin_window_baskets = int(os.getenv("VPIN_WINDOW_BASKETS", "10"))
         self.beta_min_samples = int(os.getenv("BETA_MIN_SAMPLES", "24"))
         self.atr_lookback = int(os.getenv("ATR_LOOKBACK_BARS", "12"))
