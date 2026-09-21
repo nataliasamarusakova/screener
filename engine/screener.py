@@ -155,7 +155,11 @@ class QuantScreener:
             raise ValueError("SIGNAL_HISTORY_BARS must be greater than SIGNAL_Z_MIN_SAMPLES")
 
         self.ingestion = BinanceFuturesIngestion(symbols=[])
-        self.signal_engine = QuantSignalEngine(z_history_min_samples=self.z_history_min_samples)
+        self.signal_engine = QuantSignalEngine(
+            z_history_min_samples=self.z_history_min_samples,
+            min_effective_rrr=float(os.getenv("MIN_EFFECTIVE_RRR", "1.30")),
+            friction_round_trip_pct=float(os.getenv("FRICTION_RT_PCT", "0.0018")),
+        )
         self.liq_detector = SyntheticLiquidationDetector()
         self.regime_engine = MarketRegimeEngine()
         self.funding_filter = FundingFilterEngine(proximity_threshold_minutes=20.0)
