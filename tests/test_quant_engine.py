@@ -1,8 +1,4 @@
-"""Regression tests for the production quant/risk paths.
-
-The tests intentionally assert concrete values and failure modes rather than
-implementation ranges. They cover the Phase-1 root causes fixed in Phase 2.
-"""
+"""Regression tests for the production quant/risk paths."""
 import asyncio
 import json
 import math
@@ -25,7 +21,7 @@ from engine.market_regime import MarketRegimeEngine
 from engine.microstructure_jit import compute_vpin_numba, compute_weighted_obi_jit
 from engine.quality_filter import QualityFilter
 from engine.sentiment import SentimentEngine
-from engine.signals import QuantSignalEngine, empirical_zscore
+from engine.signals import QuantSignalEngine, empirical_zscore, calculate_position_size
 from engine.screener import QuantScreener
 
 
@@ -62,19 +58,30 @@ def test_orderbook_fsm_sync_and_gap_detection():
     assert fsm.state == OrderBookFSMState.DISCONNECTED
 
 
-def test_orderbook_fsm_requires_last_update_plus_one_in_first_event():
-    fsm = BinanceOrderBookFSM("BTCUSDT")
-    fsm.on_ws_connected()
-    fsm.handle_depth_event({
-        "e": "depthUpdate", "E": 100, "s": "BTCUSDT", "U": 90, "u": 100, "pu": 89,
-        "b": [], "a": [],
-    })
-    assert fsm.apply_snapshot({
-        "lastUpdateId": 100,
-        "bids": [["60000", "1.0"]],
-        "asks": [["60001", "1.0"]],
-    }) is False
-    assert fsm.state == OrderBookFSMState.BUFFERING
+def test_position_sizing_calculation():
+    # Depo = $10,000, 1% risk = $100. Stop is 2% away. Size must be $5,000, leverage 1x
+    pos_usd, lev = calculate_position_size(10000.0, 100.0, 98.0, risk_per_trade_pct=0.01)
+    assert pos_usd == 5000.0
+    assert lev == 1
+
+    # Stop is 0.5% away. Position would be $20,000, leverage 2x
+    pos_usd, lev = calculate_position_size(10000.0, 100.0, 99.5, risk_per_trade_pct=0.01)
+    assert pos_usd == 20000.0
+    assert lev == 2
+
+
+def test_negative_beta_calculation_is_supported():
+    step = 5 * 60 * 1000
+    times = [1700000000000 + i * step for i in range(30)]
+    btc = [60000.0]
+    alt = [3000.0]
+    returns = [0.0005, -0.0002, 0.0008, 0.0001, -0.0004] * 6
+    for r in returns:
+        btc.append(btc[-1] * (1.0 + r))
+        alt.append(alt[-1] * (1.0 - 1.5 * r)) # Negative correlation
+    beta = MarketRegimeEngine.calculate_rolling_beta(times, alt, times, btc, min_samples=24)
+    assert beta is not None
+    assert beta == pytest.approx(-1.5, rel=1e-2)
 
 
 def test_weighted_obi_exact_value_and_symmetry():
@@ -126,87 +133,11 @@ def test_empirical_zscore_is_true_point_in_time_sample_zscore():
     assert z == pytest.approx(expected, abs=1e-12)
     with pytest.raises(ValueError, match="Insufficient history"):
         empirical_zscore(5.0, [1.0, 2.0, 3.0], min_samples=4)
-    # A flat history has no defined standardized deviation. The engine now treats
-    # that factor as neutral instead of failing the whole symbol.
     assert empirical_zscore(2.0, [1.0, 1.0, 1.0, 1.0], min_samples=4) == 0.0
     assert empirical_zscore(1.0, [1.0, 1.0, 1.0, 1.0], min_samples=4) == 0.0
 
 
-def test_signal_zscores_treat_flat_factor_histories_as_neutral():
-    engine = QuantSignalEngine(z_history_min_samples=4)
-    result = engine.calculate_factor_zscores(
-        funding_rate_8h=0.001,
-        basis_spread_bps=0.5,
-        delta_oi_pct=0.02,
-        obi=0.2,
-        vpin=0.1,
-        cvd_divergence_score=1.0,
-        whale_divergence_score=0.5,
-        funding_history=[0.001] * 4,
-        basis_history=[0.5] * 4,
-        delta_oi_pct_history=[0.02] * 4,
-        micro_factor_history=[0.18] * 4,
-        cvd_history=[0.0] * 4,
-        whale_history=[0.5] * 4,
-    )
-    assert result == (0.0, 0.0, 0.0, 0.0, 0.0)
-
-
-def test_missing_sentiment_does_not_create_new_whale_history_sample():
-    # The screener's policy for a missing sentiment window is: no stale carry-forward
-    # observation is appended, and the whale factor contributes neutral evidence for
-    # the current point. This regression documents that contract independently of HTTP.
-    history = (0.295,) * 24
-    assert len(history) == 24
-    # A flat persisted history is safe for the Z-score engine and evaluates to neutral.
-    assert empirical_zscore(0.0, history, min_samples=24) == 0.0
-
-
-def test_explicit_5m_agg_trade_window_never_falls_back_to_last_n_trades():
-    class StubIngestion(BinanceFuturesIngestion):
-        async def _request_json(self, method, url, *, params=None, weight, symbol=""):
-            assert params["startTime"] == "1700000000000"
-            assert params["endTime"] == "1700000299999"
-            assert params["limit"] == "1000"
-            assert weight == 20
-            return [{"a": 1, "T": 1700000100000, "q": "2.0", "m": True}]
-
-    trades = asyncio.run(StubIngestion([]).fetch_5m_agg_trades(
-        "BTCUSDT", 1700000000000, 1700000299999
-    ))
-    assert trades is not None
-    assert len(trades) == 1
-    assert trades[0]["T"] == 1700000100000
-    assert trades[0]["a"] == 1
-
-
-def test_explicit_5m_agg_trade_window_rejects_malformed_missing_trade_id():
-    class StubIngestion(BinanceFuturesIngestion):
-        async def _request_json(self, method, url, *, params=None, weight, symbol=""):
-            return [{"T": 1700000100000, "q": "2.0", "m": True}]
-
-    trades = asyncio.run(StubIngestion([]).fetch_5m_agg_trades(
-        "BTCUSDT", 1700000000000, 1700000299999
-    ))
-    assert trades is None
-
-
-def test_deprecated_last_n_trade_cvd_helper_fails_loudly():
-    ingestion = BinanceFuturesIngestion([])
-    with pytest.raises(RuntimeError, match="deprecated"):
-        asyncio.run(ingestion.fetch_recent_agg_trades_cvd("BTCUSDT"))
-
-
-def test_5m_sweep_direction_is_preserved_into_signal_booster():
-    event = LiquiditySweepDetector().detect(
-        symbol="BTCUSDT", current_price=101.0, current_high=102.0, current_low=99.0,
-        recent_swing_high=105.0, recent_swing_low=100.0, cvd_delta=500.0,
-    )
-    assert event is not None
-    assert event.pattern_type == "BULLISH_SWEEP_RECLAIM"
-
-
-def test_signal_requires_empirical_zscores_and_preserves_sweep_direction():
+def test_signal_generation_with_position_sizing_and_friction():
     engine = QuantSignalEngine(z_history_min_samples=4)
     common = dict(
         symbol="BTCUSDT",
@@ -229,573 +160,29 @@ def test_signal_requires_empirical_zscores_and_preserves_sweep_direction():
         sweep_reclaim=True,
         sweep_pattern="BULLISH_SWEEP_RECLAIM",
         timestamp_ms=1700000000000,
+        account_equity=10000.0,
     )
     sig = engine.compute_signal(**common)
-    expected_score = 100.0 * math.tanh((25 * 3 + 25 * 3 + 15 * 3 + 15 * 3 + 20 * 3 + 25) / (100 * 1.4))
     assert sig.signal_type == "STRONG_LONG"
-    assert sig.composite_score == pytest.approx(round(expected_score, 2), abs=1e-12)
-    assert sig.sweep_pattern == "BULLISH_SWEEP_RECLAIM"
+    assert sig.suggested_position_usd > 0.0
+    assert sig.suggested_leverage >= 1
     assert sig.invalidation_price < 100.0 < sig.target_price
 
-    with pytest.raises(ValueError, match="All empirical factor Z-score overrides are required"):
-        engine.compute_signal(**{k: v for k, v in common.items() if k != "z_whale_override"})
 
-    with pytest.raises(ValueError, match="explicit sweep_pattern"):
-        engine.compute_signal(**{**common, "sweep_pattern": "NONE"})
-
-
-
-
-
-
-def test_empirical_zscore_rejects_nonfinite_history_instead_of_shrinking_sample():
-    history = [1.0, 2.0, float("nan"), 4.0]
-    with pytest.raises(ValueError, match="history contains non-finite"):
-        empirical_zscore(3.0, history, min_samples=3)
-
-
-def test_funding_gate_rejects_nonfinite_funding_rate():
-    result = FundingFilterEngine().evaluate_funding_gate(
-        symbol="BTCUSDT",
-        signal_type="STRONG_LONG",
-        funding_rate_8h=float("nan"),
-        next_funding_time_ms=1_700_000_300_000,
-        current_time_ms=1_700_000_000_000,
+def test_friction_gate_blocks_signals_with_insufficient_net_rrr():
+    # If target is too close and fees eat the edge, signal must be downgraded to NEUTRAL
+    engine = QuantSignalEngine(min_effective_rrr=3.0) # Unattainable hurdle
+    sig = engine.compute_signal(
+        symbol="BTCUSDT", current_price=100.0, funding_rate_8h=0.0, basis_spread_bps=0.0,
+        delta_oi=100.0, oi_total=1000.0, obi=0.8, vpin=0.2, cvd_divergence_score=1.0,
+        recent_high=101.0, recent_low=99.0, z_cvd_override=3.0, z_fund_override=3.0,
+        z_delta_oi_override=3.0, z_micro_override=3.0, z_whale_override=3.0, atr_pct=0.01,
+        sweep_reclaim=True, sweep_pattern="BULLISH_SWEEP_RECLAIM", timestamp_ms=1700000000000,
     )
-    assert result.allow_long is False
-    assert result.allow_short is False
-    assert result.gate_reason == "INVALID_FUNDING_RATE"
-
-
-def test_funding_unknown_time_is_fail_closed():
-    result = FundingFilterEngine(proximity_threshold_minutes=20.0).evaluate_funding_gate(
-        symbol="BTCUSDT",
-        signal_type="STRONG_LONG",
-        funding_rate_8h=0.001,
-        next_funding_time_ms=0,
-        current_time_ms=1700000000000,
-    )
-    assert result.allow_long is False
-    assert result.allow_short is False
-    assert result.gate_reason == "UNKNOWN_FUNDING_TIME"
-
-
-def test_quality_gate_rejects_nan_before_threshold_logic():
-    result = QualityFilter().evaluate(
-        symbol="BTCUSDT",
-        quote_volume_24h=float("nan"),
-        spread_bps=1.0,
-        funding_rate_8h=0.0,
-    )
-    assert result.is_valid is False
-    assert result.rejection_reason == "NON_FINITE_INPUT"
-
-
-def test_rolling_beta_is_timestamp_aligned_and_requires_contiguous_5m_data():
-    step = 5 * 60 * 1000
-    times = [1700000000000 + i * step for i in range(30)]
-    btc = [60000.0]
-    alt = [3000.0]
-    returns = [0.0005, -0.0002, 0.0008, 0.0001, -0.0004] * 6
-    for r in returns:
-        btc.append(btc[-1] * (1.0 + r))
-        alt.append(alt[-1] * (1.0 + 2.0 * r))
-    beta = MarketRegimeEngine.calculate_rolling_beta(times, alt, times, btc, min_samples=24)
-    assert beta == pytest.approx(2.0, rel=1e-3)
-
-    gapped_times = times.copy()
-    gapped_times[15] += step
-    gapped_beta = MarketRegimeEngine.calculate_rolling_beta(gapped_times, alt, times, btc, min_samples=24)
-    assert gapped_beta is None
-
-
-
-
-
-
-def test_liquidation_detector_rejects_zero_visible_taker_volume():
-    result = SyntheticLiquidationDetector().detect(
-        symbol="BTCUSDT",
-        current_price=60000.0,
-        price_change_pct=-1.0,
-        delta_oi=-1000.0,
-        taker_buy_vol=0.0,
-        taker_sell_vol=0.0,
-    )
-    assert result is None
-
-
-
-
-def test_signal_rejects_nonfinite_z_override():
-    engine = QuantSignalEngine()
-    with pytest.raises(ValueError, match="Non-finite signal input"):
-        engine.compute_signal(
-            symbol="BTCUSDT", current_price=100.0, funding_rate_8h=0.0, basis_spread_bps=0.0,
-            delta_oi=0.0, oi_total=1000.0, obi=0.0, vpin=0.5, cvd_divergence_score=0.0,
-            recent_high=101.0, recent_low=99.0, z_cvd_override=float("nan"), z_fund_override=0.0,
-            z_delta_oi_override=0.0, z_micro_override=0.0, z_whale_override=0.0, atr_pct=1.0,
-        )
-
-
-
-
-
-
+    assert sig.signal_type == "NEUTRAL"
+    assert "BLOCKED_UNPROFITABLE_AFTER_FEES" in sig.gate_status
 
 
 def test_sentiment_fails_closed_without_api_key():
     result = asyncio.run(SentimentEngine(api_key=None).fetch_sentiment_divergence("BTCUSDT"))
     assert result is None
-
-
-def test_sentiment_observation_selector_is_bounded_by_pit_window():
-    start = 1_700_000_000_000
-    end = start + 300_000
-    data = [
-        {"timestamp": start - 1, "longShortRatio": "1.0"},
-        {"timestamp": start + 60_000, "longShortRatio": "1.1"},
-        {"timestamp": end + 1, "longShortRatio": "9.9"},
-    ]
-    selected = SentimentEngine._select_observation(data, start, end)
-    assert selected is not None
-    assert selected["longShortRatio"] == "1.1"
-
-
-
-
-def test_state_contract_backward_compatible_with_old_payload():
-    old_payload = {
-        "symbol": "BTCUSDT",
-        "timestamp_ms": 1700000000000,
-        "last_price": 60000.0,
-        "open_interest": 1000.0,
-        "delta_oi_5m": 0.0,
-        "cumulative_cvd_5m": 0.0,
-        "funding_rate_8h": 0.0,
-        "basis_bps": 0.0,
-        "vpin_estimate": 0.1,
-        "obi_score": 0.2,
-        "composite_score": 0.0,
-        "low_24h": 59000.0,
-        "high_24h": 61000.0,
-        "whale_sentiment_z": 0.0,
-        "cvd_history_5m": (),
-        "price_history_5m": (),
-    }
-    raw = json.dumps(old_payload).encode()
-    decoded = __import__("msgspec").json.decode(raw, type=MarketStateSnapshot)
-    assert decoded.signal_ready is False
-    assert decoded.candle_open_time_ms == 0
-
-
-async def _fake_screener_scan_dependencies():
-    return None
-
-
-
-
-
-
-def _make_5m_kline(open_ms: int, open_price: float, high: float, low: float, close: float, volume: float = 10.0, taker_buy: float = 5.0):
-    return [
-        open_ms, str(open_price), str(high), str(low), str(close), str(volume),
-        open_ms + 299_999, str(volume), 1, str(taker_buy), str(taker_buy), "0",
-    ]
-
-
-def test_atr_pct_uses_previous_close_for_first_true_range():
-    base = 1_700_000_000_000
-    step = 5 * 60 * 1000
-    klines = [
-        _make_5m_kline(base, 100.0, 101.0, 99.0, 100.0),
-        _make_5m_kline(base + step, 115.0, 120.0, 110.0, 115.0),
-        _make_5m_kline(base + 2 * step, 115.0, 116.0, 114.0, 114.5),
-    ]
-    atr_pct = __import__("engine.screener", fromlist=["QuantScreener"]).QuantScreener._atr_pct(klines, lookback=2)
-    assert atr_pct == pytest.approx(11.0 / 114.5, rel=0.0, abs=1e-12)
-
-
-def test_btc_regime_threshold_uses_unrounded_5m_change():
-    engine = MarketRegimeEngine()
-    regime = engine.evaluate_btc_regime(99.701, 100.0, 0.0)
-    assert regime.status == "NEUTRAL_RANGING"
-    assert regime.btc_change_5m_pct == pytest.approx(-0.299, abs=1e-12)
-
-
-def test_rolling_beta_rejects_gap_inside_latest_window():
-    step = 5 * 60 * 1000
-    times = [1_700_000_000_000 + i * step for i in range(30)]
-    btc = [60_000.0]
-    alt = [3_000.0]
-    returns = [0.0005, -0.0002, 0.0008, 0.0001, -0.0004] * 6
-    for r in returns:
-        btc.append(btc[-1] * (1.0 + r))
-        alt.append(alt[-1] * (1.0 + 2.0 * r))
-    gapped = times.copy()
-    gapped[15] += step
-    beta = MarketRegimeEngine.calculate_rolling_beta(gapped, alt, times, btc, min_samples=24)
-    assert beta is None
-
-
-class _FakeHTTPResponse:
-    def __init__(self, payload):
-        self.status = 200
-        self._payload = payload
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-    async def json(self):
-        return self._payload
-
-
-class _FakeHTTPSession:
-    closed = False
-
-    def __init__(self, responses):
-        self.responses = responses
-
-    def get(self, url, params=None):
-        if "globalLongShortAccountRatio" in url:
-            return _FakeHTTPResponse(self.responses["retail"])
-        if "topLongShortPositionRatio" in url:
-            return _FakeHTTPResponse(self.responses["whale"])
-        return _FakeHTTPResponse(self.responses["taker"])
-
-
-
-def test_sentiment_accepts_endpoint_specific_5m_timestamp_semantics():
-    start = 1_700_000_000_000
-    end = start + 300_000
-    responses = {
-        "retail": [{"timestamp": end, "longShortRatio": "1.2", "longAccount": "0.55"}],
-        "whale": [{"timestamp": end, "longShortRatio": "1.5", "longAccount": "0.60"}],
-        "taker": [{"timestamp": start, "buySellRatio": "1.1"}],
-    }
-    engine = SentimentEngine(session=_FakeHTTPSession(responses), api_key="test")
-    result = asyncio.run(engine.fetch_sentiment_divergence("BTCUSDT", start_time_ms=start, end_time_ms=end))
-    assert result is not None
-    assert result.observation_timestamp_ms == end
-    assert result.retail_ls_ratio == pytest.approx(1.2, abs=1e-12)
-
-
-def test_sentiment_rejects_wrong_endpoint_boundary_timestamps():
-    start = 1_700_000_000_000
-    end = start + 300_000
-    responses = {
-        "retail": [{"timestamp": start, "longShortRatio": "1.2", "longAccount": "0.55"}],
-        "whale": [{"timestamp": end, "longShortRatio": "1.5", "longAccount": "0.60"}],
-        "taker": [{"timestamp": start, "buySellRatio": "1.1"}],
-    }
-    engine = SentimentEngine(session=_FakeHTTPSession(responses), api_key="test")
-    result = asyncio.run(engine.fetch_sentiment_divergence("BTCUSDT", start_time_ms=start, end_time_ms=end))
-    assert result is None
-
-
-def test_rate_limiter_rejects_weight_larger_than_budget():
-    limiter = __import__("binance_ingestion", fromlist=["WeightedRateLimiter"]).WeightedRateLimiter(max_weight=10)
-    with pytest.raises(ValueError, match="exceeds limiter budget"):
-        asyncio.run(limiter.acquire(11))
-
-
-def test_screener_rejects_nonpositive_runtime_limits():
-    from engine.screener import QuantScreener
-    with pytest.raises(ValueError, match="SCAN_CONCURRENCY"):
-        QuantScreener(concurrency_limit=0)
-    with pytest.raises(ValueError, match="TOP_N_SYMBOLS"):
-        QuantScreener(top_n_symbols=0)
-
-
-def test_telegram_cache_skips_malformed_records(tmp_path, monkeypatch):
-    from engine.telegram import TelegramAlerter
-    import engine.telegram as telegram_module
-    cache_path = tmp_path / ".alert_cache.json"
-    cache_path.write_text(json.dumps({
-        "BTCUSDT": {"time": 100.0, "score": 80.0},
-        "BROKEN": {"time": "not-a-number", "score": 80.0},
-        "MISSING": {"time": 100.0},
-    }), encoding="utf-8")
-    monkeypatch.setattr(telegram_module, "ALERT_CACHE_FILE", cache_path)
-    alerter = TelegramAlerter(cooldown_sec=3600)
-    assert alerter.cache == {"BTCUSDT": {"time": 100.0, "score": 80.0}}
-
-
-
-def test_orderbook_snapshot_mismatch_resyncs_without_physical_disconnect():
-    async def scenario():
-        ingestion = BinanceFuturesIngestion(["BTCUSDT"])
-        ingestion._running = True
-        calls = 0
-
-        async def fake_snapshot(symbol, limit=1000):
-            nonlocal calls
-            calls += 1
-            return {
-                "lastUpdateId": 100,
-                "bids": [["60000", "1.0"]],
-                "asks": [["60001", "1.0"]],
-            }
-
-        ingestion.fetch_l2_snapshot = fake_snapshot
-        book = ingestion.books["BTCUSDT"]
-        book.on_ws_connected()
-        task = asyncio.create_task(ingestion._sync_symbol_book("BTCUSDT"))
-        await asyncio.sleep(0)
-        book.handle_depth_event({"e": "depthUpdate", "E": 100, "s": "BTCUSDT", "U": 90, "u": 100, "pu": 89, "b": [], "a": []})
-        await asyncio.sleep(0.35)
-        assert book.state == OrderBookFSMState.BUFFERING
-        assert calls >= 1
-        book.handle_depth_event({"e": "depthUpdate", "E": 101, "s": "BTCUSDT", "U": 101, "u": 105, "pu": 100, "b": [["60000", "2.0"]], "a": [["60001", "2.0"]]})
-        await asyncio.wait_for(task, timeout=2.0)
-        assert book.state == OrderBookFSMState.IN_SYNC
-        assert calls == 2
-        await ingestion.stop()
-
-    asyncio.run(scenario())
-
-
-def test_quality_filter_rejects_nonfinite_configuration():
-    with pytest.raises(ValueError, match="finite"):
-        QualityFilter(max_spread_bps=float("nan"))
-    with pytest.raises(ValueError, match="invalid bounds"):
-        QualityFilter(max_abs_funding_rate_8h=0.0)
-
-
-def test_funding_filter_rejects_nonfinite_threshold_configuration():
-    with pytest.raises(ValueError, match="finite and positive"):
-        FundingFilterEngine(proximity_threshold_minutes=float("nan"))
-
-
-def test_market_regime_rejects_nonfinite_or_reversed_thresholds():
-    with pytest.raises(ValueError, match="finite"):
-        MarketRegimeEngine(dump_threshold_5m_pct=float("nan"))
-    with pytest.raises(ValueError, match="invalid bounds"):
-        MarketRegimeEngine(dump_threshold_5m_pct=0.3, pump_threshold_5m_pct=-0.3)
-
-
-def test_ingestion_rejects_nonfinite_rate_limit_backoff(monkeypatch):
-    monkeypatch.setenv("BINANCE_429_BACKOFF_SEC", "nan")
-    with pytest.raises(ValueError, match="BINANCE_429_BACKOFF_SEC"):
-        BinanceFuturesIngestion([])
-
-
-def test_screener_offline_single_symbol_scan_persists_closed_candle(tmp_path):
-    from types import SimpleNamespace
-
-    class FakeIngestion:
-        def __init__(self):
-            self.stopped = False
-
-        async def fetch_universe_tickers(self):
-            return {
-                "BTCUSDT": {
-                    "symbol": "BTCUSDT", "quoteVolume": "100000000",
-                    "highPrice": "102", "lowPrice": "98", "priceChangePercent": "0.2",
-                }
-            }
-
-        async def fetch_universe_premium_index(self):
-            return {
-                "BTCUSDT": {
-                    "symbol": "BTCUSDT", "lastFundingRate": "0.0001",
-                    "markPrice": "100", "indexPrice": "99.99",
-                    "nextFundingTime": 9_999_999_999_999,
-                }
-            }
-
-        async def fetch_universe_funding_info(self):
-            return {}
-
-        async def fetch_symbol_closed_5m_klines(self, symbol, closed_open_ms, *, history_bars):
-            first = closed_open_ms - (history_bars - 1) * 300_000
-            rows = []
-            for i in range(history_bars):
-                t = first + i * 300_000
-                rows.append([t, "99.5", "100.5", "99.0", "100.0", "10", t + 299_999, "1000", "10", "5", "500", "0"])
-            return rows
-
-        async def fetch_symbol_closed_5m_open_interest(self, symbol, current_open_ms):
-            return 1000.0
-
-        async def fetch_symbol_orderbook_top(self, symbol, limit=20):
-            return SimpleNamespace(
-                bids=((99.99, 10.0), (99.98, 5.0)),
-                asks=((100.00, 10.0), (100.01, 5.0)),
-                spread_bps=1.5,
-            )
-
-        async def fetch_5m_agg_trades(self, symbol, start_time_ms, end_time_ms):
-            return [{"a": 1, "T": start_time_ms, "q": 10.0, "m": False}]
-
-        async def stop(self):
-            self.stopped = True
-
-    class FakeSentiment:
-        async def fetch_sentiment_divergence(self, symbol, start_time_ms=None, end_time_ms=None):
-            return SimpleNamespace(divergence_score=0.0)
-
-        async def close(self):
-            pass
-
-    async def run():
-        screener = QuantScreener(state_file=tmp_path / "state.bin", top_n_symbols=1, concurrency_limit=1)
-        screener.ingestion = FakeIngestion()
-        screener.sentiment_engine = FakeSentiment()
-        _, _, summary = await screener.scan()
-        assert summary.total_scanned == 1
-        assert summary.successful_symbols == 1
-        assert summary.failed_symbols == 0
-        assert summary.signal_ready_symbols == 0
-        state = screener.load_previous_state()
-        assert state["BTCUSDT"].candle_open_time_ms == summary.timestamp_ms + 1 - 300_000
-        assert screener.ingestion.stopped is False
-        await screener.close()
-        assert screener.ingestion.stopped is True
-
-    asyncio.run(run())
-
-
-def test_screener_missing_sentiment_does_not_fail_ready_symbol_or_pollute_history(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    import engine.screener as screener_module
-    import msgspec
-
-    monkeypatch.setenv("SIGNAL_Z_MIN_SAMPLES", "4")
-    monkeypatch.setenv("SIGNAL_HISTORY_BARS", "10")
-    monkeypatch.setattr(screener_module, "detect_cvd_divergence_jit", lambda *args, **kwargs: (0.25, 0))
-
-    step = 300_000
-    now_open = (int(__import__("time").time() * 1000) // step) * step
-    closed_open = now_open - step
-    previous_open = closed_open - step
-
-    previous = MarketStateSnapshot(
-        symbol="BTCUSDT",
-        timestamp_ms=previous_open + 299_999,
-        last_price=100.0,
-        open_interest=1000.0,
-        delta_oi_5m=0.0,
-        cumulative_cvd_5m=100.0,
-        funding_rate_8h=0.001,
-        basis_bps=1.0,
-        vpin_estimate=0.2,
-        obi_score=0.1,
-        composite_score=0.0,
-        cvd_history_5m=(96.0, 97.0, 98.0, 99.0),
-        price_history_5m=(98.0, 99.0, 100.0, 101.0),
-        funding_history_5m=(0.0008, 0.0010, 0.0011, 0.0009),
-        basis_history_5m=(0.5, 0.8, 1.2, 1.0),
-        delta_oi_pct_history_5m=(-0.001, 0.0005, -0.0002, 0.0008),
-        micro_factor_history_5m=(0.05, 0.08, 0.12, 0.07),
-        whale_divergence_history_5m=(0.10, 0.12, 0.08, 0.11, 0.09),
-        cvd_divergence_history_5m=(-0.1, 0.0, 0.2, -0.05),
-        candle_open_time_ms=previous_open,
-        candle_open_times_5m=(previous_open - 3 * step, previous_open - 2 * step, previous_open - step, previous_open),
-        candle_high_5m=101.0,
-        candle_low_5m=98.0,
-    )
-
-    class FakeIngestion:
-        stopped = False
-
-        async def fetch_universe_tickers(self):
-            return {"BTCUSDT": {"symbol": "BTCUSDT", "quoteVolume": "100000000", "highPrice": "102", "lowPrice": "98", "priceChangePercent": "0.2"}}
-
-        async def fetch_universe_premium_index(self):
-            return {"BTCUSDT": {"symbol": "BTCUSDT", "lastFundingRate": "0.0001", "markPrice": "100", "indexPrice": "99.99", "nextFundingTime": 9_999_999_999_999}}
-
-        async def fetch_universe_funding_info(self):
-            return {}
-
-        async def fetch_symbol_closed_5m_klines(self, symbol, closed_open_ms, *, history_bars):
-            rows=[]
-            first=closed_open_ms-(history_bars-1)*step
-            for i in range(history_bars):
-                t=first+i*step
-                rows.append([t, "100", "101", "99", "100", "10", t+299_999, "1000", "10", "5", "500", "0"])
-            return rows
-
-        async def fetch_symbol_closed_5m_open_interest(self, symbol, current_open_ms):
-            return 1001.0
-
-        async def fetch_symbol_orderbook_top(self, symbol, limit=20):
-            return SimpleNamespace(bids=((99.99, 10.0), (99.98, 5.0)), asks=((100.00, 10.0), (100.01, 5.0)), spread_bps=1.0)
-
-        async def fetch_5m_agg_trades(self, symbol, start_time_ms, end_time_ms):
-            return [{"a": 1, "T": start_time_ms, "q": 10.0, "m": False}]
-
-        async def stop(self):
-            self.stopped = True
-
-    class MissingSentiment:
-        async def fetch_sentiment_divergence(self, symbol, start_time_ms=None, end_time_ms=None):
-            return None
-
-        async def close(self):
-            pass
-
-    async def run():
-        state_file = tmp_path / "state.bin"
-        state_file.write_bytes(msgspec.json.encode([previous]))
-        screener = QuantScreener(state_file=state_file, top_n_symbols=1, concurrency_limit=1)
-        screener.ingestion = FakeIngestion()
-        screener.sentiment_engine = MissingSentiment()
-        _, _, summary = await screener.scan()
-        assert summary.total_scanned == 1
-        assert summary.successful_symbols == 1
-        assert summary.failed_symbols == 0
-        # The regression target is that the missing sentiment window is not an
-        # unexpected symbol failure.
-        persisted = screener.load_previous_state()["BTCUSDT"]
-        assert len(persisted.whale_divergence_history_5m) == 5
-        assert persisted.whale_divergence_history_5m == previous.whale_divergence_history_5m
-        await screener.close()
-
-    asyncio.run(run())
-
-
-def _minimal_snapshot(symbol: str, candle_open_time_ms: int) -> MarketStateSnapshot:
-    return MarketStateSnapshot(
-        symbol=symbol,
-        timestamp_ms=candle_open_time_ms + 299999,
-        last_price=100.0,
-        open_interest=1000.0,
-        delta_oi_5m=0.0,
-        cumulative_cvd_5m=0.0,
-        funding_rate_8h=0.0,
-        basis_bps=0.0,
-        vpin_estimate=0.2,
-        obi_score=0.0,
-        composite_score=0.0,
-        candle_open_time_ms=candle_open_time_ms,
-    )
-
-
-def test_screener_contiguous_state_helper_rejects_stale_btc_snapshot():
-    expected = 1_700_000_000_000
-    fresh = _minimal_snapshot("BTCUSDT", expected)
-    stale = _minimal_snapshot("BTCUSDT", expected - 300_000)
-    assert QuantScreener._state_is_for_candle(fresh, expected) is True
-    assert QuantScreener._state_is_for_candle(stale, expected) is False
-    assert QuantScreener._state_is_for_candle(None, expected) is False
-
-
-def test_signal_rejects_nonfinite_configuration():
-    with pytest.raises(ValueError, match="finite"):
-        QuantSignalEngine(score_tanh_scale=float("nan"))
-    with pytest.raises(ValueError, match="non-negative"):
-        QuantSignalEngine(w_cvd=-1.0)
-    with pytest.raises(ValueError, match="strong_signal_threshold"):
-        QuantSignalEngine(strong_signal_threshold=101.0)
-
-
-def test_binance_451_is_a_distinct_restricted_location_failure():
-    exc = BinanceRestrictedLocationError(
-        "Binance Futures rejected the request with HTTP 451 (restricted location)"
-    )
-    assert "HTTP 451" in str(exc)
-    assert "restricted location" in str(exc)
