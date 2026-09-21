@@ -118,7 +118,7 @@ class QuantSignalEngine:
         basis_weight: float = 0.30,
         z_history_min_samples: int = 24,
         score_tanh_scale: float = 1.40,
-        sweep_booster_points: float = 25.0,
+        sweep_booster_points: float = 0.0,
         strong_signal_threshold: float = 75.0,
         swing_buffer_bps: float = 15.0,
         atr_stop_multiplier: float = 1.50,
@@ -126,8 +126,10 @@ class QuantSignalEngine:
         target_risk_reward: float = 2.0,
         friction_round_trip_pct: float = 0.0018,
         min_effective_rrr: float = 1.30,   # FIX: default now 1.30, was 0.0 (dead code)
-        trailing_activation_r: float = 0.5,  # NEW: activate trailing at +0.5R
-        trailing_distance_r: float = 0.7,    # NEW: trail width = 0.7R
+        trailing_activation_r: float = 0.5,
+        trailing_distance_r: float = 0.7,
+        risk_per_trade_pct: float = 0.01,
+        max_leverage: int = 3,
     ) -> None:
         numeric_config = (
             w_cvd, w_fund, w_oi, w_micro, w_whale,
@@ -135,7 +137,7 @@ class QuantSignalEngine:
             sweep_booster_points, strong_signal_threshold,
             swing_buffer_bps, atr_stop_multiplier, max_atr_multiplier,
             target_risk_reward, friction_round_trip_pct, min_effective_rrr,
-            trailing_activation_r, trailing_distance_r,
+            trailing_activation_r, trailing_distance_r, risk_per_trade_pct, float(max_leverage),
         )
         if not all(math.isfinite(float(x)) for x in numeric_config):
             raise ValueError("Signal configuration must be finite")
@@ -162,6 +164,8 @@ class QuantSignalEngine:
         self.min_effective_rrr = float(min_effective_rrr)
         self.trailing_activation_r = float(trailing_activation_r)
         self.trailing_distance_r = float(trailing_distance_r)
+        self.risk_per_trade_pct = float(risk_per_trade_pct)
+        self.max_leverage = int(max_leverage)
 
         if self.total_weights <= 0.0:
             raise ValueError("Signal weights must sum to a positive value")
@@ -179,6 +183,12 @@ class QuantSignalEngine:
             raise ValueError("max_atr_multiplier must be >= atr_stop_multiplier")
         if self.trailing_activation_r <= 0.0 or self.trailing_distance_r <= 0.0:
             raise ValueError("Trailing stop parameters must be positive")
+        if not (0.0 < self.risk_per_trade_pct < 1.0):
+            raise ValueError("risk_per_trade_pct must be in (0, 1)")
+        if self.max_leverage < 1:
+            raise ValueError("max_leverage must be >= 1")
+        if self.friction_round_trip_pct < 0.0:
+            raise ValueError("friction_round_trip_pct must be non-negative")
 
     def calculate_factor_zscores(
         self,
@@ -242,6 +252,7 @@ class QuantSignalEngine:
         recent_high: float,
         recent_low: float,
         timestamp_ms: Optional[int] = None,
+        decision_timestamp_ms: Optional[int] = None,
         z_whale_sentiment: float = 0.0,
         relative_strength: float = 0.0,
         sweep_reclaim: bool = False,
@@ -260,6 +271,7 @@ class QuantSignalEngine:
         friction_round_trip_pct: Optional[float] = None,  # NEW: per-symbol override
     ) -> SignalEvent:
         now_ms = timestamp_ms if timestamp_ms is not None else int(time.time() * 1000)
+        decision_ms = decision_timestamp_ms if decision_timestamp_ms is not None else int(time.time() * 1000)
 
         if (
             z_cvd_override is None
@@ -358,25 +370,27 @@ class QuantSignalEngine:
                 raise ValueError("5m swing levels are required for strong-signal risk levels")
 
             buffer = self.swing_buffer_bps / 10000.0
-            max_risk_dist = current_price * atr_pct * self.max_atr_multiplier
-            min_risk_dist = current_price * atr_pct * 0.50
+            atr_unit = current_price * atr_pct
+            min_risk_dist = atr_unit * 0.50
+            desired_risk_dist = atr_unit * self.atr_stop_multiplier
+            max_risk_dist = atr_unit * self.max_atr_multiplier
 
             if candidate_type == "STRONG_LONG":
                 structural_stop = recent_low * (1.0 - buffer)
-                invalidation_price = min(
-                    current_price - min_risk_dist,
-                    max(current_price - max_risk_dist, structural_stop),
-                )
+                structural_risk_dist = current_price - structural_stop
+                risk_dist = max(desired_risk_dist, structural_risk_dist)
+                risk_dist = _clip(risk_dist, min_risk_dist, max_risk_dist)
+                invalidation_price = current_price - risk_dist
                 if invalidation_price <= 0.0 or invalidation_price >= current_price:
                     raise ValueError("Invalid long invalidation level")
                 gross_risk = current_price - invalidation_price
                 target_price = current_price + gross_risk * self.target_risk_reward
             else:
                 structural_stop = recent_high * (1.0 + buffer)
-                invalidation_price = max(
-                    current_price + min_risk_dist,
-                    min(current_price + max_risk_dist, structural_stop),
-                )
+                structural_risk_dist = structural_stop - current_price
+                risk_dist = max(desired_risk_dist, structural_risk_dist)
+                risk_dist = _clip(risk_dist, min_risk_dist, max_risk_dist)
+                invalidation_price = current_price + risk_dist
                 if invalidation_price <= current_price:
                     raise ValueError("Invalid short invalidation level")
                 gross_risk = invalidation_price - current_price
@@ -406,6 +420,8 @@ class QuantSignalEngine:
                     account_equity=account_equity,
                     current_price=current_price,
                     invalidation_price=invalidation_price,
+                    risk_per_trade_pct=self.risk_per_trade_pct,
+                    max_leverage=self.max_leverage,
                 )
                 # NEW: trailing stop in fraction of price
                 trailing_activation_pct = gross_risk_pct * self.trailing_activation_r
@@ -433,7 +449,7 @@ class QuantSignalEngine:
             target_price=round(target_price, 4),
             # FIX: no fallback to target_risk_reward for NEUTRAL — was a lie in output
             risk_reward_ratio=round(effective_rrr, 2),
-            decision_timestamp_ms=now_ms,
+            decision_timestamp_ms=decision_ms,
             z_whale_sentiment=round(z_whale, 2),
             relative_strength=round(relative_strength, 2),
             sweep_reclaim=sweep_reclaim,

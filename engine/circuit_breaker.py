@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -52,7 +54,25 @@ class CircuitBreaker:
     def _save(self) -> None:
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self.state_file.write_text(json.dumps(self.state), encoding="utf-8")
+            fd, temp_name = tempfile.mkstemp(
+                dir=str(self.state_file.parent), prefix=f".{self.state_file.name}.", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(self.state, fh, separators=(",", ":"))
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(temp_name, self.state_file)
+                dir_fd = os.open(self.state_file.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            finally:
+                try:
+                    os.unlink(temp_name)
+                except FileNotFoundError:
+                    pass
         except OSError as exc:
             logger.error("circuit_breaker_save_failed error=%s", exc)
 

@@ -28,6 +28,7 @@ from engine.microstructure_jit import compute_vpin_numba, compute_weighted_obi_j
 from engine.quality_filter import QualityFilter
 from engine.sentiment import SentimentEngine
 from engine.signals import QuantSignalEngine
+from engine.research_recorder import ResearchRecorder
 
 logger = logging.getLogger("screener")
 
@@ -150,10 +151,15 @@ class QuantScreener:
         self.vpin_window_baskets = int(os.getenv("VPIN_WINDOW_BASKETS", "10"))
         self.beta_min_samples = int(os.getenv("BETA_MIN_SAMPLES", "24"))
         self.atr_lookback = int(os.getenv("ATR_LOOKBACK_BARS", "12"))
+        self.obi_decay = float(os.getenv("OBI_DECAY", "0.85"))
         self.failure_ratio_limit = float(os.getenv("SCAN_FAILURE_RATIO_LIMIT", "0.10"))
         self.account_equity = float(os.getenv("ACCOUNT_EQUITY_USDT", "10000.0"))
         # NEW: correlation limit
         self.max_strong_per_direction = int(os.getenv("MAX_STRONG_PER_DIRECTION", "3"))
+        self.max_portfolio_correlation = float(os.getenv("MAX_PORTFOLIO_CORRELATION", "0.80"))
+        self.max_aggregate_risk_pct = float(os.getenv("MAX_AGGREGATE_RISK_PCT", "0.03"))
+        self.funding_proximity_minutes = float(os.getenv("FUNDING_PROXIMITY_MINUTES", "20.0"))
+        self.funding_extreme_threshold_8h = float(os.getenv("FUNDING_EXTREME_THRESHOLD_8H", "0.0010"))
 
         if self.concurrency_limit < 1:
             raise ValueError("SCAN_CONCURRENCY must be >= 1")
@@ -163,17 +169,36 @@ class QuantScreener:
             raise ValueError("SIGNAL_HISTORY_BARS must be greater than SIGNAL_Z_MIN_SAMPLES")
         if self.max_strong_per_direction < 1:
             raise ValueError("MAX_STRONG_PER_DIRECTION must be >= 1")
+        if not math.isfinite(self.max_portfolio_correlation) or not (0.0 < self.max_portfolio_correlation <= 1.0):
+            raise ValueError("MAX_PORTFOLIO_CORRELATION must be in (0, 1]")
+        if not math.isfinite(self.max_aggregate_risk_pct) or not (0.0 < self.max_aggregate_risk_pct <= 1.0):
+            raise ValueError("MAX_AGGREGATE_RISK_PCT must be in (0, 1]")
+        if not math.isfinite(self.funding_proximity_minutes) or self.funding_proximity_minutes <= 0.0:
+            raise ValueError("FUNDING_PROXIMITY_MINUTES must be positive")
+        if not math.isfinite(self.funding_extreme_threshold_8h) or self.funding_extreme_threshold_8h <= 0.0:
+            raise ValueError("FUNDING_EXTREME_THRESHOLD_8H must be positive")
+        if not math.isfinite(self.obi_decay) or not (0.0 < self.obi_decay <= 1.0):
+            raise ValueError("OBI_DECAY must be in (0, 1]")
 
         self.ingestion = BinanceFuturesIngestion(symbols=[])
         # FIX: read min_effective_rrr and friction from env
+        self.research_recorder = ResearchRecorder(Path(os.getenv("RESEARCH_DB", "data/research/features.sqlite3")))
         self.signal_engine = QuantSignalEngine(
             z_history_min_samples=self.z_history_min_samples,
             min_effective_rrr=float(os.getenv("MIN_EFFECTIVE_RRR", "1.30")),
             friction_round_trip_pct=float(os.getenv("FRICTION_RT_PCT", "0.0018")),
+            atr_stop_multiplier=float(os.getenv("ATR_STOP_MULTIPLIER", "1.50")),
+            max_atr_multiplier=float(os.getenv("MAX_ATR_MULTIPLIER", "2.50")),
+            sweep_booster_points=float(os.getenv("SWEEP_BOOSTER_POINTS", "0.0")),
+            risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "0.01")),
+            max_leverage=int(os.getenv("MAX_LEVERAGE", "3")),
         )
         self.liq_detector = SyntheticLiquidationDetector()
         self.regime_engine = MarketRegimeEngine()
-        self.funding_filter = FundingFilterEngine(proximity_threshold_minutes=20.0)
+        self.funding_filter = FundingFilterEngine(
+            proximity_threshold_minutes=self.funding_proximity_minutes,
+            extreme_threshold_8h=self.funding_extreme_threshold_8h,
+        )
         self.quality_filter = QualityFilter(
             min_24h_volume_usdt=float(os.getenv("MIN_24H_VOLUME_USDT", "10000000")),
             max_spread_bps=float(os.getenv("MAX_SPREAD_BPS", "2.5")),
@@ -259,14 +284,19 @@ class QuantScreener:
 
     @staticmethod
     def _compute_friction_rt(ob_spread_bps: float, atr_pct: float) -> float:
+        """Estimate round-trip taker costs conservatively and per symbol.
+
+        The model is deliberately a cost floor, not an alpha assumption: it adds
+        two-sided spread, configured taker commission and a bounded ATR impact term.
+        It must be treated as a research approximation until fill data is available.
         """
-        NEW: per-symbol friction model.
-        commission (taker×2) + 2×spread + slippage estimate.
-        Slippage ~15% of ATR, capped at 30 bps.
-        """
-        commission_rt = 0.0010  # 5 bps × 2
+        commission_rt = float(os.getenv("TAKER_COMMISSION_RT_PCT", "0.0010"))
+        slippage_atr_fraction = float(os.getenv("SLIPPAGE_ATR_FRACTION", "0.15"))
+        max_slippage = float(os.getenv("MAX_SLIPPAGE_RT_PCT", "0.0030"))
+        if not all(math.isfinite(x) and x >= 0.0 for x in (ob_spread_bps, atr_pct, commission_rt, slippage_atr_fraction, max_slippage)):
+            raise ValueError("Invalid friction input/configuration")
         spread_cost_rt = (ob_spread_bps * 2.0) / 10000.0
-        slippage_rt = min(atr_pct * 0.15, 0.0030)
+        slippage_rt = min(atr_pct * slippage_atr_fraction, max_slippage)
         return commission_rt + spread_cost_rt + slippage_rt
 
     async def close(self) -> None:
@@ -276,38 +306,120 @@ class QuantScreener:
             return_exceptions=False,
         )
 
+    @staticmethod
+    def _returns_from_prices(prices: tuple) -> Optional[np.ndarray]:
+        if len(prices) < 3:
+            return None
+        arr = np.asarray(prices, dtype=np.float64)
+        if not np.all(np.isfinite(arr)) or np.any(arr <= 0.0):
+            return None
+        rets = arr[1:] / arr[:-1] - 1.0
+        return rets if len(rets) >= 2 and np.std(rets) > 1e-12 else None
+
     def _apply_portfolio_correlation_limit(
-        self, signals: List[SignalEvent]
+        self,
+        signals: List[SignalEvent],
+        snapshots: Optional[Dict[str, MarketStateSnapshot]] = None,
     ) -> Tuple[List[SignalEvent], int]:
-        """
-        NEW: cap number of STRONG signals per direction.
-        Prevents opening 10 correlated longs.
-        Downgrades excess STRONG signals to NEUTRAL.
-        """
-        strong_longs = [s for s in signals if s.signal_type == "STRONG_LONG"]
-        strong_shorts = [s for s in signals if s.signal_type == "STRONG_SHORT"]
+        """Apply directional count, correlation and aggregate-risk caps.
 
-        long_kept = {
-            s.symbol for s in sorted(strong_longs, key=lambda s: -s.composite_score)[
-                : self.max_strong_per_direction
-            ]
-        }
-        short_kept = {
-            s.symbol for s in sorted(strong_shorts, key=lambda s: s.composite_score)[
-                : self.max_strong_per_direction
-            ]
-        }
-        kept = long_kept | short_kept
-
+        ``MAX_STRONG_PER_DIRECTION`` is only a cardinality cap. Correlation is
+        calculated independently from 5m close histories and is no longer claimed
+        to be a correlation limit when no correlation matrix is used.
+        """
+        snapshots = snapshots or {}
         downgraded = 0
-        for s in signals:
-            if s.signal_type in ("STRONG_LONG", "STRONG_SHORT") and s.symbol not in kept:
-                s.signal_type = "NEUTRAL"
-                s.gate_status = "BLOCKED_PORTFOLIO_CORRELATION_LIMIT"
-                s.suggested_position_usd = 0.0
-                s.suggested_leverage = 1
-                downgraded += 1
+
+        for direction, key_fn in (
+            ("STRONG_LONG", lambda s: -s.composite_score),
+            ("STRONG_SHORT", lambda s: s.composite_score),
+        ):
+            candidates = sorted(
+                [s for s in signals if s.signal_type == direction],
+                key=key_fn,
+            )
+            kept: List[SignalEvent] = []
+            aggregate_risk_pct = 0.0
+            for signal in candidates:
+                # suggested_position_usd is already capped by max leverage; infer the
+                # actual stop-risk fraction instead of assuming every stop is exactly 1%.
+                stop_risk = 0.0
+                if signal.suggested_position_usd > 0.0 and signal.price > 0.0:
+                    stop_distance = abs(signal.price - signal.invalidation_price) / signal.price
+                    stop_risk = (signal.suggested_position_usd * stop_distance) / max(self.account_equity, 1e-12)
+                if stop_risk <= 0.0:
+                    stop_risk = 0.01
+
+                if len(kept) >= self.max_strong_per_direction:
+                    signal.signal_type = "NEUTRAL"
+                    signal.gate_status = "BLOCKED_PORTFOLIO_COUNT_LIMIT"
+                    signal.suggested_position_usd = 0.0
+                    signal.suggested_leverage = 1
+                    downgraded += 1
+                    continue
+
+                if aggregate_risk_pct + stop_risk > self.max_aggregate_risk_pct + 1e-12:
+                    signal.signal_type = "NEUTRAL"
+                    signal.gate_status = "BLOCKED_PORTFOLIO_RISK_LIMIT"
+                    signal.suggested_position_usd = 0.0
+                    signal.suggested_leverage = 1
+                    downgraded += 1
+                    continue
+
+                new_returns = self._returns_from_prices(
+                    tuple(snapshots.get(signal.symbol).price_history_5m) if snapshots.get(signal.symbol) else ()
+                )
+                if new_returns is not None:
+                    blocked_corr = None
+                    for existing in kept:
+                        old_returns = self._returns_from_prices(
+                            tuple(snapshots.get(existing.symbol).price_history_5m) if snapshots.get(existing.symbol) else ()
+                        )
+                        if old_returns is None:
+                            continue
+                        common = min(len(old_returns), len(new_returns))
+                        if common < max(self.beta_min_samples, 10):
+                            continue
+                        corr = float(np.corrcoef(old_returns[-common:], new_returns[-common:])[0, 1])
+                        if math.isfinite(corr) and corr >= self.max_portfolio_correlation:
+                            blocked_corr = corr
+                            break
+                    if blocked_corr is not None:
+                        signal.signal_type = "NEUTRAL"
+                        signal.gate_status = f"BLOCKED_PORTFOLIO_CORRELATION:{blocked_corr:+.2f}"
+                        signal.suggested_position_usd = 0.0
+                        signal.suggested_leverage = 1
+                        downgraded += 1
+                        continue
+
+                kept.append(signal)
+                aggregate_risk_pct += stop_risk
+
         return signals, downgraded
+
+    @staticmethod
+    def _derive_cvd_series_and_divergence(
+        parsed: List[tuple],
+        lookback: int,
+    ) -> Tuple[List[float], List[float]]:
+        """Reconstruct CVD and point-in-time divergence from completed klines only."""
+        cvd_values: List[float] = []
+        running = 0.0
+        for row in parsed:
+            running += row[6] - row[7]
+            cvd_values.append(running)
+
+        divergence_values: List[float] = [0.0] * len(parsed)
+        for idx in range(lookback, len(parsed)):
+            prices = np.asarray([row[4] for row in parsed[: idx + 1]], dtype=np.float64)
+            cvd = np.asarray(cvd_values[: idx + 1], dtype=np.float64)
+            score, _ = detect_cvd_divergence_jit(
+                prices,
+                cvd,
+                lookback=min(lookback, len(prices) - 1),
+            )
+            divergence_values[idx] = float(score)
+        return cvd_values, divergence_values
 
     async def scan(self) -> Tuple[List[SignalEvent], List[SyntheticLiquidation], ScreenerResult]:
         t0 = time.time()
@@ -358,7 +470,7 @@ class QuantScreener:
             )
 
             sem = asyncio.Semaphore(self.concurrency_limit)
-            Result = Union[None, Tuple[Optional[SignalEvent], MarketStateSnapshot, Optional[SyntheticLiquidation]], Exception]
+            Result = Union[None, Tuple[Optional[SignalEvent], MarketStateSnapshot, Optional[SyntheticLiquidation], dict], Exception]
 
             async def analyze_symbol(symbol: str) -> Result:
                 async with sem:
@@ -410,21 +522,25 @@ class QuantScreener:
                         alt_change_5m_pct = (candle_close / parsed[-2][4] - 1.0) * 100.0
                         atr_pct = self._atr_pct(klines, self.atr_lookback)
 
-                        curr_oi = await self.ingestion.fetch_symbol_closed_5m_open_interest(symbol, current_open_ms)
-                        if curr_oi is None:
+                        oi_history = await self.ingestion.fetch_symbol_open_interest_history(
+                            symbol,
+                            closed_open_ms,
+                            history_bars=max(self.history_bars, self.z_history_min_samples + 1),
+                        )
+                        if oi_history is None or len(oi_history) < self.z_history_min_samples + 1:
                             return None
-                        delta_oi_5m = 0.0
-                        delta_oi_pct: Optional[float] = None
-                        if prev_contiguous and p_snap and p_snap.open_interest > 0.0:
-                            delta_oi_5m = curr_oi - p_snap.open_interest
-                            delta_oi_pct = delta_oi_5m / p_snap.open_interest
+                        oi_values = [oi for _, oi in oi_history]
+                        curr_oi = oi_values[-1]
+                        prev_oi = oi_values[-2]
+                        delta_oi_5m = curr_oi - prev_oi
+                        delta_oi_pct = delta_oi_5m / prev_oi if prev_oi > 0.0 else None
 
                         ob = await self.ingestion.fetch_symbol_orderbook_top(symbol, limit=20)
                         if ob is None:
                             return None
                         bids_qty = np.asarray([q for _, q in ob.bids], dtype=np.float64)
                         asks_qty = np.asarray([q for _, q in ob.asks], dtype=np.float64)
-                        obi = float(compute_weighted_obi_jit(bids_qty, asks_qty, decay=0.85))
+                        obi = float(compute_weighted_obi_jit(bids_qty, asks_qty, decay=self.obi_decay))
 
                         q_res = self.quality_filter.evaluate(
                             symbol=symbol,
@@ -436,26 +552,17 @@ class QuantScreener:
                             return None
 
                         current_cvd_delta = taker_buy - taker_sell
-                        current_cvd = (p_snap.cumulative_cvd_5m + current_cvd_delta) if prev_contiguous and p_snap else current_cvd_delta
-                        prev_cvd_hist = tuple(p_snap.cvd_history_5m) if p_snap and prev_contiguous else ()
-                        prev_price_hist = tuple(p_snap.price_history_5m) if p_snap and prev_contiguous else ()
-                        prev_times = tuple(p_snap.candle_open_times_5m) if p_snap and prev_contiguous else ()
-                        cvd_hist = prev_cvd_hist[-self.history_bars + 1:] + (current_cvd,)
-                        price_hist = prev_price_hist[-self.history_bars + 1:] + (candle_close,)
-                        time_hist = prev_times[-self.history_bars + 1:] + (closed_open_ms,)
-
-                        div_score: Optional[float] = None
-                        if prev_contiguous and len(prev_cvd_hist) >= self.cvd_lookback + 1 and len(prev_cvd_hist) == len(prev_price_hist) == len(prev_times):
-                            if prev_times[-1] == expected_prev_open_ms:
-                                div_window = max(self.cvd_lookback + 1, 4)
-                                prices_arr = np.asarray(price_hist[-div_window:], dtype=np.float64)
-                                cvd_arr = np.asarray(cvd_hist[-div_window:], dtype=np.float64)
-                                div_score_raw, _ = detect_cvd_divergence_jit(
-                                    prices_arr,
-                                    cvd_arr,
-                                    lookback=min(self.cvd_lookback, len(prices_arr) - 1),
-                                )
-                                div_score = float(div_score_raw)
+                        cvd_series, div_series = self._derive_cvd_series_and_divergence(parsed, self.cvd_lookback)
+                        current_cvd = (
+                            (p_snap.cumulative_cvd_5m + current_cvd_delta)
+                            if prev_contiguous and p_snap is not None
+                            else cvd_series[-1]
+                        )
+                        cvd_hist = cvd_series[-self.history_bars:]
+                        price_hist = [row[4] for row in parsed[-self.history_bars:]]
+                        time_hist = [row[0] for row in parsed[-self.history_bars:]]
+                        div_hist_from_klines = div_series[-self.history_bars:]
+                        div_score: Optional[float] = div_hist_from_klines[-1] if div_hist_from_klines else None
 
                         closed_trades = await self.ingestion.fetch_5m_agg_trades(symbol, closed_open_ms, closed_end_ms)
                         if closed_trades is None or not closed_trades:
@@ -508,19 +615,12 @@ class QuantScreener:
                             )
 
                         rolling_beta = None
-                        btc_state = prev_state.get("BTCUSDT")
-                        if (
-                            symbol != "BTCUSDT"
-                            and p_snap is not None
-                            and btc_state is not None
-                            and prev_contiguous
-                            and self._state_is_for_candle(btc_state, expected_prev_open_ms)
-                        ):
+                        if symbol != "BTCUSDT":
                             rolling_beta = self.regime_engine.calculate_rolling_beta(
-                                p_snap.candle_open_times_5m,
-                                p_snap.price_history_5m,
-                                btc_state.candle_open_times_5m,
-                                btc_state.price_history_5m,
+                                time_hist,
+                                price_hist,
+                                [row[0] for row in btc_parsed[-self.history_bars:]],
+                                [row[4] for row in btc_parsed[-self.history_bars:]],
                                 min_samples=self.beta_min_samples,
                             )
 
@@ -578,8 +678,6 @@ class QuantScreener:
                         base_basis_hist = p_snap.basis_history_5m if (p_snap and prev_contiguous) else ()
                         base_micro_hist = p_snap.micro_factor_history_5m if (p_snap and prev_contiguous) else ()
                         base_whale_hist = p_snap.whale_divergence_history_5m if (p_snap and prev_contiguous) else ()
-                        base_delta_hist = p_snap.delta_oi_pct_history_5m if (p_snap and prev_contiguous) else ()
-                        base_div_hist = p_snap.cvd_divergence_history_5m if (p_snap and prev_contiguous) else ()
 
                         funding_hist = base_funding_hist[-self.history_bars + 1:] + (norm_8h_funding,)
                         basis_hist = base_basis_hist[-self.history_bars + 1:] + (basis_bps,)
@@ -590,15 +688,18 @@ class QuantScreener:
                             if sentiment_available
                             else base_whale_hist[-self.history_bars:]
                         )
-                        delta_hist = (base_delta_hist[-self.history_bars + 1:] + (delta_oi_pct,)) if delta_oi_pct is not None else base_delta_hist
-                        div_hist = (base_div_hist[-self.history_bars + 1:] + (div_score,)) if div_score is not None else base_div_hist
+                        oi_delta_hist = []
+                        for prev, cur in zip(oi_values[:-1], oi_values[1:]):
+                            if prev > 0.0:
+                                oi_delta_hist.append((cur - prev) / prev)
+                        delta_hist = tuple(oi_delta_hist[-self.history_bars:])
+                        div_hist = tuple(div_hist_from_klines[-self.history_bars:])
 
                         signal: Optional[SignalEvent] = None
                         signal_ready = (
                             delta_oi_pct is not None
                             and (rolling_beta is not None or symbol == "BTCUSDT")
-                        ) and (
-                            len(funding_hist) - 1 >= self.z_history_min_samples
+                            and len(funding_hist) - 1 >= self.z_history_min_samples
                             and len(basis_hist) - 1 >= self.z_history_min_samples
                             and len(delta_hist) - 1 >= self.z_history_min_samples
                             and len(micro_hist) - 1 >= self.z_history_min_samples
@@ -652,7 +753,8 @@ class QuantScreener:
                                 z_delta_oi_override=z_oi,
                                 z_micro_override=z_micro,
                                 z_whale_override=z_whale,
-                                timestamp_ms=int(time.time() * 1000),
+                                timestamp_ms=closed_end_ms,
+                                decision_timestamp_ms=int(time.time() * 1000),
                                 account_equity=self.account_equity,
                                 whale_history_length=len(whale_hist) - 1,
                                 friction_round_trip_pct=friction_rt,
@@ -687,7 +789,35 @@ class QuantScreener:
                             candle_low_5m=candle_low,
                             signal_ready=signal is not None,
                         )
-                        return signal, snapshot, liq
+                        research_row = {
+                            "timestamp_ms": closed_end_ms,
+                            "symbol": symbol,
+                            "open": float(parsed[-1][1]),
+                            "high": float(candle_high),
+                            "low": float(candle_low),
+                            "close": float(candle_close),
+                            "volume": float(volume_5m),
+                            "open_interest": float(curr_oi),
+                            "delta_oi_pct": float(delta_oi_pct if delta_oi_pct is not None else 0.0),
+                            "funding_rate_8h": float(norm_8h_funding),
+                            "basis_bps": float(basis_bps),
+                            "obi": float(obi),
+                            "vpin": float(vpin),
+                            "cvd_divergence_score": float(div_score if div_score is not None else 0.0),
+                            "whale_divergence_score": float(whale_divergence),
+                            "atr_pct": float(atr_pct),
+                            "recent_high": float(recent_high_swing),
+                            "recent_low": float(recent_low_swing),
+                            "spread_bps": float(ob.spread_bps),
+                            "gate_long_status": str(gate_long_status),
+                            "gate_short_status": str(gate_short_status),
+                            "relative_strength": float(rs_to_btc),
+                            "sweep_reclaim": bool(sweep_reclaim),
+                            "sweep_pattern": str(sweep_pattern),
+                            "recorded_signal_type": signal.signal_type if signal is not None else "NONE",
+                            "recorded_score": signal.composite_score if signal is not None else 0.0,
+                        }
+                        return signal, snapshot, liq, research_row
                     except Exception as exc:
                         logger.exception("symbol_analysis_failed symbol=%s error=%s", symbol, exc)
                         return exc
@@ -698,6 +828,7 @@ class QuantScreener:
             failed_symbols = 0
             signal_ready_symbols = 0
             new_snapshots: List[MarketStateSnapshot] = []
+            research_rows: List[dict] = []
 
             for result in results:
                 if isinstance(result, Exception):
@@ -707,8 +838,9 @@ class QuantScreener:
                     rejected_symbols += 1
                     continue
                 successful_symbols += 1
-                signal, snapshot, liq = result
+                signal, snapshot, liq, research_row = result
                 new_snapshots.append(snapshot)
+                research_rows.append(research_row)
                 if signal is not None:
                     signal_ready_symbols += 1
                     signals.append(signal)
@@ -729,10 +861,11 @@ class QuantScreener:
             }
             merged_state.update({snapshot.symbol: snapshot for snapshot in new_snapshots})
             self.save_current_state(list(merged_state.values()))
+            self.research_recorder.append_rows(research_rows)
 
             signals.sort(key=lambda s: s.composite_score, reverse=True)
-            # NEW: portfolio correlation limit BEFORE counting strong
-            signals, portfolio_limited = self._apply_portfolio_correlation_limit(signals)
+            snapshot_map = {snapshot.symbol: snapshot for snapshot in new_snapshots}
+            signals, portfolio_limited = self._apply_portfolio_correlation_limit(signals, snapshot_map)
 
             strong_longs = [s for s in signals if s.signal_type == "STRONG_LONG"]
             strong_shorts = [s for s in signals if s.signal_type == "STRONG_SHORT"]

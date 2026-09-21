@@ -213,7 +213,8 @@ class TelegramAlerter:
             f"{sweep_line}\n"
             f" • <b>Gate Status:</b> {gate_badge}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏰ <i>Point-in-Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(sig.timestamp_ms / 1000))}</i>"
+            f"⏰ <i>Candle close: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(sig.timestamp_ms / 1000))}</i>\n"
+            f"⚙️ <i>Signal generated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(sig.decision_timestamp_ms / 1000))}</i>"
         )
 
     @staticmethod
