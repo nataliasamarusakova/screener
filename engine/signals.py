@@ -358,7 +358,7 @@ class QuantSignalEngine:
             price=current_price,
             invalidation_price=round(invalidation_price, 4),
             target_price=round(target_price, 4),
-            risk_reward_ratio=round(effective_rrr if effective_rrr > 0 else self.target_risk_reward, 2),
+            risk_reward_ratio=round(effective_rrr, 2),
             decision_timestamp_ms=now_ms,
             z_whale_sentiment=round(z_whale, 2),
             relative_strength=round(relative_strength, 2),
