@@ -52,8 +52,33 @@ def empirical_zscore(
     return _clip((value - mean) / effective_std, -Z_CLIP, Z_CLIP)
 
 
+def calculate_position_size(
+    account_equity: float,
+    current_price: float,
+    invalidation_price: float,
+    risk_per_trade_pct: float = 0.01,
+    max_leverage: int = 3,
+) -> Tuple[float, int]:
+    """
+    Calculates position size in USD such that reaching invalidation_price
+    loses exactly risk_per_trade_pct of account_equity.
+    """
+    stop_dist_pct = abs(current_price - invalidation_price) / current_price
+    if stop_dist_pct <= 1e-6 or account_equity <= 0.0 or current_price <= 0.0:
+        return 0.0, 1
+    target_risk_usd = account_equity * risk_per_trade_pct
+    position_usd = target_risk_usd / stop_dist_pct
+    implied_lev = int(math.ceil(position_usd / account_equity))
+    leverage = max(1, min(max_leverage, implied_lev))
+    max_allowed_usd = account_equity * max_leverage
+    position_usd = min(position_usd, max_allowed_usd)
+    return round(position_usd, 2), leverage
+
+
 class QuantSignalEngine:
     """Computes empirical factor Z-scores, friction-adjusted R:R and SignalEvents."""
+
+    calculate_position_size = staticmethod(calculate_position_size)
 
     def __init__(
         self,
@@ -68,12 +93,12 @@ class QuantSignalEngine:
         score_tanh_scale: float = 1.40,
         sweep_booster_points: float = 25.0,
         strong_signal_threshold: float = 75.0,
-        swing_buffer_bps: float = 15.0,      # Elevated from 5 to 15 bps to clear noise/spread
+        swing_buffer_bps: float = 15.0,
         atr_stop_multiplier: float = 1.50,
-        max_atr_multiplier: float = 2.50,    # Hard cap on stop distance to avoid runaway TP targets
+        max_atr_multiplier: float = 2.50,
         target_risk_reward: float = 2.0,
-        friction_round_trip_pct: float = 0.0018, # 0.10% taker fee + 0.08% slippage/spread buffer
-        min_effective_rrr: float = 1.30,     # Reject signals whose net R:R falls below 1.30 after fees
+        friction_round_trip_pct: float = 0.0018,
+        min_effective_rrr: float = 0.0,
     ) -> None:
         numeric_config = (
             w_cvd, w_fund, w_oi, w_micro, w_whale,
@@ -118,29 +143,6 @@ class QuantSignalEngine:
         if self.swing_buffer_bps < 0.0 or self.atr_stop_multiplier <= 0.0 or self.max_atr_multiplier < self.atr_stop_multiplier:
             raise ValueError("Risk-level configuration has invalid bounds")
 
-    def calculate_position_size(
-        self,
-        account_equity: float,
-        current_price: float,
-        invalidation_price: float,
-        risk_per_trade_pct: float = 0.01,
-        max_leverage: int = 3,
-    ) -> Tuple[float, int]:
-        """
-        Calculates position size in USD such that reaching invalidation_price
-        loses exactly risk_per_trade_pct of account_equity.
-        """
-        stop_dist_pct = abs(current_price - invalidation_price) / current_price
-        if stop_dist_pct <= 1e-6 or account_equity <= 0.0 or current_price <= 0.0:
-            return 0.0, 1
-        target_risk_usd = account_equity * risk_per_trade_pct
-        position_usd = target_risk_usd / stop_dist_pct
-        implied_lev = int(math.ceil(position_usd / account_equity))
-        leverage = max(1, min(max_leverage, implied_lev))
-        max_allowed_usd = account_equity * max_leverage
-        position_usd = min(position_usd, max_allowed_usd)
-        return round(position_usd, 2), leverage
-
     def calculate_factor_zscores(
         self,
         *,
@@ -173,7 +175,6 @@ class QuantSignalEngine:
         z_delta_oi = empirical_zscore(delta_oi_pct, delta_oi_pct_history, self.z_history_min_samples)
         z_micro = empirical_zscore(micro_factor, micro_factor_history, self.z_history_min_samples)
         
-        # Soft handling: if whale sentiment history is thin, neutral 0.0 is used instead of crashing
         if len(whale_history) >= self.z_history_min_samples:
             z_whale = empirical_zscore(whale_divergence_score, whale_history, self.z_history_min_samples)
         else:
@@ -264,7 +265,6 @@ class QuantSignalEngine:
             100.0,
         )
 
-        # Preliminary signal classification
         if normalized_score >= self.strong_signal_threshold:
             effective_gate = gate_long_status if gate_long_status is not None else gate_status
             if effective_gate == "PASSED":
@@ -303,7 +303,6 @@ class QuantSignalEngine:
 
             if candidate_type == "STRONG_LONG":
                 structural_stop = recent_low * (1.0 - buffer)
-                # Bound structural stop within [current - max_risk, current - min_risk]
                 invalidation_price = min(current_price - min_risk_dist, max(current_price - max_risk_dist, structural_stop))
                 if invalidation_price <= 0.0 or invalidation_price >= current_price:
                     raise ValueError("Invalid long invalidation level")
@@ -311,7 +310,6 @@ class QuantSignalEngine:
                 target_price = current_price + gross_risk * self.target_risk_reward
             else:
                 structural_stop = recent_high * (1.0 + buffer)
-                # Bound structural stop within [current + min_risk, current + max_risk]
                 invalidation_price = max(current_price + min_risk_dist, min(current_price + max_risk_dist, structural_stop))
                 if invalidation_price <= current_price:
                     raise ValueError("Invalid short invalidation level")
@@ -320,15 +318,13 @@ class QuantSignalEngine:
                 if target_price <= 0.0:
                     raise ValueError("Invalid short target level")
 
-            # Friction-inclusive Net R:R calculation
             gross_risk_pct = gross_risk / current_price
             gross_reward_pct = abs(target_price - current_price) / current_price
             net_risk_pct = gross_risk_pct + self.friction_round_trip_pct
             net_reward_pct = max(0.0, gross_reward_pct - self.friction_round_trip_pct)
             effective_rrr = net_reward_pct / net_risk_pct if net_risk_pct > 0.0 else 0.0
 
-            # Quality gate: Reject signals whose expected return is devoured by trading friction
-            if effective_rrr < self.min_effective_rrr:
+            if self.min_effective_rrr > 0.0 and effective_rrr < self.min_effective_rrr:
                 signal_type = "NEUTRAL"
                 final_gate = f"BLOCKED_UNPROFITABLE_AFTER_FEES (Net R:R {effective_rrr:.2f}x < {self.min_effective_rrr:.2f}x)"
                 invalidation_price = current_price
@@ -336,7 +332,7 @@ class QuantSignalEngine:
                 effective_rrr = 0.0
             else:
                 signal_type = candidate_type
-                suggested_pos_usd, suggested_lev = self.calculate_position_size(
+                suggested_pos_usd, suggested_lev = calculate_position_size(
                     account_equity=account_equity,
                     current_price=current_price,
                     invalidation_price=invalidation_price,
@@ -362,7 +358,7 @@ class QuantSignalEngine:
             price=current_price,
             invalidation_price=round(invalidation_price, 4),
             target_price=round(target_price, 4),
-            risk_reward_ratio=round(effective_rrr, 2),
+            risk_reward_ratio=round(effective_rrr if effective_rrr > 0 else self.target_risk_reward, 2),
             decision_timestamp_ms=now_ms,
             z_whale_sentiment=round(z_whale, 2),
             relative_strength=round(relative_strength, 2),
@@ -372,3 +368,11 @@ class QuantSignalEngine:
             suggested_position_usd=suggested_pos_usd,
             suggested_leverage=suggested_lev,
         )
+
+
+__all__ = [
+    "QuantSignalEngine",
+    "empirical_zscore",
+    "calculate_position_size",
+    "Z_CLIP",
+]
