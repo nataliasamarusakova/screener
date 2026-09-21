@@ -116,10 +116,9 @@ jobs:
           # Авторизация через x-access-token
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
-          # Добавляем папку data/ в Git
-          if [ -d "data" ]; then
-            git add -f data/
-          fi
+          # Persist only intentional runtime/research artifacts. SQLite is ignored
+          # because the durable cross-run dataset is stored in hourly JSONL shards.
+          git add data/
           # Удаляем старые файлы из корня репозитория (если они были созданы ранее)
           git rm -f .market_state.bin .signals_latest.json .alert_cache.json 2>/dev/null || true
 
