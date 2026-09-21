@@ -1,15 +1,18 @@
 name: Quant Screener Engine
 
 on:
-  repository_dispatch: 
+  repository_dispatch:
     types: [run_quant_engine]
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
   group: quant-screener-run
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run-screener:
@@ -27,6 +30,22 @@ jobs:
       SIGNAL_HISTORY_BARS: "60"
       SIGNAL_Z_MIN_SAMPLES: "24"
       BETA_MIN_SAMPLES: "24"
+      ATR_LOOKBACK_BARS: "12"
+      ATR_STOP_MULTIPLIER: "1.50"
+      MAX_ATR_MULTIPLIER: "2.50"
+      MAX_PORTFOLIO_CORRELATION: "0.80"
+      MAX_AGGREGATE_RISK_PCT: "0.03"
+      FUNDING_PROXIMITY_MINUTES: "20"
+      FUNDING_EXTREME_THRESHOLD_8H: "0.0010"
+      OBI_DECAY: "0.85"
+      MAX_DRAWDOWN_PCT: "0.20"
+      DAILY_LOSS_LIMIT_PCT: "0.08"
+      RISK_PER_TRADE_PCT: "0.01"
+      MAX_LEVERAGE: "3"
+      PAPER_TRADING: "1"
+      SWEEP_BOOSTER_POINTS: "0.0"
+      BINANCE_MAX_REQUEST_RETRIES: "3"
+      BINANCE_RETRY_BACKOFF_CAP_SEC: "8"
 
     steps:
       - name: Checkout repository
