@@ -428,6 +428,43 @@ class QuantScreener:
             divergence_values[idx] = float(score)
         return cvd_values, divergence_values
 
+    @staticmethod
+    def _select_recoverable_history(
+        state_values: tuple,
+        persisted_rows: list[dict],
+        key_fn,
+        state_allowed: bool,
+    ) -> tuple[tuple, str]:
+        """Choose the strongest contiguous history available for one factor.
+
+        A contiguous previous state is preferred only when it is at least as
+        complete as durable research history. This prevents partial state resets
+        from pinning a factor to a short 3-4 sample tail forever.
+        """
+        state_hist = tuple(state_values) if state_allowed else ()
+        research_values = []
+        for row in persisted_rows:
+            try:
+                value = key_fn(row)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if value is None:
+                continue
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                research_values.append(value)
+        research_hist = tuple(research_values)
+        if len(research_hist) > len(state_hist):
+            return research_hist, "RESEARCH"
+        if state_hist:
+            return state_hist, "STATE"
+        if research_hist:
+            return research_hist, "RESEARCH"
+        return (), "EMPTY"
+
     async def scan(self) -> Tuple[List[SignalEvent], List[SyntheticLiquidation], ScreenerResult]:
         t0 = time.time()
         prev_state = self.load_previous_state()
@@ -691,26 +728,42 @@ class QuantScreener:
                         whale_divergence = float(sent.divergence_score) if sentiment_available else 0.0
 
                         persisted_rows = research_history.get(symbol, [])
-                        if prev_contiguous and p_snap is not None:
-                            base_funding_hist = p_snap.funding_history_5m
-                            base_basis_hist = p_snap.basis_history_5m
-                            base_micro_hist = p_snap.micro_factor_history_5m
-                            base_whale_hist = p_snap.whale_divergence_history_5m
+                        state_allowed = prev_contiguous and p_snap is not None
+                        base_funding_hist, funding_source = self._select_recoverable_history(
+                            p_snap.funding_history_5m if p_snap is not None else (),
+                            persisted_rows,
+                            lambda row: row.get("funding_rate_8h"),
+                            state_allowed,
+                        )
+                        base_basis_hist, basis_source = self._select_recoverable_history(
+                            p_snap.basis_history_5m if p_snap is not None else (),
+                            persisted_rows,
+                            lambda row: row.get("basis_bps"),
+                            state_allowed,
+                        )
+                        base_micro_hist, micro_source = self._select_recoverable_history(
+                            p_snap.micro_factor_history_5m if p_snap is not None else (),
+                            persisted_rows,
+                            lambda row: float(row["obi"]) * (1.0 - float(row["vpin"])),
+                            state_allowed,
+                        )
+                        base_whale_hist, whale_source = self._select_recoverable_history(
+                            p_snap.whale_divergence_history_5m if p_snap is not None else (),
+                            [row for row in persisted_rows if bool(row.get("sentiment_available", False))],
+                            lambda row: row.get("whale_divergence_score"),
+                            state_allowed,
+                        )
+                        factor_sources = {funding_source, basis_source, micro_source, whale_source}
+                        if factor_sources == {"STATE"}:
                             recovery_source = "STATE"
+                        elif factor_sources == {"EMPTY"}:
+                            recovery_source = "EMPTY"
+                        elif "RESEARCH" in factor_sources and "STATE" in factor_sources:
+                            recovery_source = "MIXED"
+                        elif "RESEARCH" in factor_sources:
+                            recovery_source = "RESEARCH"
                         else:
-                            base_funding_hist = tuple(float(row["funding_rate_8h"]) for row in persisted_rows if "funding_rate_8h" in row)
-                            base_basis_hist = tuple(float(row["basis_bps"]) for row in persisted_rows if "basis_bps" in row)
-                            base_micro_hist = tuple(
-                                float(row["obi"]) * (1.0 - float(row["vpin"]))
-                                for row in persisted_rows
-                                if "obi" in row and "vpin" in row
-                            )
-                            base_whale_hist = tuple(
-                                float(row["whale_divergence_score"])
-                                for row in persisted_rows
-                                if "whale_divergence_score" in row and bool(row.get("sentiment_available", False))
-                            )
-                            recovery_source = "RESEARCH" if persisted_rows else "EMPTY"
+                            recovery_source = "STATE"
 
                         funding_hist = base_funding_hist[-self.history_bars + 1:] + (norm_8h_funding,)
                         basis_hist = base_basis_hist[-self.history_bars + 1:] + (basis_bps,)
