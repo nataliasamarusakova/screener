@@ -33,10 +33,6 @@ def _get_bot_token() -> str:
 
 
 class TelegramAlerter:
-    """
-    Asynchronous Telegram notification service with stateful throttling.
-    """
-
     def __init__(self, cooldown_sec: int = 3600) -> None:
         self.bot_token = _get_bot_token()
         self.chat_ids = _get_chat_ids()
@@ -63,7 +59,7 @@ class TelegramAlerter:
                     continue
                 validated[symbol] = {"time": timestamp, "score": score}
             return validated
-        except (OSError, ValueError, TypeError) as exc:
+        except Exception as exc:
             logger.warning("telegram_alert_cache_load_failed path=%s error=%s", ALERT_CACHE_FILE, exc)
             return {}
 
@@ -83,7 +79,7 @@ class TelegramAlerter:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
-        except (OSError, ValueError, TypeError) as exc:
+        except Exception as exc:
             logger.error("telegram_alert_cache_save_failed path=%s error=%s", target, exc)
         finally:
             try:
@@ -92,7 +88,6 @@ class TelegramAlerter:
                 pass
 
     def _should_alert(self, symbol: str, current_score: float) -> bool:
-        """Throttles repeated alerts unless score moves significantly or cooldown expires."""
         now = time.time()
         record = self.cache.get(symbol)
         if not record:
@@ -101,11 +96,9 @@ class TelegramAlerter:
         last_time = record.get("time", 0.0)
         last_score = record.get("score", 0.0)
 
-        # Cooldown expired
         if now - last_time >= self.cooldown_sec:
             return True
 
-        # Direction flip or significant change in score (>= 20 points)
         if (last_score > 0 and current_score < 0) or (last_score < 0 and current_score > 0):
             return True
 
@@ -151,16 +144,10 @@ class TelegramAlerter:
         signals: List[SignalEvent],
         synthetic_liqs: List[SyntheticLiquidation]
     ) -> int:
-        """
-        Dispatches alerts for qualifying STRONG signals (|Score| >= 75) and synthetic liquidations.
-        Returns number of sent alerts.
-        """
         if not self.bot_token or not self.chat_ids:
             return 0
 
         sent_count = 0
-
-        # 1. Process Strong Signals
         for sig in signals:
             if sig.signal_type in ("STRONG_LONG", "STRONG_SHORT"):
                 if not self._should_alert(sig.symbol, sig.composite_score):
@@ -172,7 +159,6 @@ class TelegramAlerter:
                     self._record_alert(sig.symbol, sig.composite_score)
                     sent_count += 1
 
-        # 2. Process Critical Synthetic Liquidations
         for liq in synthetic_liqs:
             if liq.anomaly_ratio >= 1.5:
                 liq_key = f"{liq.symbol}_LIQ"
@@ -191,14 +177,9 @@ class TelegramAlerter:
     def format_signal_html(sig: SignalEvent) -> str:
         is_long = sig.signal_type == "STRONG_LONG"
         badge = "🟢 <b>STRONG LONG SIGNAL</b>" if is_long else "🔴 <b>STRONG SHORT SIGNAL</b>"
-
-        # Gate status badge
         gate_badge = "✅ PASSED" if sig.gate_status == "PASSED" else f"🚫 {html.escape(sig.gate_status[:40])}"
+        sweep_badge = "⚡ <b>WYCKOFF SPRING / SWEEP RECLAIM</b>" if sig.sweep_reclaim else ""
 
-        # Wyckoff sweep/reclaim badge
-        sweep_badge = "⚡ <b>WYCKOFF SPRING / SWEEP RECLAIM CONFIRMED</b>" if sig.sweep_reclaim else ""
-
-        # Whale sentiment context
         if sig.z_whale_sentiment >= 1.0:
             whale_text = f"{sig.z_whale_sentiment:+.2f} 🐋 Smart Money LONG"
         elif sig.z_whale_sentiment <= -1.0:
@@ -212,15 +193,16 @@ class TelegramAlerter:
             f"{badge}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🪙 <b>Symbol:</b> <code>{sig.symbol}</code>\n"
-            f"📊 <b>Composite Score:</b> <b>{sig.composite_score:+.1f} / 100</b>\n"
+            f"📊 <b>Score:</b> <b>{sig.composite_score:+.1f} / 100</b>\n"
             f"💵 <b>Ref Price:</b> <code>${sig.price:,.4f}</code>\n"
             f"🎯 <b>Target (TP):</b> <code>${sig.target_price:,.4f}</code>\n"
             f"🛑 <b>Invalidation (SL):</b> <code>${sig.invalidation_price:,.4f}</code>\n"
-            f"⚖️ <b>Risk / Reward:</b> <b>{sig.risk_reward_ratio:.1f}x</b>\n"
+            f"⚖️ <b>Net R:R (Friction-Adjusted):</b> <b>{sig.risk_reward_ratio:.2f}x</b>\n"
+            f"💰 <b>Position Size (1% Risk):</b> <b>${sig.suggested_position_usd:,.0f}</b> ({sig.suggested_leverage}x Lev)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔬 <b>Quantitative Drivers:</b>\n"
             f" • <b>Funding 8h:</b> <code>{sig.funding_8h*100:+.4f}%</code>\n"
-            f" • <b>Spot-Perp Basis:</b> <code>{sig.basis_bps:+.2f} bps</code>\n"
+            f" • <b>Basis Spread:</b> <code>{sig.basis_bps:+.2f} bps</code>\n"
             f" • <b>L2 Imbalance (OBI):</b> <code>{sig.obi:+.3f}</code>\n"
             f" • <b>Flow Toxicity (VPIN):</b> <code>{sig.vpin:.3f}</code>\n"
             f" • <b>Z(CVD Div):</b> <code>{sig.z_cvd_div:+.2f}</code> | <b>Z(Trap):</b> <code>{sig.z_fund_trap:+.2f}</code>\n"
@@ -241,12 +223,12 @@ class TelegramAlerter:
             f"{side_badge}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🪙 <b>Symbol:</b> <code>{liq.symbol}</code>\n"
-            f"⚠️ <b>Hidden Binance Liquidation Detected!</b>\n"
+            f"⚠️ <b>Hidden Liquidation Detected!</b>\n"
             f"📉 <b>ΔOpen Interest:</b> <code>{liq.delta_oi:,.1f} contracts</code>\n"
             f"🌊 <b>Taker Volume:</b> <code>{liq.taker_volume:,.1f}</code>\n"
             f"💥 <b>Anomaly Ratio:</b> <b>{liq.anomaly_ratio:.2f}x</b>\n"
-            f"📦 <b>Reconstructed Volume:</b> <code>{liq.estimated_liquidation_volume:,.1f}</code>\n"
-            f"💵 <b>Price at Event:</b> <code>${liq.price:,.4f}</code>\n"
+            f"📦 <b>Reconstructed Vol:</b> <code>{liq.estimated_liquidation_volume:,.1f}</code>\n"
+            f"💵 <b>Price:</b> <code>${liq.price:,.4f}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⏰ <i>{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(liq.timestamp_ms / 1000))}</i>"
         )
