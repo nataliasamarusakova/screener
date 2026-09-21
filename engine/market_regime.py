@@ -147,7 +147,7 @@ class MarketRegimeEngine:
         if var_btc <= 1e-16:
             return None
         beta = cov / var_btc
-        return beta if math.isfinite(beta) and beta > 0.0 else None
+        return beta if math.isfinite(beta) else None
 
     def check_signal_gate(
         self,
