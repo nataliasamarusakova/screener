@@ -2,7 +2,8 @@ name: Quant Screener Engine
 
 on:
   repository_dispatch:
-    types: [run_quant_engine] 
+    types: [run_quant_engine]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -32,11 +33,13 @@ jobs:
       MAX_ATR_MULTIPLIER: "2.50"
       MAX_PORTFOLIO_CORRELATION: "0.80"
       MAX_AGGREGATE_RISK_PCT: "0.03"
+      MAX_GROSS_LEVERAGE: "3.0"
       FUNDING_PROXIMITY_MINUTES: "20"
       FUNDING_EXTREME_THRESHOLD_8H: "0.0010"
       OBI_DECAY: "0.85"
       MAX_DRAWDOWN_PCT: "0.20"
       DAILY_LOSS_LIMIT_PCT: "0.08"
+      MAX_EQUITY_STATE_AGE_SEC: "600"
       RISK_PER_TRADE_PCT: "0.01"
       MAX_LEVERAGE: "3"
       PAPER_TRADING: "1"
@@ -69,6 +72,8 @@ jobs:
         run: |
           set -euo pipefail
           test -n "${BINANCE_API_KEY:-}"
+          test -n "${TG_BOT_TOKEN:-}"
+          test -n "${TG_CHAT_IDS:-}"
           test -n "${{ secrets.WIREGUARD_CONF }}"
 
       - name: Install dependencies
@@ -100,8 +105,8 @@ jobs:
         run: |
           sudo wg-quick down wg0 2>/dev/null || true
 
-      - name: Persist market state & latest signals
-        if: success()
+      - name: Persist runtime state & research artifacts
+        if: always()
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -124,7 +129,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore(state): update quant market snapshot [skip ci]"
+          git commit -m "chore(state): persist quant runtime state [skip ci]"
 
           for attempt in 1 2 3 4 5; do
             git fetch origin main
