@@ -131,3 +131,7 @@ class MarketStateSnapshot(msgspec.Struct, gc=False):
     candle_high_5m: float = 0.0
     candle_low_5m: float = 0.0
     signal_ready: bool = False
+    strategy_revision: str = "LEGACY_UNKNOWN"
+    code_revision: str = "UNKNOWN"
+    config_fingerprint: str = "UNKNOWN"
+    research_schema_version: int = 0

@@ -4,16 +4,46 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 
 from binance_ingestion import BinanceRestrictedLocationError
 from engine.circuit_breaker import CircuitBreaker
 from engine.screener import QuantScreener, save_latest_scan_json
-from engine.telegram import TelegramAlerter
+from engine.telegram import TelegramAlerter, TelegramDispatchError
 from engine.risk_guard import RiskGuard
 from engine.signal_ledger import append_signal_events
+from engine.dispatch_ledger import append_dispatch_events
 
 logger = logging.getLogger("cron_runner")
+
+
+def finalize_research_rows(
+    research_rows: list[dict],
+    *,
+    dispatch_allowed: bool | None,
+    block_reason: str | None,
+    dispatched_signal_ids: set[str] | None,
+    dispatched_at_ms: int,
+    not_attempted: bool = False,
+) -> None:
+    """Materialize final dispatch outcome into immutable research rows before persistence."""
+    sent_ids = set(dispatched_signal_ids or ())
+    for row in research_rows:
+        final_type = str(row.get("final_signal_type", "NONE"))
+        is_strong = final_type in ("STRONG_LONG", "STRONG_SHORT")
+        signal_id = f"{row.get('symbol')}:{row.get('timestamp_ms')}:{final_type}"
+        dispatched = bool(
+            is_strong
+            and not not_attempted
+            and row.get("symbol") is not None
+            and signal_id in sent_ids
+        )
+        row["dispatch_allowed"] = dispatch_allowed
+        row["dispatch_block_reason"] = block_reason
+        row["dispatched"] = dispatched
+        row["dispatched_at_ms"] = int(dispatched_at_ms) if dispatched else None
+        row["dispatch_status_source"] = "FINAL_RISK_GUARD_AND_TELEGRAM"
 
 
 async def main() -> None:
@@ -38,6 +68,7 @@ async def main() -> None:
         daily_loss_limit_pct=float(os.environ.get("DAILY_LOSS_LIMIT_PCT", "0.08")),
         paper_trading=paper_trading,
         kill_switch_file=data_dir / "KILL_SWITCH",
+        max_state_age_sec=float(os.environ.get("MAX_EQUITY_STATE_AGE_SEC", "600")),
     )
     if breaker.is_halted():
         print(f"⚠️ [CIRCUIT BREAKER] Halted for {breaker.halt_remaining_minutes():.1f} more minutes. Skipping scan.")
@@ -56,16 +87,10 @@ async def main() -> None:
     alerter = TelegramAlerter()
 
     try:
-        signals, synthetic_liqs, summary = await screener.scan()
+        signals, synthetic_liqs, summary, research_rows = await screener.scan()
 
         signals_path = data_dir / ("paper_signals_latest.json" if paper_trading else "signals_latest.json")
         save_latest_scan_json(signals, synthetic_liqs, summary, target_path=signals_path)
-        ledger_count = append_signal_events(data_dir / "signal_ledger.jsonl", signals)
-        if ledger_count:
-            print(f"[LEDGER] Recorded {ledger_count} STRONG signal event(s).")
-
-        breaker.record_success()
-
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         print(f"📊 [SCAN COMPLETE] Scanned {summary.total_scanned} symbols in {summary.duration_sec}s")
         print(f"🪙 BTC Regime: {summary.btc_regime} ({summary.btc_change_5m_pct:+.2f}%)")
@@ -94,11 +119,89 @@ async def main() -> None:
         # Re-check immediately before external dispatch so a kill switch or fresh
         # equity reconciliation received during the scan can still block new risk.
         risk_allowed, risk_reason = risk_guard.evaluate()
+        dispatch_ts_ms = int(time.time() * 1000)
+
         if not risk_allowed:
+            finalize_research_rows(
+                research_rows,
+                dispatch_allowed=False,
+                block_reason=risk_reason,
+                dispatched_signal_ids=set(),
+                dispatched_at_ms=dispatch_ts_ms,
+                not_attempted=True,
+            )
+            append_dispatch_events(
+                data_dir / "dispatch_ledger.jsonl",
+                signals,
+                allowed=False,
+                block_reason=risk_reason,
+            )
+            screener.research_recorder.append_rows(research_rows)
+            breaker.record_success()
             print(f"🛑 [RISK GUARD] {risk_reason} after scan. Suppressing alert dispatch.")
             return
 
-        sent_alerts = await alerter.process_and_dispatch_signals(signals, synthetic_liqs)
+        # Risk is final; record the actionable signal before Telegram so the
+        # signal ledger remains the durable decision/audit event, while the
+        # dispatch ledger records the external delivery result.
+        ledger_count = append_signal_events(data_dir / "signal_ledger.jsonl", signals)
+        if ledger_count:
+            print(f"[LEDGER] Recorded {ledger_count} risk-approved STRONG signal event(s).")
+
+        try:
+            sent_alerts, sent_signal_ids = await alerter.process_and_dispatch_signals(signals, synthetic_liqs)
+        except TelegramDispatchError as exc:
+            finalize_research_rows(
+                research_rows,
+                dispatch_allowed=True,
+                block_reason=str(exc),
+                dispatched_signal_ids=exc.sent_signal_ids,
+                dispatched_at_ms=dispatch_ts_ms,
+            )
+            append_dispatch_events(
+                data_dir / "dispatch_ledger.jsonl",
+                signals,
+                allowed=True,
+                block_reason=str(exc),
+                dispatched_at_ms=dispatch_ts_ms,
+                dispatched_signal_ids=exc.sent_signal_ids,
+            )
+            screener.research_recorder.append_rows(research_rows)
+            raise
+        except Exception as exc:
+            finalize_research_rows(
+                research_rows,
+                dispatch_allowed=True,
+                block_reason=f"DISPATCH_EXCEPTION:{type(exc).__name__}",
+                dispatched_signal_ids=set(),
+                dispatched_at_ms=dispatch_ts_ms,
+            )
+            append_dispatch_events(
+                data_dir / "dispatch_ledger.jsonl",
+                signals,
+                allowed=True,
+                block_reason=f"DISPATCH_EXCEPTION:{type(exc).__name__}",
+                dispatched_at_ms=dispatch_ts_ms,
+            )
+            screener.research_recorder.append_rows(research_rows)
+            raise
+
+        finalize_research_rows(
+            research_rows,
+            dispatch_allowed=True,
+            block_reason=None,
+            dispatched_signal_ids=sent_signal_ids,
+            dispatched_at_ms=dispatch_ts_ms,
+        )
+        append_dispatch_events(
+            data_dir / "dispatch_ledger.jsonl",
+            signals,
+            allowed=True,
+            dispatched_at_ms=dispatch_ts_ms,
+            dispatched_signal_ids=sent_signal_ids,
+        )
+        screener.research_recorder.append_rows(research_rows)
+        breaker.record_success()
         if sent_alerts > 0:
             print(f"[TELEGRAM] Successfully dispatched {sent_alerts} alert(s).")
     except BinanceRestrictedLocationError as exc:

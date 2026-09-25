@@ -926,8 +926,8 @@ class BinanceFuturesIngestion:
                 return None
             if not math.isfinite(oi) or oi <= 0.0:
                 return None
-            # The endpoint timestamp is the end of the 5m bucket. Normalize it to
-            # the candle open so the resulting feature series aligns with klines/state.
+            # Binance openInterestHist timestamps are treated as 5m bucket anchors.
+            # Floor to the canonical candle-open grid so OI and kline state align.
             normalized_open = (ts // interval_ms) * interval_ms
             if normalized_open < start_ms or normalized_open > closed_open_ms:
                 continue
