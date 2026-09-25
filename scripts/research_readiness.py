@@ -34,15 +34,29 @@ def main() -> None:
     timestamps = sorted({bar.timestamp_ms for symbol in dataset.symbols() for bar in dataset.bars(symbol)})
     bars_needed = (args.wfa_train_days + args.wfa_validation_days + args.wfa_test_days) * 24 * 12 + 24
     calendar_days = ((timestamps[-1] - timestamps[0]) / 86_400_000) if timestamps else 0.0
+    required_days = args.wfa_train_days + args.wfa_validation_days + args.wfa_test_days
+    provenance = dataset.provenance_summary()
+    reasons = []
+    if not timestamps:
+        reasons.append("NO_TIMESTAMPS")
+    if calendar_days < required_days:
+        reasons.append(f"HISTORY_{calendar_days:.2f}/{required_days}_DAYS")
+    if not provenance["clean"]:
+        reasons.append("PROVENANCE_MIXED_OR_LEGACY")
+    if sum(1 for symbol in dataset.symbols() for _ in dataset.bars(symbol)) < args.min_outcomes:
+        reasons.append(f"OBSERVATIONS_{sum(1 for symbol in dataset.symbols() for _ in dataset.bars(symbol))}/{args.min_outcomes}")
+    status = "READY_FOR_WFA" if not reasons else "NOT_READY"
     print(json.dumps({
-        "status": "READY" if timestamps else "DATA_REQUIRED",
+        "status": status,
         "symbols": len(dataset.symbols()),
         "bars": sum(len(dataset.bars(s)) for s in dataset.symbols()),
         "calendar_days": calendar_days,
-        "required_calendar_days_minimum": args.wfa_train_days + args.wfa_validation_days + args.wfa_test_days,
-        "required_bar_count_per_contiguous_symbol_minimum": bars_needed,
-        "minimum_outcomes_for_statistical_gate": args.min_outcomes,
-        "note": "Outcome count is measured after backtest execution; bars alone do not establish statistical power."
+        "required_calendar_days_minimum": required_days,
+        "gap_count": dataset.gap_count,
+        "provenance": provenance,
+        "blocking_reasons": reasons,
+        "minimum_observations_for_wfa_gate": args.min_outcomes,
+        "note": "This pre-WFA gate uses observation count; trade-outcome power is still evaluated after backtest execution."
     }, indent=2))
 
 

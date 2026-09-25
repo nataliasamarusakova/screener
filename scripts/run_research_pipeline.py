@@ -16,8 +16,9 @@ from pathlib import Path
 
 
 
-def load_trades(path: Path) -> list[TradeRecord]:
-    rows = []
+def load_trades(path: Path):
+    from engine.research import TradeRecord
+    rows: list[TradeRecord] = []
     if not path.exists():
         return rows
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -58,8 +59,23 @@ def main() -> None:
         raise SystemExit(2)
 
     out_dir = Path(args.out_dir)
+    readiness = dataset.provenance_summary()
+    timestamps = sorted({bar.timestamp_ms for symbol in dataset.symbols() for bar in dataset.bars(symbol)})
+    calendar_days = ((timestamps[-1] - timestamps[0]) / 86_400_000) if timestamps else 0.0
+    required_days = 30 + 7 + 7
+    if calendar_days < required_days or not readiness["clean"]:
+        payload = {
+            "status": "NOT_READY",
+            "calendar_days": calendar_days,
+            "required_calendar_days": required_days,
+            "provenance": readiness,
+            "gap_count": dataset.gap_count,
+        }
+        write_json(Path(args.out_dir) / "status.json", payload)
+        print(json.dumps(payload, indent=2))
+        return
     signal_engine = QuantSignalEngine()
-    trades = QuantBacktester(signal_engine, BacktestConfig()).run(dataset)
+    trades = QuantBacktester(signal_engine, BacktestConfig(replay_recorded_signals=True)).run(dataset)
     trade_path = out_dir / "backtest_trades.jsonl"
     trade_path.parent.mkdir(parents=True, exist_ok=True)
     trade_path.write_text("\n".join(json.dumps(t.__dict__, separators=(",", ":")) for t in trades) + ("\n" if trades else ""), encoding="utf-8")
@@ -75,6 +91,11 @@ def main() -> None:
     configs = load_parameter_grid(Path(args.grid))
     wfa_results = run_wfa(dataset, configs, WalkForwardConfig())
     save_results(wfa_results, out_dir / "wfa_results.json")
+    if not wfa_results:
+        payload = {"status": "WFA_NOT_READY", "trades": n, "reason": "No valid contiguous walk-forward folds were available."}
+        write_json(out_dir / "status.json", payload)
+        print(json.dumps(payload, indent=2))
+        return
 
     fills, portfolio_report = PortfolioSimulator(PortfolioConfig()).run(dataset, trades)
     write_json(out_dir / "portfolio_report.json", {"report": report_to_dict(portfolio_report), "fills": [f.__dict__ for f in fills]})

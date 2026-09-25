@@ -29,13 +29,28 @@ def main() -> None:
     parser.add_argument("--entry-mode", choices=["next_open", "close"], default="next_open")
     parser.add_argument("--max-holding-bars", type=int, default=12)
     parser.add_argument("--threshold", type=float, default=75.0)
+    parser.add_argument("--mode", choices=["recorded", "counterfactual"], default="recorded", help="Replay recorded final decisions or recompute the current model.")
     parser.add_argument("--output-summary", default="data/research/backtest_summary.json")
     args = parser.parse_args()
 
     input_path = Path(args.input)
     dataset = ResearchDataset.from_jsonl(input_path) if input_path.suffix.lower() == ".jsonl" else ResearchDataset.from_csv(input_path)
+    if args.mode == "recorded" and not dataset.provenance_summary()["clean"]:
+        summary_path = Path(args.output_summary)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"status": "DATA_NOT_CLEAN", "reason": "Recorded replay requires a single non-legacy provenance revision.", "provenance": dataset.provenance_summary()}
+        summary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(json.dumps(payload, indent=2))
+        return
     engine = QuantSignalEngine(strong_signal_threshold=args.threshold)
-    backtester = QuantBacktester(engine, BacktestConfig(entry_mode=args.entry_mode, max_holding_bars=args.max_holding_bars))
+    backtester = QuantBacktester(
+        engine,
+        BacktestConfig(
+            entry_mode=args.entry_mode,
+            max_holding_bars=args.max_holding_bars,
+            replay_recorded_signals=(args.mode == "recorded"),
+        ),
+    )
     trades = backtester.run(dataset)
 
     output = Path(args.output)
@@ -55,6 +70,7 @@ def main() -> None:
         "entry_mode": args.entry_mode,
         "max_holding_bars": args.max_holding_bars,
         "strong_threshold": args.threshold,
+        "mode": args.mode,
         "status": "NO_DATA" if not trades else "COMPLETED",
     }
     equity = 1.0

@@ -125,7 +125,7 @@ async def evaluate_row(
         raw = exit_px / entry - 1.0
         signed = raw if side == "STRONG_LONG" else -raw
         result[f"return_{minutes}m"] = signed
-        friction = float(row.get("friction_rt_pct", 0.0))
+        friction = float(row.get("applied_friction_rt_pct", 0.0))
         result[f"net_return_{minutes}m"] = signed - friction
     return result
 
