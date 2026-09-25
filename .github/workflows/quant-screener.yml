@@ -2,10 +2,7 @@ name: Quant Screener Engine
 
 on:
   repository_dispatch:
-    types: [run_quant_engine]
-  schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+    types: [run_quant_engine] 
 
 permissions:
   contents: write
