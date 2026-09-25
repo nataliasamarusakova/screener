@@ -23,6 +23,14 @@ logger = logging.getLogger("telegram_alerter")
 ALERT_CACHE_FILE = Path("data/alert_cache.json")
 
 
+class TelegramDispatchError(RuntimeError):
+    """Raised when at least one configured Telegram delivery fails."""
+
+    def __init__(self, message: str, *, sent_signal_ids: set[str] | None = None) -> None:
+        super().__init__(message)
+        self.sent_signal_ids = set(sent_signal_ids or ())
+
+
 def _get_chat_ids() -> List[str]:
     raw = os.environ.get("TG_CHAT_IDS") or os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("TG_CHAT_ID") or ""
     return [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
@@ -143,35 +151,54 @@ class TelegramAlerter:
         self,
         signals: List[SignalEvent],
         synthetic_liqs: List[SyntheticLiquidation]
-    ) -> int:
+    ) -> tuple[int, set[str]]:
+        eligible_signals = [
+            sig for sig in signals
+            if sig.signal_type in ("STRONG_LONG", "STRONG_SHORT")
+            and self._should_alert(sig.symbol, sig.composite_score)
+        ]
+        eligible_liqs = [
+            liq for liq in synthetic_liqs
+            if liq.anomaly_ratio >= 1.5
+            and self._should_alert(f"{liq.symbol}_LIQ", liq.anomaly_ratio)
+        ]
+        if not eligible_signals and not eligible_liqs:
+            return 0, set()
         if not self.bot_token or not self.chat_ids:
-            return 0
+            raise TelegramDispatchError(
+                "TELEGRAM_CONFIGURATION_MISSING",
+                sent_signal_ids=set(),
+            )
 
         sent_count = 0
-        for sig in signals:
-            if sig.signal_type in ("STRONG_LONG", "STRONG_SHORT"):
-                if not self._should_alert(sig.symbol, sig.composite_score):
-                    continue
+        sent_signal_ids: set[str] = set()
+        failures: list[str] = []
+        for sig in eligible_signals:
+            msg = self.format_signal_html(sig)
+            ok = await self.send_message(msg)
+            if ok:
+                self._record_alert(sig.symbol, sig.composite_score)
+                sent_count += 1
+                sent_signal_ids.add(f"{sig.symbol}:{sig.timestamp_ms}:{sig.signal_type}")
+            else:
+                failures.append(f"SIGNAL:{sig.symbol}:{sig.timestamp_ms}")
 
-                msg = self.format_signal_html(sig)
-                ok = await self.send_message(msg)
-                if ok:
-                    self._record_alert(sig.symbol, sig.composite_score)
-                    sent_count += 1
+        for liq in eligible_liqs:
+            liq_key = f"{liq.symbol}_LIQ"
+            msg = self.format_liquidation_html(liq)
+            ok = await self.send_message(msg)
+            if ok:
+                self._record_alert(liq_key, liq.anomaly_ratio)
+                sent_count += 1
+            else:
+                failures.append(f"LIQ:{liq.symbol}:{liq.timestamp_ms}")
 
-        for liq in synthetic_liqs:
-            if liq.anomaly_ratio >= 1.5:
-                liq_key = f"{liq.symbol}_LIQ"
-                if not self._should_alert(liq_key, liq.anomaly_ratio):
-                    continue
-
-                msg = self.format_liquidation_html(liq)
-                ok = await self.send_message(msg)
-                if ok:
-                    self._record_alert(liq_key, liq.anomaly_ratio)
-                    sent_count += 1
-
-        return sent_count
+        if failures:
+            raise TelegramDispatchError(
+                "TELEGRAM_DELIVERY_FAILED:" + ",".join(failures[:10]),
+                sent_signal_ids=sent_signal_ids,
+            )
+        return sent_count, sent_signal_ids
 
     @staticmethod
     def format_signal_html(sig: SignalEvent) -> str:

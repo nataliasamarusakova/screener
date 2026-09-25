@@ -9,6 +9,8 @@ from typing import Iterable
 INTERVAL_MS = 5 * 60 * 1000
 
 from contracts import SignalEvent
+from engine.serialization import signal_to_dict
+from engine.provenance import provenance
 
 
 def append_signal_events(path: Path, signals: Iterable[SignalEvent]) -> int:
@@ -35,35 +37,15 @@ def append_signal_events(path: Path, signals: Iterable[SignalEvent]) -> int:
         if signal_id in existing_ids:
             continue
         candle_open_ms = (int(sig.timestamp_ms) // INTERVAL_MS) * INTERVAL_MS
-        rows.append({
+        payload = signal_to_dict(sig)
+        payload.update({
             "signal_id": signal_id,
-            "symbol": sig.symbol,
-            "timestamp_ms": sig.timestamp_ms,
             "candle_open_ms": candle_open_ms,
             "candle_close_ms": candle_open_ms + INTERVAL_MS - 1,
-            "decision_timestamp_ms": sig.decision_timestamp_ms,
-            "signal_type": sig.signal_type,
-            "score": sig.composite_score,
-            "price": sig.price,
-            "invalidation_price": sig.invalidation_price,
-            "target_price": sig.target_price,
-            "risk_reward_ratio": sig.risk_reward_ratio,
-            "suggested_position_usd": sig.suggested_position_usd,
-            "suggested_leverage": sig.suggested_leverage,
-            "z_cvd_div": sig.z_cvd_div,
-            "z_fund_trap": sig.z_fund_trap,
-            "z_delta_oi": sig.z_delta_oi,
-            "z_micro": sig.z_micro,
-            "z_whale_sentiment": sig.z_whale_sentiment,
-            "vpin": sig.vpin,
-            "obi": sig.obi,
-            "funding_8h": sig.funding_8h,
-            "basis_bps": sig.basis_bps,
-            "relative_strength": sig.relative_strength,
-            "sweep_reclaim": sig.sweep_reclaim,
-            "gate_status": sig.gate_status,
-            "friction_rt_pct": sig.applied_friction_rt_pct,
+            "applied_friction_rt_pct": sig.applied_friction_rt_pct,
+            **provenance(),
         })
+        rows.append(payload)
 
     if not rows:
         return 0

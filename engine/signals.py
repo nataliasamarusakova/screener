@@ -23,7 +23,7 @@ def empirical_zscore(
     value: float,
     history: Sequence[float],
     min_samples: int = 24,
-    min_std_floor: float = 0.05,
+    min_std_floor: float = 0.0,
 ) -> float:
     """
     Point-in-time sample Z-score with a minimum std floor.
@@ -48,8 +48,21 @@ def empirical_zscore(
     if std <= 1e-12:
         return 0.0
 
-    effective_std = max(std, min_std_floor)
-    return _clip((value - mean) / effective_std, -Z_CLIP, Z_CLIP)
+    if min_std_floor < 0.0 or not math.isfinite(min_std_floor):
+        raise ValueError("min_std_floor must be finite and non-negative")
+    if std <= max(1e-12, min_std_floor):
+        return 0.0 if min_std_floor > 0.0 else _clip((value - mean) / max(std, 1e-12), -Z_CLIP, Z_CLIP)
+
+    return _clip((value - mean) / std, -Z_CLIP, Z_CLIP)
+
+
+def _history_std(history: Sequence[float]) -> float:
+    values = [float(x) for x in history if math.isfinite(float(x))]
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((x - mean) ** 2 for x in values) / (len(values) - 1)
+    return math.sqrt(max(0.0, variance))
 
 
 def percentile_score(
@@ -206,7 +219,8 @@ class QuantSignalEngine:
         micro_factor_history: Sequence[float],
         cvd_history: Sequence[float],
         whale_history: Sequence[float],
-        use_percentile_for_cvd: bool = True,  # NEW: use percentile for bimodal CVD
+        use_percentile_for_cvd: bool = True,
+        use_percentile_for_funding: bool = True,
     ) -> Tuple[float, float, float, float, float]:
         micro_factor = obi * (1.0 - vpin)
         if not math.isfinite(micro_factor):
@@ -221,13 +235,35 @@ class QuantSignalEngine:
         else:
             z_cvd = empirical_zscore(cvd_divergence_score, cvd_history, self.z_history_min_samples)
 
-        z_funding = empirical_zscore(funding_rate_8h, funding_history, self.z_history_min_samples)
+        # Funding is an 8h rate sampled every 5m. Repeated values can produce
+        # an arbitrarily tiny standard deviation without representing stronger
+        # information. Use a rank-based score by default so normalization is
+        # stable under repeated/near-constant observations.
+        funding_active = len(funding_history) >= self.z_history_min_samples
+        basis_active = _history_std(basis_history) > 0.0
+        if use_percentile_for_funding:
+            try:
+                z_funding = percentile_score(
+                    funding_rate_8h, funding_history, self.z_history_min_samples
+                )
+            except ValueError:
+                z_funding = empirical_zscore(
+                    funding_rate_8h, funding_history, self.z_history_min_samples
+                )
+        else:
+            z_funding = empirical_zscore(
+                funding_rate_8h, funding_history, self.z_history_min_samples
+            )
         z_basis = empirical_zscore(basis_spread_bps, basis_history, self.z_history_min_samples)
-        z_fund_trap = _clip(
-            -(self.funding_weight * z_funding + self.basis_weight * z_basis),
-            -Z_CLIP,
-            Z_CLIP,
-        )
+        if funding_active and basis_active:
+            combined_fund = self.funding_weight * z_funding + self.basis_weight * z_basis
+        elif funding_active:
+            combined_fund = z_funding
+        elif basis_active:
+            combined_fund = z_basis
+        else:
+            combined_fund = 0.0
+        z_fund_trap = _clip(-combined_fund, -Z_CLIP, Z_CLIP)
         z_delta_oi = empirical_zscore(delta_oi_pct, delta_oi_pct_history, self.z_history_min_samples)
         z_micro = empirical_zscore(micro_factor, micro_factor_history, self.z_history_min_samples)
 
@@ -237,6 +273,31 @@ class QuantSignalEngine:
             z_whale = 0.0
 
         return z_cvd, z_fund_trap, z_delta_oi, z_micro, z_whale
+
+    def factor_activity(
+        self,
+        *,
+        funding_history: Sequence[float],
+        basis_history: Sequence[float],
+        delta_oi_pct_history: Sequence[float],
+        micro_factor_history: Sequence[float],
+        whale_history: Sequence[float],
+    ) -> dict[str, bool]:
+        """Return whether each factor has meaningful sample variance.
+
+        A factor with zero/near-zero variance is treated as unavailable for weight
+        normalization rather than contributing a dead weight in the denominator.
+        """
+        floor = 0.0
+        return {
+            "cvd": True,
+            "funding": _history_std(funding_history) > floor,
+            "basis": _history_std(basis_history) > floor,
+            "fund": (_history_std(funding_history) > floor or _history_std(basis_history) > floor),
+            "oi": _history_std(delta_oi_pct_history) > floor,
+            "micro": _history_std(micro_factor_history) > floor,
+            "whale": _history_std(whale_history) > floor and len(whale_history) >= self.z_history_min_samples,
+        }
 
     def compute_signal(
         self,
@@ -269,6 +330,7 @@ class QuantSignalEngine:
         account_equity: float = 10000.0,
         whale_history_length: int = 0,       # NEW: for weight renormalization
         friction_round_trip_pct: Optional[float] = None,  # NEW: per-symbol override
+        active_factors: Optional[dict[str, bool]] = None,
     ) -> SignalEvent:
         now_ms = timestamp_ms if timestamp_ms is not None else int(time.time() * 1000)
         decision_ms = decision_timestamp_ms if decision_timestamp_ms is not None else int(time.time() * 1000)
@@ -301,19 +363,37 @@ class QuantSignalEngine:
         z_micro = _clip(float(z_micro_override), -Z_CLIP, Z_CLIP)
         z_whale = _clip(float(z_whale_override), -Z_CLIP, Z_CLIP)
 
-        # FIX: renormalize denominator when whale factor has no history
-        whale_active = whale_history_length >= self.z_history_min_samples
-        active_weight_total = self.total_weights - (0.0 if whale_active else self.w_whale)
-        if active_weight_total <= 0.0:
-            active_weight_total = self.total_weights
+        # Do not leave dead factor weights in the denominator. If a factor has no
+        # sample variance, it is treated as unavailable for this decision.
+        activity = active_factors or {
+            "cvd": True,
+            "fund": True,
+            "oi": True,
+            "micro": True,
+            "whale": whale_history_length >= self.z_history_min_samples,
+        }
+        if not activity.get("whale", False):
+            activity["whale"] = False
 
-        raw_weighted = (
-            self.w_cvd * z_cvd_div
-            + self.w_fund * z_fund_trap
-            + self.w_oi * z_delta_oi
-            + self.w_micro * z_micro
-            + (self.w_whale * z_whale if whale_active else 0.0)
-        )
+        active_weight_total = 0.0
+        raw_weighted = 0.0
+        if activity.get("cvd", True):
+            active_weight_total += self.w_cvd
+            raw_weighted += self.w_cvd * z_cvd_div
+        if activity.get("fund", True):
+            active_weight_total += self.w_fund
+            raw_weighted += self.w_fund * z_fund_trap
+        if activity.get("oi", True):
+            active_weight_total += self.w_oi
+            raw_weighted += self.w_oi * z_delta_oi
+        if activity.get("micro", True):
+            active_weight_total += self.w_micro
+            raw_weighted += self.w_micro * z_micro
+        if activity.get("whale", False):
+            active_weight_total += self.w_whale
+            raw_weighted += self.w_whale * z_whale
+        if active_weight_total <= 0.0:
+            raise ValueError("No active signal factors")
 
         if sweep_reclaim:
             if sweep_pattern == "BULLISH_SWEEP_RECLAIM":
@@ -338,7 +418,6 @@ class QuantSignalEngine:
                 final_gate = "PASSED"
             else:
                 candidate_type = "NEUTRAL"
-                normalized_score = min(normalized_score, self.strong_signal_threshold - 30.0)
                 final_gate = effective_gate
         elif normalized_score <= -self.strong_signal_threshold:
             effective_gate = gate_short_status if gate_short_status is not None else gate_status
@@ -347,7 +426,6 @@ class QuantSignalEngine:
                 final_gate = "PASSED"
             else:
                 candidate_type = "NEUTRAL"
-                normalized_score = max(normalized_score, -self.strong_signal_threshold + 30.0)
                 final_gate = effective_gate
         else:
             candidate_type = "NEUTRAL"

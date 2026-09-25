@@ -25,11 +25,13 @@ from engine.funding_filter import FundingFilterEngine
 from engine.liquidations import SyntheticLiquidationDetector
 from engine.liquidity_sweep import LiquiditySweepDetector
 from engine.market_regime import MarketRegimeEngine
-from engine.microstructure_jit import compute_vpin_numba, compute_weighted_obi_jit
+from engine.microstructure_jit import VPIN_ESTIMATE_METHOD, compute_vpin_numba, compute_weighted_obi_jit
 from engine.quality_filter import QualityFilter
 from engine.sentiment import SentimentEngine
 from engine.signals import QuantSignalEngine
 from engine.research_recorder import ResearchRecorder
+from engine.provenance import provenance
+from engine.serialization import signal_to_dict
 
 logger = logging.getLogger("screener")
 
@@ -78,34 +80,9 @@ def save_latest_scan_json(
             "stale_state_symbols_dropped": summary.stale_state_symbols_dropped,
             "state_recovery_sources": summary.state_recovery_sources,
         },
-        "signals": [
-            {
-                "symbol": s.symbol,
-                "type": s.signal_type,
-                "score": s.composite_score,
-                "price": s.price,
-                "funding_8h": s.funding_8h,
-                "basis_bps": s.basis_bps,
-                "obi": s.obi,
-                "vpin": s.vpin,
-                "z_cvd_div": s.z_cvd_div,
-                "z_fund_trap": s.z_fund_trap,
-                "z_whale_sentiment": s.z_whale_sentiment,
-                "relative_strength": s.relative_strength,
-                "sweep_reclaim": s.sweep_reclaim,
-                "sweep_pattern": s.sweep_pattern,
-                "gate_status": s.gate_status,
-                "invalidation_price": s.invalidation_price,
-                "target_price": s.target_price,
-                "risk_reward_ratio": s.risk_reward_ratio,
-                "suggested_position_usd": s.suggested_position_usd,
-                "suggested_leverage": s.suggested_leverage,
-                "trailing_stop_activation_pct": s.trailing_stop_activation_pct,
-                "trailing_stop_distance_pct": s.trailing_stop_distance_pct,
-                "applied_friction_rt_pct": s.applied_friction_rt_pct,
-            }
-            for s in signals
-        ],
+        "signal_schema_version": 2,
+        "provenance": provenance(),
+        "signals": [signal_to_dict(s) for s in signals],
         "liquidations": [
             {
                 "symbol": lq.symbol,
@@ -150,6 +127,7 @@ class QuantScreener:
         top_n_symbols: int = 100,
     ) -> None:
         self.state_file = state_file
+        self._provenance = provenance()
         self.concurrency_limit = concurrency_limit
         self.top_n_symbols = top_n_symbols
         self.history_bars = int(os.getenv("SIGNAL_HISTORY_BARS", "60"))
@@ -165,6 +143,7 @@ class QuantScreener:
         self.max_strong_per_direction = int(os.getenv("MAX_STRONG_PER_DIRECTION", "3"))
         self.max_portfolio_correlation = float(os.getenv("MAX_PORTFOLIO_CORRELATION", "0.80"))
         self.max_aggregate_risk_pct = float(os.getenv("MAX_AGGREGATE_RISK_PCT", "0.03"))
+        self.max_gross_leverage = float(os.getenv("MAX_GROSS_LEVERAGE", "3.0"))
         self.funding_proximity_minutes = float(os.getenv("FUNDING_PROXIMITY_MINUTES", "20.0"))
         self.funding_extreme_threshold_8h = float(os.getenv("FUNDING_EXTREME_THRESHOLD_8H", "0.0010"))
 
@@ -180,6 +159,8 @@ class QuantScreener:
             raise ValueError("MAX_PORTFOLIO_CORRELATION must be in (0, 1]")
         if not math.isfinite(self.max_aggregate_risk_pct) or not (0.0 < self.max_aggregate_risk_pct <= 1.0):
             raise ValueError("MAX_AGGREGATE_RISK_PCT must be in (0, 1]")
+        if not math.isfinite(self.max_gross_leverage) or self.max_gross_leverage < 1.0:
+            raise ValueError("MAX_GROSS_LEVERAGE must be >= 1")
         if not math.isfinite(self.funding_proximity_minutes) or self.funding_proximity_minutes <= 0.0:
             raise ValueError("FUNDING_PROXIMITY_MINUTES must be positive")
         if not math.isfinite(self.funding_extreme_threshold_8h) or self.funding_extreme_threshold_8h <= 0.0:
@@ -212,6 +193,13 @@ class QuantScreener:
         )
         self.sweep_detector = LiquiditySweepDetector()
         self.sentiment_engine = SentimentEngine()
+
+    def _state_is_compatible(self, snapshot: MarketStateSnapshot) -> bool:
+        return (
+            snapshot.strategy_revision == self._provenance["strategy_revision"]
+            and snapshot.config_fingerprint == self._provenance["config_fingerprint"]
+            and snapshot.research_schema_version == self._provenance["research_schema_version"]
+        )
 
     def load_previous_state(self) -> Dict[str, MarketStateSnapshot]:
         target = self.state_file
@@ -302,7 +290,7 @@ class QuantScreener:
         max_slippage = float(os.getenv("MAX_SLIPPAGE_RT_PCT", "0.0030"))
         if not all(math.isfinite(x) and x >= 0.0 for x in (ob_spread_bps, atr_pct, commission_rt, slippage_atr_fraction, max_slippage)):
             raise ValueError("Invalid friction input/configuration")
-        spread_cost_rt = (ob_spread_bps * 2.0) / 10000.0
+        spread_cost_rt = ob_spread_bps / 10000.0
         slippage_rt = min(atr_pct * slippage_atr_fraction, max_slippage)
         return commission_rt + spread_cost_rt + slippage_rt
 
@@ -323,84 +311,91 @@ class QuantScreener:
         rets = arr[1:] / arr[:-1] - 1.0
         return rets if len(rets) >= 2 and np.std(rets) > 1e-12 else None
 
+    @staticmethod
+    def _downgrade_signal(signal: SignalEvent, reason: str) -> None:
+        """Convert an otherwise-strong candidate into a non-actionable NEUTRAL event."""
+        signal.signal_type = "NEUTRAL"
+        signal.gate_status = reason
+        signal.invalidation_price = signal.price
+        signal.target_price = signal.price
+        signal.risk_reward_ratio = 0.0
+        signal.suggested_position_usd = 0.0
+        signal.suggested_leverage = 1
+        signal.trailing_stop_activation_pct = 0.0
+        signal.trailing_stop_distance_pct = 0.0
+
     def _apply_portfolio_correlation_limit(
         self,
         signals: List[SignalEvent],
         snapshots: Optional[Dict[str, MarketStateSnapshot]] = None,
     ) -> Tuple[List[SignalEvent], int]:
-        """Apply directional count, correlation and aggregate-risk caps.
-
-        ``MAX_STRONG_PER_DIRECTION`` is only a cardinality cap. Correlation is
-        calculated independently from 5m close histories and is no longer claimed
-        to be a correlation limit when no correlation matrix is used.
-        """
+        """Apply global portfolio risk, direction, gross-leverage and correlation caps."""
         snapshots = snapshots or {}
         downgraded = 0
+        direction_counts = {"STRONG_LONG": 0, "STRONG_SHORT": 0}
+        kept: List[SignalEvent] = []
+        aggregate_risk_pct = 0.0
+        aggregate_notional_usd = 0.0
 
-        for direction, key_fn in (
-            ("STRONG_LONG", lambda s: -s.composite_score),
-            ("STRONG_SHORT", lambda s: s.composite_score),
-        ):
-            candidates = sorted(
-                [s for s in signals if s.signal_type == direction],
-                key=key_fn,
+        candidates = sorted(
+            [s for s in signals if s.signal_type in ("STRONG_LONG", "STRONG_SHORT")],
+            key=lambda s: abs(s.composite_score),
+            reverse=True,
+        )
+        for signal in candidates:
+            direction = signal.signal_type
+            if direction_counts[direction] >= self.max_strong_per_direction:
+                self._downgrade_signal(signal, "BLOCKED_PORTFOLIO_COUNT_LIMIT")
+                downgraded += 1
+                continue
+
+            stop_risk = 0.0
+            if signal.suggested_position_usd > 0.0 and signal.price > 0.0:
+                stop_distance = abs(signal.price - signal.invalidation_price) / signal.price
+                stop_risk = (signal.suggested_position_usd * stop_distance) / max(self.account_equity, 1e-12)
+            if stop_risk <= 0.0:
+                stop_risk = self.signal_engine.risk_per_trade_pct
+
+            if aggregate_risk_pct + stop_risk > self.max_aggregate_risk_pct + 1e-12:
+                self._downgrade_signal(signal, "BLOCKED_PORTFOLIO_RISK_LIMIT")
+                downgraded += 1
+                continue
+
+            if aggregate_notional_usd + signal.suggested_position_usd > self.account_equity * self.max_gross_leverage + 1e-9:
+                self._downgrade_signal(signal, "BLOCKED_PORTFOLIO_GROSS_LEVERAGE")
+                downgraded += 1
+                continue
+
+            new_returns = self._returns_from_prices(
+                tuple(snapshots.get(signal.symbol).price_history_5m) if snapshots.get(signal.symbol) else ()
             )
-            kept: List[SignalEvent] = []
-            aggregate_risk_pct = 0.0
-            for signal in candidates:
-                # suggested_position_usd is already capped by max leverage; infer the
-                # actual stop-risk fraction instead of assuming every stop is exactly 1%.
-                stop_risk = 0.0
-                if signal.suggested_position_usd > 0.0 and signal.price > 0.0:
-                    stop_distance = abs(signal.price - signal.invalidation_price) / signal.price
-                    stop_risk = (signal.suggested_position_usd * stop_distance) / max(self.account_equity, 1e-12)
-                if stop_risk <= 0.0:
-                    stop_risk = 0.01
-
-                if len(kept) >= self.max_strong_per_direction:
-                    signal.signal_type = "NEUTRAL"
-                    signal.gate_status = "BLOCKED_PORTFOLIO_COUNT_LIMIT"
-                    signal.suggested_position_usd = 0.0
-                    signal.suggested_leverage = 1
-                    downgraded += 1
-                    continue
-
-                if aggregate_risk_pct + stop_risk > self.max_aggregate_risk_pct + 1e-12:
-                    signal.signal_type = "NEUTRAL"
-                    signal.gate_status = "BLOCKED_PORTFOLIO_RISK_LIMIT"
-                    signal.suggested_position_usd = 0.0
-                    signal.suggested_leverage = 1
-                    downgraded += 1
-                    continue
-
-                new_returns = self._returns_from_prices(
-                    tuple(snapshots.get(signal.symbol).price_history_5m) if snapshots.get(signal.symbol) else ()
-                )
-                if new_returns is not None:
-                    blocked_corr = None
-                    for existing in kept:
-                        old_returns = self._returns_from_prices(
-                            tuple(snapshots.get(existing.symbol).price_history_5m) if snapshots.get(existing.symbol) else ()
-                        )
-                        if old_returns is None:
-                            continue
-                        common = min(len(old_returns), len(new_returns))
-                        if common < max(self.beta_min_samples, 10):
-                            continue
-                        corr = float(np.corrcoef(old_returns[-common:], new_returns[-common:])[0, 1])
-                        if math.isfinite(corr) and corr >= self.max_portfolio_correlation:
-                            blocked_corr = corr
-                            break
-                    if blocked_corr is not None:
-                        signal.signal_type = "NEUTRAL"
-                        signal.gate_status = f"BLOCKED_PORTFOLIO_CORRELATION:{blocked_corr:+.2f}"
-                        signal.suggested_position_usd = 0.0
-                        signal.suggested_leverage = 1
-                        downgraded += 1
+            blocked_corr = None
+            if new_returns is not None:
+                new_sign = 1 if direction == "STRONG_LONG" else -1
+                for existing in kept:
+                    old_returns = self._returns_from_prices(
+                        tuple(snapshots.get(existing.symbol).price_history_5m) if snapshots.get(existing.symbol) else ()
+                    )
+                    if old_returns is None:
                         continue
+                    common = min(len(old_returns), len(new_returns))
+                    if common < max(self.beta_min_samples, 10):
+                        continue
+                    corr = float(np.corrcoef(old_returns[-common:], new_returns[-common:])[0, 1])
+                    old_sign = 1 if existing.signal_type == "STRONG_LONG" else -1
+                    effective_corr = corr * new_sign * old_sign
+                    if math.isfinite(effective_corr) and effective_corr >= self.max_portfolio_correlation:
+                        blocked_corr = effective_corr
+                        break
+            if blocked_corr is not None:
+                self._downgrade_signal(signal, f"BLOCKED_PORTFOLIO_CORRELATION:{blocked_corr:+.2f}")
+                downgraded += 1
+                continue
 
-                kept.append(signal)
-                aggregate_risk_pct += stop_risk
+            kept.append(signal)
+            direction_counts[direction] += 1
+            aggregate_risk_pct += stop_risk
+            aggregate_notional_usd += signal.suggested_position_usd
 
         return signals, downgraded
 
@@ -434,6 +429,8 @@ class QuantScreener:
         persisted_rows: list[dict],
         key_fn,
         state_allowed: bool,
+        expected_previous_timestamp_ms: Optional[int] = None,
+        interval_ms: int = 5 * 60 * 1000,
     ) -> tuple[tuple, str]:
         """Choose the strongest contiguous history available for one factor.
 
@@ -457,6 +454,16 @@ class QuantScreener:
             if math.isfinite(value):
                 research_values.append(value)
         research_hist = tuple(research_values)
+        if expected_previous_timestamp_ms is not None and persisted_rows:
+            valid_research_tail = None
+            try:
+                max_ts = max(int(row["timestamp_ms"]) for row in persisted_rows if "timestamp_ms" in row)
+                if max_ts == expected_previous_timestamp_ms:
+                    valid_research_tail = research_hist
+            except (TypeError, ValueError, KeyError):
+                valid_research_tail = None
+            if valid_research_tail is None:
+                research_hist = ()
         if len(research_hist) > len(state_hist):
             return research_hist, "RESEARCH"
         if state_hist:
@@ -465,7 +472,9 @@ class QuantScreener:
             return research_hist, "RESEARCH"
         return (), "EMPTY"
 
-    async def scan(self) -> Tuple[List[SignalEvent], List[SyntheticLiquidation], ScreenerResult]:
+    async def scan(
+        self,
+    ) -> Tuple[List[SignalEvent], List[SyntheticLiquidation], ScreenerResult, List[dict]]:
         t0 = time.time()
         prev_state = self.load_previous_state()
         signals: List[SignalEvent] = []
@@ -519,6 +528,7 @@ class QuantScreener:
                 before_timestamp_ms=closed_end_ms,
                 symbols=sorted_symbols,
                 limit=self.history_bars,
+                expected_provenance={k: self._provenance[k] for k in ("strategy_revision", "config_fingerprint", "research_schema_version")},
             )
 
             sem = asyncio.Semaphore(self.concurrency_limit)
@@ -559,7 +569,7 @@ class QuantScreener:
                         expected_prev_open_ms = closed_open_ms - interval_ms
                         if p_snap is not None and p_snap.candle_open_time_ms == closed_open_ms:
                             return None
-                        prev_contiguous = self._state_is_for_candle(p_snap, expected_prev_open_ms)
+                        prev_contiguous = self._state_is_for_candle(p_snap, expected_prev_open_ms) and (p_snap is not None and self._state_is_compatible(p_snap))
 
                         klines = await self.ingestion.fetch_symbol_closed_5m_klines(
                             symbol, closed_open_ms, history_bars=kline_history
@@ -734,24 +744,28 @@ class QuantScreener:
                             persisted_rows,
                             lambda row: row.get("funding_rate_8h"),
                             state_allowed,
+                            expected_previous_timestamp_ms=closed_end_ms - interval_ms,
                         )
                         base_basis_hist, basis_source = self._select_recoverable_history(
                             p_snap.basis_history_5m if p_snap is not None else (),
                             persisted_rows,
                             lambda row: row.get("basis_bps"),
                             state_allowed,
+                            expected_previous_timestamp_ms=closed_end_ms - interval_ms,
                         )
                         base_micro_hist, micro_source = self._select_recoverable_history(
                             p_snap.micro_factor_history_5m if p_snap is not None else (),
                             persisted_rows,
                             lambda row: float(row["obi"]) * (1.0 - float(row["vpin"])),
                             state_allowed,
+                            expected_previous_timestamp_ms=closed_end_ms - interval_ms,
                         )
                         base_whale_hist, whale_source = self._select_recoverable_history(
                             p_snap.whale_divergence_history_5m if p_snap is not None else (),
                             [row for row in persisted_rows if bool(row.get("sentiment_available", False))],
                             lambda row: row.get("whale_divergence_score"),
                             state_allowed,
+                            expected_previous_timestamp_ms=closed_end_ms - interval_ms,
                         )
                         factor_sources = {funding_source, basis_source, micro_source, whale_source}
                         if factor_sources == {"STATE"}:
@@ -853,6 +867,13 @@ class QuantScreener:
                                 account_equity=self.account_equity,
                                 whale_history_length=len(whale_hist) - 1,
                                 friction_round_trip_pct=friction_rt,
+                                active_factors=self.signal_engine.factor_activity(
+                                    funding_history=funding_hist[:-1],
+                                    basis_history=basis_hist[:-1],
+                                    delta_oi_pct_history=delta_hist[:-1],
+                                    micro_factor_history=micro_hist[:-1],
+                                    whale_history=whale_hist[:-1] if len(whale_hist) > 1 else (),
+                                ),
                             )
 
                         snapshot = MarketStateSnapshot(
@@ -883,8 +904,13 @@ class QuantScreener:
                             candle_high_5m=candle_high,
                             candle_low_5m=candle_low,
                             signal_ready=signal is not None,
+                            strategy_revision=str(self._provenance["strategy_revision"]),
+                            code_revision=str(self._provenance["code_revision"]),
+                            config_fingerprint=str(self._provenance["config_fingerprint"]),
+                            research_schema_version=int(self._provenance["research_schema_version"]),
                         )
                         research_row = {
+                            **provenance(),
                             "timestamp_ms": closed_end_ms,
                             "symbol": symbol,
                             "open": float(parsed[-1][1]),
@@ -898,6 +924,7 @@ class QuantScreener:
                             "basis_bps": float(basis_bps),
                             "obi": float(obi),
                             "vpin": float(vpin),
+                            "vpin_method": VPIN_ESTIMATE_METHOD,
                             "cvd_divergence_score": float(div_score if div_score is not None else 0.0),
                             "whale_divergence_score": float(whale_divergence),
                             "atr_pct": float(atr_pct),
@@ -909,8 +936,19 @@ class QuantScreener:
                             "relative_strength": float(rs_to_btc),
                             "sweep_reclaim": bool(sweep_reclaim),
                             "sweep_pattern": str(sweep_pattern),
+                            "candidate_signal_type": signal.signal_type if signal is not None else "NONE",
+                            "candidate_score": float(signal.composite_score) if signal is not None else 0.0,
                             "recorded_signal_type": signal.signal_type if signal is not None else "NONE",
-                            "recorded_score": signal.composite_score if signal is not None else 0.0,
+                            "recorded_score": float(signal.composite_score) if signal is not None else 0.0,
+                            "final_signal_type": signal.signal_type if signal is not None else "NONE",
+                            "portfolio_action": "CANDIDATE_ONLY" if signal is not None else "NO_SIGNAL",
+                            "actionable": bool(signal is not None and signal.signal_type in ("STRONG_LONG", "STRONG_SHORT")),
+                            "dispatch_allowed": None,
+                            "dispatch_block_reason": None,
+                            "dispatched_at_ms": None,
+                            "gate_status": signal.gate_status if signal is not None else "NOT_READY",
+                            "signal_decision_timestamp_ms": int(signal.decision_timestamp_ms) if signal is not None else None,
+                            "signal_event": signal_to_dict(signal) if signal is not None else None,
                             "signal_ready": bool(signal_ready),
                             "signal_readiness_reasons": list(readiness_reasons),
                             "sentiment_available": bool(sentiment_available),
@@ -964,7 +1002,6 @@ class QuantScreener:
             successful_state_symbols = {snapshot.symbol for snapshot in new_snapshots}
             stale_state_symbols_dropped = len(previous_state_symbols - successful_state_symbols)
             self.save_current_state(new_snapshots)
-            self.research_recorder.append_rows(research_rows)
             if stale_state_symbols_dropped:
                 logger.warning(
                     "stale_state_symbols_dropped count=%s",
@@ -975,6 +1012,27 @@ class QuantScreener:
             snapshot_map = {snapshot.symbol: snapshot for snapshot in new_snapshots}
             signals, portfolio_limited = self._apply_portfolio_correlation_limit(signals, snapshot_map)
 
+            signal_map = {(s.symbol, s.timestamp_ms): s for s in signals}
+            for row in research_rows:
+                key = (str(row["symbol"]).upper(), int(row["timestamp_ms"]))
+                candidate = row.get("signal_event") or {}
+                final_signal = signal_map.get(key)
+                row["candidate_signal_type"] = candidate.get("signal_type", "NONE")
+                row["candidate_score"] = float(candidate.get("composite_score", 0.0))
+                if final_signal is None:
+                    row["final_signal_type"] = "NONE"
+                    row["recorded_signal_type"] = "NONE"
+                    row["portfolio_action"] = "NOT_ACTIONABLE"
+                    row["actionable"] = False
+                    row["gate_status"] = "NOT_READY_OR_REJECTED"
+                else:
+                    row["final_signal_type"] = final_signal.signal_type
+                    row["recorded_signal_type"] = final_signal.signal_type
+                    row["portfolio_action"] = ("ACTIONABLE" if final_signal.signal_type in ("STRONG_LONG", "STRONG_SHORT") else "BLOCKED_OR_NEUTRAL")
+                    row["actionable"] = bool(final_signal.signal_type in ("STRONG_LONG", "STRONG_SHORT"))
+                    row["gate_status"] = final_signal.gate_status
+                    row["recorded_score"] = float(final_signal.composite_score)
+                    row["signal_event_final"] = signal_to_dict(final_signal)
             strong_longs = [s for s in signals if s.signal_type == "STRONG_LONG"]
             strong_shorts = [s for s in signals if s.signal_type == "STRONG_SHORT"]
             duration = time.time() - t0
@@ -997,7 +1055,7 @@ class QuantScreener:
                 stale_state_symbols_dropped=stale_state_symbols_dropped,
                 state_recovery_sources=dict(recovery_counter.most_common()),
             )
-            return signals, synthetic_liqs, summary
+            return signals, synthetic_liqs, summary, research_rows
         except Exception:
             logger.exception("Screener scan failed")
             raise

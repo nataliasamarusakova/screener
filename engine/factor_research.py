@@ -7,7 +7,7 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-from engine.research import TradeRecord
+from engine.research import ResearchDataset, TradeRecord, SUPPORTED_FORWARD_MINUTES
 
 
 FACTORS = ("z_cvd", "z_fund", "z_oi", "z_micro", "z_whale")
@@ -80,3 +80,74 @@ def analyze_factors(trades: Sequence[TradeRecord]) -> list[FactorStats]:
 
 def to_dicts(stats: Sequence[FactorStats]) -> list[dict]:
     return [asdict(item) for item in stats]
+
+
+def analyze_feature_event_study(dataset: ResearchDataset) -> list[dict]:
+    """Cross-sectional/event-study attribution over every signal-ready observation.
+
+    This deliberately includes NEUTRAL observations. It uses only factor values
+    recorded at the observation timestamp and future closes from the same symbol,
+    so no future information enters the feature side of the analysis.
+    """
+    output: list[dict] = []
+    for symbol in dataset.symbols():
+        rows = dataset.bars(symbol)
+        by_ts = {row.timestamp_ms: row for row in rows}
+        for row in rows:
+            recorded = row.candidate_signal or row.recorded_signal
+            if not recorded or not bool(recorded):
+                continue
+            factors = {}
+            for name in FACTORS:
+                key = {
+                    "z_cvd": "z_cvd_div",
+                    "z_fund": "z_fund_trap",
+                    "z_oi": "z_delta_oi",
+                    "z_micro": "z_micro",
+                    "z_whale": "z_whale_sentiment",
+                }[name]
+                value = recorded.get(key)
+                if value is None or not math.isfinite(float(value)):
+                    factors = {}
+                    break
+                factors[name] = float(value)
+            if not factors:
+                continue
+            for minutes in SUPPORTED_FORWARD_MINUTES:
+                future_ts = row.timestamp_ms + minutes * 60_000
+                future = by_ts.get(future_ts)
+                if future is None or row.close <= 0.0:
+                    continue
+                forward_return = future.close / row.close - 1.0
+                record = {
+                    "symbol": symbol,
+                    "timestamp_ms": row.timestamp_ms,
+                    "signal_type": recorded.get("signal_type", "NEUTRAL"),
+                    "horizon_minutes": minutes,
+                    "forward_return": float(forward_return),
+                    **factors,
+                }
+                output.append(record)
+    return output
+
+
+def summarize_feature_event_study(rows: Sequence[dict]) -> list[dict]:
+    """Aggregate event-study IC and mean signed return by factor/horizon."""
+    results: list[dict] = []
+    for factor in FACTORS:
+        for horizon in SUPPORTED_FORWARD_MINUTES:
+            pairs = [
+                (float(row[factor]), float(row["forward_return"]))
+                for row in rows
+                if int(row.get("horizon_minutes", -1)) == horizon
+                and math.isfinite(float(row.get(factor, float("nan"))))
+                and math.isfinite(float(row.get("forward_return", float("nan"))))
+            ]
+            results.append({
+                "factor": factor,
+                "horizon_minutes": horizon,
+                "n": len(pairs),
+                "pearson_ic": _pearson([x for x, _ in pairs], [y for _, y in pairs]),
+                "mean_signed_return": _mean([x * y for x, y in pairs]) if pairs else None,
+            })
+    return results

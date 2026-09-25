@@ -30,7 +30,13 @@ class WalkForwardConfig:
     test_bars: int = 7 * 24 * 12
     embargo_bars: int = 12
     min_train_trades: int = 50
+    min_validation_trades: int = 20
     min_test_trades: int = 20
+    max_multiple_testing_adjusted_p: float = 0.10
+
+    def __post_init__(self) -> None:
+        if not (0.0 < self.max_multiple_testing_adjusted_p <= 1.0):
+            raise ValueError("max_multiple_testing_adjusted_p must be in (0, 1]")
 
 
 @dataclass
@@ -62,14 +68,45 @@ def load_parameter_grid(path: Path) -> list[ParameterConfig]:
     return configs
 
 
+def _normal_two_sided_p(z: float | None) -> float | None:
+    if z is None or not math.isfinite(z):
+        return None
+    return math.erfc(abs(z) / math.sqrt(2.0))
+
+
+def _hac_t_stat(values: Sequence[float]) -> float | None:
+    """Newey-West/HAC-style mean t-statistic for ordered trade returns."""
+    n = len(values)
+    if n < 3:
+        return None
+    mean = sum(values) / n
+    centered = [x - mean for x in values]
+    gamma0 = sum(x * x for x in centered) / n
+    if gamma0 <= 0.0:
+        return None
+    lag = max(1, min(n - 1, int(round(n ** 0.25))))
+    long_run = gamma0
+    for k in range(1, lag + 1):
+        gamma = sum(centered[t] * centered[t - k] for t in range(k, n)) / n
+        weight = 1.0 - k / (lag + 1.0)
+        long_run += 2.0 * weight * gamma
+    long_run = max(long_run, 1e-18)
+    se = math.sqrt(long_run / n)
+    return mean / se if se > 0.0 else None
+
+
 def _stats(trades: Sequence[TradeRecord]) -> dict[str, Any]:
     values = [float(t.net_return) for t in trades if math.isfinite(float(t.net_return))]
     if not values:
-        return {"n": 0, "mean": None, "std": None, "t_stat": None, "hit_rate": None, "profit_factor": None}
+        return {
+            "n": 0, "mean": None, "std": None, "t_stat": None,
+            "hac_t_stat": None, "p_value": None, "hit_rate": None, "profit_factor": None,
+        }
     mean = sum(values) / len(values)
     variance = sum((x - mean) ** 2 for x in values) / max(1, len(values) - 1)
     std = math.sqrt(variance)
     t = mean / (std / math.sqrt(len(values))) if std > 0.0 and len(values) > 1 else None
+    hac_t = _hac_t_stat(values)
     gains = sum(x for x in values if x > 0.0)
     losses = -sum(x for x in values if x < 0.0)
     return {
@@ -77,6 +114,8 @@ def _stats(trades: Sequence[TradeRecord]) -> dict[str, Any]:
         "mean": mean,
         "std": std,
         "t_stat": t,
+        "hac_t_stat": hac_t,
+        "p_value": _normal_two_sided_p(hac_t),
         "hit_rate": sum(x > 0.0 for x in values) / len(values),
         "profit_factor": gains / losses if losses > 0.0 else None,
     }
@@ -109,6 +148,8 @@ def _slice_bounds(timestamps: Sequence[int], start_index: int, length: int) -> t
 
 def run_wfa(dataset: ResearchDataset, configs: Sequence[ParameterConfig], cfg: WalkForwardConfig) -> list[FoldResult]:
     timestamps = _all_timestamps(dataset)
+    if any(b - a != 5 * 60 * 1000 for a, b in zip(timestamps, timestamps[1:])):
+        return []
     if len(timestamps) < cfg.train_bars + cfg.embargo_bars + cfg.validation_bars + cfg.embargo_bars + cfg.test_bars:
         return []
 
@@ -126,17 +167,22 @@ def run_wfa(dataset: ResearchDataset, configs: Sequence[ParameterConfig], cfg: W
         ranked: list[tuple[float, ParameterConfig, dict[str, Any]]] = []
         for candidate in configs:
             engine = _make_engine(candidate.params)
-            backtester = QuantBacktester(engine, BacktestConfig())
+            backtester = QuantBacktester(engine, BacktestConfig(replay_recorded_signals=False))
             trades = backtester.run(dataset, signal_start_ms=train_start, signal_end_ms=validation_end, require_exit_within_end=True)
             train_trades = [t for t in trades if train_start <= t.signal_timestamp_ms <= train_end]
             val_trades = [t for t in trades if validation_start <= t.signal_timestamp_ms <= validation_end]
             train_stats = _stats(train_trades)
             val_stats = _stats(val_trades)
-            if train_stats["n"] < cfg.min_train_trades or val_stats["n"] == 0:
+            if train_stats["n"] < cfg.min_train_trades or val_stats["n"] < cfg.min_validation_trades:
                 score = float("-inf")
             else:
-                # Selection uses validation t-stat only after a minimum train sample gate.
-                score = float(val_stats["t_stat"] if val_stats["t_stat"] is not None else float("-inf"))
+                raw_p = val_stats.get("p_value")
+                adjusted_p = min(1.0, raw_p * len(configs)) if raw_p is not None else None
+                val_stats["multiple_testing_adjusted_p"] = adjusted_p
+                if adjusted_p is None or adjusted_p > cfg.max_multiple_testing_adjusted_p:
+                    score = float("-inf")
+                else:
+                    score = float(val_stats["hac_t_stat"] if val_stats["hac_t_stat"] is not None else float("-inf"))
             ranked.append((score, candidate, {"train": train_stats, "validation": val_stats}))
 
         ranked.sort(key=lambda item: item[0], reverse=True)
@@ -147,7 +193,7 @@ def run_wfa(dataset: ResearchDataset, configs: Sequence[ParameterConfig], cfg: W
             oos_stats = {"n": 0, "reason": "NO_CONFIG_PASSED_TRAIN_GATE"}
         else:
             engine = _make_engine(selected[1].params)
-            backtester = QuantBacktester(engine, BacktestConfig())
+            backtester = QuantBacktester(engine, BacktestConfig(replay_recorded_signals=False))
             oos_trades = backtester.run(dataset, signal_start_ms=test_start, signal_end_ms=test_end, require_exit_within_end=True)
             oos_stats = _stats(oos_trades)
             oos_stats["passed_min_test_trades"] = oos_stats["n"] >= cfg.min_test_trades

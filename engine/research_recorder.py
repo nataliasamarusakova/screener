@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 SCHEMA = """
@@ -83,6 +84,8 @@ class ResearchRecorder:
                     fh.write(payload_json)
                     fh.write("\n")
                     existing.add(key)
+                fh.flush()
+                os.fsync(fh.fileno())
 
 
     def load_recent_histories(
@@ -92,6 +95,7 @@ class ResearchRecorder:
         symbols: Iterable[str],
         limit: int,
         interval_ms: int = 5 * 60 * 1000,
+        expected_provenance: Mapping[str, Any] | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         """Load recent persisted point-in-time rows for state recovery.
 
@@ -105,6 +109,10 @@ class ResearchRecorder:
             return result
 
         horizon_ms = max(limit * interval_ms * 2, 6 * 60 * 60 * 1000)
+        expected = {str(k): v for k, v in (expected_provenance or {}).items()}
+
+        def provenance_matches(payload: dict[str, Any]) -> bool:
+            return all(payload.get(key) == value for key, value in expected.items())
         start_ms = int(before_timestamp_ms) - horizon_ms
 
         shard_paths = sorted(self.shard_dir.glob("**/*.jsonl"))
@@ -134,6 +142,8 @@ class ResearchRecorder:
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                     continue
                 if symbol not in wanted or timestamp_ms < start_ms or timestamp_ms >= before_timestamp_ms:
+                    continue
+                if not provenance_matches(payload):
                     continue
                 current = candidates[symbol].get(timestamp_ms)
                 if current is None:
@@ -195,7 +205,9 @@ class ResearchRecorder:
                         key = (str(payload["symbol"]).upper(), int(payload["timestamp_ms"]))
                     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                         continue
-                    records[key] = payload_json
+                    # Persistent hourly shards are authoritative. The local SQLite
+                    # cache is only a fallback for keys absent from the shards.
+                    records.setdefault(key, payload_json)
 
         output.parent.mkdir(parents=True, exist_ok=True)
         with output.open("w", encoding="utf-8") as fh:

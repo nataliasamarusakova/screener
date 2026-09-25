@@ -9,6 +9,8 @@ from __future__ import annotations
 import numpy as np
 import numba
 
+VPIN_ESTIMATE_METHOD = "INTRABAR_VOLUME_BUCKET_PROXY"
+
 
 @numba.njit(fastmath=True, nogil=True)
 def compute_weighted_obi_jit(
