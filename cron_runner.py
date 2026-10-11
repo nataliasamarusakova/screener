@@ -10,6 +10,7 @@ from pathlib import Path
 from binance_ingestion import BinanceRestrictedLocationError
 from engine.circuit_breaker import CircuitBreaker
 from engine.screener import QuantScreener, save_latest_scan_json
+from engine.level_retest_scanner import run_level_retest_mode
 from engine.telegram import TelegramAlerter, TelegramDispatchError
 from engine.risk_guard import RiskGuard
 from engine.signal_ledger import append_signal_events
@@ -47,13 +48,32 @@ def finalize_research_rows(
 
 
 async def main() -> None:
-    top_n = int(os.environ.get("TOP_N_SYMBOLS", "100"))
     concurrency = int(os.environ.get("SCAN_CONCURRENCY", "25"))
     paper_trading = os.environ.get("PAPER_TRADING", "0") == "1"
 
     # Создаем папку data, если её нет
     data_dir = Path("data")
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Independent research-only mode: 12h former-high support retests.
+    # It deliberately bypasses the 5m trading risk gate because it emits
+    # pattern observations/alerts only and never submits orders.
+    screener_mode = os.getenv("SCREENER_MODE", "quant_5m").strip().lower()
+    if screener_mode == "level_retest_12h":
+        await run_level_retest_mode(
+            data_dir=data_dir,
+            # The 12h mode controls its universe with LEVEL_RETEST_* settings;
+            # don't inherit the legacy 5m TOP_N_SYMBOLS cap.
+            concurrency_limit=concurrency,
+        )
+        return
+    if screener_mode != "quant_5m":
+        raise ValueError(
+            f"Unsupported SCREENER_MODE={screener_mode!r}; expected 'quant_5m' or 'level_retest_12h'"
+        )
+
+    # Legacy 5m universe size; independent from the standalone 12h mode.
+    top_n = int(os.environ.get("TOP_N_SYMBOLS", "100"))
 
     # NEW: circuit breaker check
     breaker = CircuitBreaker(

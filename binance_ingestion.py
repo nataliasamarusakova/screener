@@ -884,6 +884,89 @@ class BinanceFuturesIngestion:
             return None
         return data
 
+    async def fetch_symbol_12h_klines_with_current(
+        self,
+        symbol: str,
+        *,
+        history_bars: int = 100,
+    ) -> Optional[List[list]]:
+        """Fetch `history_bars` completed 12h candles plus the currently forming candle.
+
+        The current candle is returned last so a pattern detector can use its live
+        low together with the latest ticker price. Structural pivots and breakouts
+        must still be evaluated from completed candles only.
+        """
+        interval_ms = 12 * 60 * 60 * 1000
+        now_ms = int(time.time() * 1000)
+        current_open_ms = now_ms - (now_ms % interval_ms)
+        if history_bars < 20 or history_bars > 1499:
+            raise ValueError("history_bars must be between 20 and 1499")
+        start_ms = current_open_ms - history_bars * interval_ms
+        limit = history_bars + 1
+        url = f"{self.REST_BASE_URL}/fapi/v1/klines"
+        data = await self._request_json(
+            "GET", url,
+            params={
+                "symbol": symbol,
+                "interval": "12h",
+                "startTime": str(start_ms),
+                "endTime": str(now_ms),
+                "limit": str(limit),
+            },
+            weight=2 if limit < 500 else (5 if limit <= 1000 else 10),
+            symbol=symbol,
+        )
+        expected_count = history_bars + 1
+        # Recently listed contracts may legitimately have fewer than `history_bars`
+        # historical candles. Accept a shorter contiguous window, provided it still
+        # contains at least 20 completed candles plus the current candle; the caller
+        # and detector then decide whether the history is sufficient for a setup.
+        if (
+            not isinstance(data, list)
+            or len(data) < 21
+            or len(data) > expected_count
+        ):
+            logger.warning(
+                "kline_12h_window_incomplete symbol=%s expected_max=%d minimum=21 actual=%s",
+                symbol, expected_count, len(data) if isinstance(data, list) else None,
+            )
+            return None
+
+        actual_opens: List[int] = []
+        for row in data:
+            if not isinstance(row, list) or len(row) < 12:
+                return None
+            try:
+                open_ms = int(row[0])
+                close_ms = int(row[6])
+                numeric = [float(row[i]) for i in (1, 2, 3, 4, 5, 9)]
+            except (TypeError, ValueError):
+                return None
+            if not all(math.isfinite(value) for value in numeric):
+                return None
+            if min(numeric[0:4]) <= 0.0 or numeric[4] < 0.0 or numeric[5] < 0.0:
+                return None
+            if close_ms != open_ms + interval_ms - 1:
+                return None
+            actual_opens.append(open_ms)
+        contiguous = all(
+            actual_opens[index + 1] - actual_opens[index] == interval_ms
+            for index in range(len(actual_opens) - 1)
+        )
+        if (
+            not actual_opens
+            or actual_opens[0] < start_ms
+            or actual_opens[-1] != current_open_ms
+            or not contiguous
+        ):
+            logger.warning(
+                "kline_12h_window_gap symbol=%s expected_start_at_or_after=%d actual_first=%s expected_last=%d actual_last=%s",
+                symbol, start_ms, actual_opens[0] if actual_opens else None,
+                current_open_ms, actual_opens[-1] if actual_opens else None,
+            )
+            return None
+        return data
+
     async def fetch_symbol_open_interest_history(
         self,
         symbol: str,
