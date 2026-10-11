@@ -4,6 +4,15 @@ on:
   repository_dispatch:
     types: [run_quant_engine]
   workflow_dispatch:
+    inputs:
+      screener_mode:
+        description: "Scanner mode (12h resistance flip is research/alerts only)"
+        required: true
+        default: quant_5m
+        type: choice
+        options:
+          - quant_5m
+          - level_retest_12h
 
 permissions:
   contents: write
@@ -14,12 +23,17 @@ concurrency:
 
 jobs:
   run-screener:
-    name: Execute 5-Min Quant Screener
+    name: Execute Selected Screener Mode
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     env:
+      SCREENER_MODE: ${{ inputs.screener_mode || github.event.client_payload.screener_mode || 'quant_5m' }}
       TOP_N_SYMBOLS: "100"
+      # 12h pattern mode scans the full eligible USDT-M Futures universe by default.
+      # Set a positive cap or minimum volume only when intentionally narrowing it.
+      LEVEL_RETEST_TOP_N_SYMBOLS: "0"
+      LEVEL_RETEST_MIN_24H_VOLUME_USDT: "0"
       SCAN_CONCURRENCY: "25"
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       TG_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
@@ -97,7 +111,7 @@ jobs:
           echo "=== Active Outbound IP via VPN ==="
           curl -s --max-time 10 https://ipinfo.io/json | grep -E "ip|country|city|org" || true
 
-      - name: Run 5-Minute Quant Screener
+      - name: Run Selected Screener Mode
         run: python cron_runner.py
 
       - name: Disconnect WireGuard VPN
@@ -114,7 +128,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
+
           # Авторизация через x-access-token
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
