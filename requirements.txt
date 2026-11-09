@@ -1,0 +1,6 @@
+beautifulsoup4>=4.12,<5
+lxml>=5,<7
+playwright==1.62.0
+playwright-stealth>=2.0,<3
+requests>=2.32,<3
+pytest>=8,<9
