@@ -2,5 +2,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.py[cod]
-reports/*
 playwright/.cache/
+
+# Per-invocation diagnostics are local to a runner; durable P1 state is snapshots + notifications.
+data/runs.jsonl
