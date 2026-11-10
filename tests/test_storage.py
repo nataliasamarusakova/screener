@@ -177,3 +177,24 @@ def test_notification_delivery_state_is_per_recipient_and_legacy_rows_are_broadc
     assert store.notification_exists(legacy_event, "chat-b") is True
     assert store.notification_due(legacy_event, 4, "chat-a") is False
     assert store.notification_due(legacy_event, 4, "chat-b") is False
+
+
+def test_snapshot_due_samples_only_near_the_four_hour_p1_interval(tmp_path):
+    base = datetime(2026, 11, 10, 8, 0, tzinfo=timezone.utc)
+    store = Store(tmp_path / "sample-data")
+    store.add_snapshot(base, "PERPETUAL", [_row()])
+    assert store.snapshot_due(base + timedelta(hours=3, minutes=49), interval_hours=4, tolerance_minutes=10) is False
+    assert store.snapshot_due(base + timedelta(hours=3, minutes=50), interval_hours=4, tolerance_minutes=10) is True
+    assert store.snapshot_due(base + timedelta(hours=4), interval_hours=4, tolerance_minutes=10) is True
+
+
+def test_latest_notification_state_tracks_transition_per_recipient(tmp_path):
+    store = Store(tmp_path / "data")
+    group = "STRKUSDT_PERP.A|LONG A — Trend Continuation"
+    store.record_notification("event-A", 1, chat_id="chat-1", event_group=group, fingerprint="A")
+    assert store.latest_notification_state(group, "chat-1")["fingerprint"] == "A"
+    assert store.latest_notification_state(group, "chat-2") is None
+    store.record_notification("event-B", 2, chat_id="chat-1", event_group=group, fingerprint="B")
+    assert store.latest_notification_state(group, "chat-1")["fingerprint"] == "B"
+    store.record_notification("event-A-again", 3, chat_id="chat-1", event_group=group, fingerprint="A")
+    assert store.latest_notification_state(group, "chat-1")["fingerprint"] == "A"

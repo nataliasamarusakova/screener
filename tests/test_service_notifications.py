@@ -47,7 +47,9 @@ def test_unchanged_table_suppresses_duplicate_notification_without_name_error():
     )
 
     assert notifications == []
-    assert store.exists_calls == ["ETHUSDT_PERP|LONG A|OBSERVATION"]
+    assert len(store.exists_calls) == 1
+    assert store.exists_calls[0].startswith("ETHUSDT_PERP|LONG A|")
+    assert len(store.exists_calls[0].rsplit("|", 1)[1]) == 20
     assert store.due_calls == []
 
 
@@ -176,6 +178,8 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
     first = service.run_scan_once(settings, dry_run=True)
     assert first["status"] == "OK"
     assert first["rows"] == 20
+    assert first["snapshot_saved"] is True
+    assert any(item.get("type") == "market_summary" for item in first["notifications"])
     assert any(item.status == "OBSERVATION" for item in first["results"])
     assert "output_paths" not in first
     assert not (tmp_path / "reports").exists()
@@ -185,11 +189,16 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
     assert (settings.data_dir / "runs.jsonl").exists()
 
     store = Store(settings.data_dir)
-    store.record_notification("ALT0USDT_PERP.A|LONG A — Trend Continuation|OBSERVATION", "fixture")
+    prior_result = next(item for item in first["results"] if item.status == "OBSERVATION")
+    event_fingerprint = service._scenario_event_fingerprint(prior_result)
+    store.record_notification(
+        f"{prior_result.symbol}|{prior_result.scenario}|{event_fingerprint}", "fixture"
+    )
     scraped.fetched_at = fixed_time + timedelta(minutes=30)
     second = service.run_scan_once(settings, dry_run=True)
     assert second["no_new_coinalyze_data"] is True
-    assert not any(item.get("type") == "scenario" for item in second["notifications"])
+    assert second["snapshot_saved"] is False
+    assert not any(item.get("type") in {"scenario", "market_summary"} for item in second["notifications"])
     # Polling an identical table must not move the observation timestamp forward.
     latest_history = store.recent_symbol_history("ALT0USDT_PERP.A", limit=5)
     assert latest_history[-1]["snapshot_at"] == fixed_time.isoformat()
@@ -258,7 +267,7 @@ def test_telegram_alert_shows_oi_usd_funding_divergence_and_graph_context():
     assert "контртрендовая ситуация" in message
 
 
-def test_funding_sign_reversal_is_sent_as_observation_with_warning():
+def test_funding_sign_reversal_is_sent_as_observation_with_warning(tmp_path):
     from screener.telegram import format_alert
     from screener.scenarios import evaluate_scenarios
 
@@ -293,8 +302,9 @@ def test_funding_sign_reversal_is_sent_as_observation_with_warning():
         telegram_bot_token="", telegram_chat_ids=[], telegram_send_wait_states=True,
         telegram_cooldown_hours=4,
     )
+    from screener.storage import Store
     deliveries = _collect_notifications(
-        [long_a], enriched, settings, FakeStore(),
+        [long_a], enriched, settings, Store(tmp_path / "funding-state"),
         contract_alerts_allowed=True, dry_run=True,
     )
     scenario_delivery = next(item for item in deliveries if item.get("type") == "scenario")
@@ -477,3 +487,237 @@ def test_pons_long_a_five_of_six_not_sent_as_observation_after_rank_fix():
         dry_run=True, no_new_data=False,
     )
     assert outcomes == []
+
+
+def test_scenario_notification_fingerprint_changes_on_chart_state_transition():
+    from screener.service import _scenario_event_fingerprint
+
+    base = ScenarioResult(
+        symbol="STRKUSDT_PERP.A", name="STRK", scenario="LONG A — Trend Continuation",
+        direction="LONG", checks=[Check("flow", True, "positive", ">0")],
+        quality_flags=[], status="OBSERVATION",
+        technical={
+            "context_4h": {"trend": "EMA20 < EMA50", "ema20": 1.0, "ema50": 1.1,
+                           "last_close": 1.05, "last_confirmed_support": 1.0},
+            "trend_retest_long": {"confirmed": False, "level": 1.04},
+        },
+    )
+    same = base
+    confirmed = ScenarioResult(
+        symbol=base.symbol, name=base.name, scenario=base.scenario, direction=base.direction,
+        checks=list(base.checks), quality_flags=[], status="OBSERVATION",
+        technical={
+            "context_4h": {"trend": "EMA20 < EMA50", "ema20": 1.0, "ema50": 1.1,
+                           "last_close": 1.05, "last_confirmed_support": 1.0},
+            "trend_retest_long": {"confirmed": True, "level": 1.04, "retest_open_time_ms": 1790000000000},
+        },
+    )
+    assert _scenario_event_fingerprint(base) == _scenario_event_fingerprint(same)
+    assert _scenario_event_fingerprint(base) != _scenario_event_fingerprint(confirmed)
+
+
+def test_market_summary_key_is_stable_per_saved_snapshot():
+    from datetime import datetime, timezone
+    from screener.service import _market_summary_event_key
+
+    first = datetime(2026, 11, 10, 12, 1, tzinfo=timezone.utc)
+    same_snapshot = datetime(2026, 11, 10, 12, 1, tzinfo=timezone.utc)
+    next_snapshot = datetime(2026, 11, 10, 15, 55, tzinfo=timezone.utc)
+    assert _market_summary_event_key("PERPETUAL", first) == _market_summary_event_key("PERPETUAL", same_snapshot)
+    assert _market_summary_event_key("PERPETUAL", first) != _market_summary_event_key("PERPETUAL", next_snapshot)
+
+
+def test_telegram_alert_includes_15m_timing_context_and_scenario_invalidation():
+    from screener.telegram import format_alert
+
+    market = MarketRow(symbol="STRKUSDT_PERP.A", name="STRK", price=1.0, chg24_pct=2.0)
+    enriched, _ = analyze_universe([market], {"thresholds": {}})
+    result = ScenarioResult(
+        symbol=market.symbol, name=market.name, scenario="LONG A — Trend Continuation",
+        direction="LONG", checks=[Check("flow", True, "yes", "rule")],
+        quality_flags=[], status="OBSERVATION",
+        technical={
+            "context_4h": {"trend": "EMA20 < EMA50", "ema20": 1.0, "ema50": 1.1,
+                           "last_close": 1.05, "last_confirmed_support": 1.0},
+            "trend_retest_long": {"confirmed": True, "level": 1.04, "retest_open_time_ms": 1790000000000},
+            "higher_low": {"confirmed": True, "latest_low": 0.98},
+            "context_15m": {"direction": "BULLISH", "last_closed_change_pct": 0.42},
+        },
+    )
+    message = format_alert(result, enriched[0])
+    assert "15m контекст (последняя закрытая свеча): бычья" in message
+    assert "изменение +0,42%" in message
+    assert "Уровень отмены сценария" in message
+    assert "закрытие 1H ниже уровня отменяет LONG" in message
+    assert "уровень пробоя и ретеста 1H" in message
+
+
+def test_telegram_client_retries_rate_limit_once_then_succeeds(monkeypatch):
+    from screener.telegram import TelegramClient
+    import screener.telegram as telegram_module
+
+    calls = []
+
+    class Response:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self.payload = payload
+            self.headers = {}
+
+        def json(self):
+            return self.payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise telegram_module.requests.HTTPError(f"HTTP {self.status_code}")
+
+    responses = [
+        Response(429, {"ok": False, "parameters": {"retry_after": 1}}),
+        Response(200, {"ok": True, "result": {"message_id": 77}}),
+    ]
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs)
+        return responses.pop(0)
+
+    sleeps = []
+    monkeypatch.setattr(telegram_module.requests, "post", fake_post)
+    monkeypatch.setattr(telegram_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+    client = TelegramClient("token", ["chat-1"])
+    result = client.send("test message")
+
+    assert len(calls) == 2
+    assert sleeps == [1.0]
+    assert result == [{"chat_id": "chat-1", "sent": True, "message_id": 77}]
+
+
+def test_safe_truncation_keeps_html_well_formed_and_respects_telegram_limit():
+    from html.parser import HTMLParser
+    from screener.telegram import _safe_telegram_truncate, DISCLAIMER
+
+    raw = "<b>" + ("A & B < C " * 900) + "</b>" + DISCLAIMER
+    result = _safe_telegram_truncate(raw, limit=3900)
+    assert len(result) <= 3900
+    assert "<b>" not in result
+    assert "&amp;" in result
+    assert result.endswith(DISCLAIMER)
+    parser = HTMLParser()
+    parser.feed(result)
+    parser.close()
+
+
+def test_scenario_state_transitions_are_delivered_even_when_state_returns_to_previous_value(tmp_path, monkeypatch):
+    import screener.service as service
+    from screener.storage import Store
+
+    market = MarketRow(
+        symbol="STRKUSDT_PERP.A", name="STRK", price=1.0, chg24_pct=2.0,
+        futures_imbalance_4h=8.0, spot_imbalance_4h=2.0,
+        oi_chg4h_pct=1.2, oi_chg4h_usd=2_500_000,
+        fr_oiw_pct=0.005, pfr_oiw_pct=0.004, ls_ratio_1d=1.2,
+    )
+    enriched, _ = analyze_universe([market], {"thresholds": {}})
+    settings = SimpleNamespace(
+        telegram_bot_token="token", telegram_chat_ids=["chat-1"],
+        telegram_send_wait_states=True, telegram_cooldown_hours=4,
+    )
+    store = Store(tmp_path / "state")
+    sent = []
+
+    class FakeTelegram:
+        def __init__(self, token, chat_ids):
+            self.chat_ids = chat_ids
+
+        @property
+        def configured(self):
+            return True
+
+        def send(self, message, chat_ids=None):
+            recipients = self.chat_ids if chat_ids is None else chat_ids
+            sent.append(message)
+            return [{"chat_id": chat_id, "sent": True, "message_id": len(sent)} for chat_id in recipients]
+
+    monkeypatch.setattr(service, "TelegramClient", FakeTelegram)
+
+    def make_result(retest_confirmed):
+        return ScenarioResult(
+            symbol=market.symbol, name=market.name,
+            scenario="LONG A — Trend Continuation", direction="LONG",
+            checks=[Check("flow", True, "ok", ">0")], quality_flags=[], status="OBSERVATION",
+            technical={
+                "context_4h": {"trend": "EMA20 < EMA50", "ema20": 1.0, "ema50": 1.1,
+                               "last_close": 1.05, "last_confirmed_support": 1.0},
+                "trend_retest_long": {"confirmed": retest_confirmed, "level": 1.04},
+            },
+        )
+
+    # State A is delivered, then transition B is delivered immediately despite the four-hour cooldown.
+    first = make_result(False)
+    out_a = _collect_notifications(
+        [first], enriched, settings, store, True, False, no_new_data=True,
+    )
+    assert len(sent) == 1 and out_a[0]["sent"] is True
+
+    second = make_result(True)
+    out_b = _collect_notifications(
+        [second], enriched, settings, store, True, False, no_new_data=True,
+    )
+    assert len(sent) == 2 and out_b[0]["sent"] is True
+
+    # Returning to a previously seen fingerprint is still a new transition relative to last state B.
+    out_a_again = _collect_notifications(
+        [first], enriched, settings, store, True, False, no_new_data=True,
+    )
+    assert len(sent) == 3 and out_a_again[0]["sent"] is True
+
+    # Stable state A is not repeated on the next unchanged poll.
+    out_stable = _collect_notifications(
+        [first], enriched, settings, store, True, False, no_new_data=True,
+    )
+    assert out_stable == []
+    assert len(sent) == 3
+
+
+def test_technical_for_symbol_uses_closed_15m_and_derives_24h_low_from_closed_1h():
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from screener.models import Candle
+    from screener.service import _technical_for_symbol
+
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    intervals = {"4h": 4 * 60 * 60 * 1000, "1h": 60 * 60 * 1000, "15m": 15 * 60 * 1000}
+
+    class FakeBinance:
+        def fetch_candles(self, symbol, interval, limit):
+            interval_ms = intervals[interval]
+            rows = []
+            count = 100
+            for index in range(count):
+                open_time = now_ms - (count - index) * interval_ms
+                open_price = 100.0 + index * 0.01
+                close_price = open_price + (0.5 if interval == "15m" and index == count - 1 else 0.05)
+                low = open_price - 0.2
+                if interval == "1h" and index == count - 2:
+                    low = 95.0
+                high = max(open_price, close_price) + 0.2
+                rows.append(Candle(
+                    open_time_ms=open_time,
+                    close_time_ms=open_time + interval_ms - 1,
+                    open=open_price, high=high, low=low, close=close_price,
+                    volume=1000, quote_volume=100000, trades=100,
+                ))
+            return rows
+
+    settings = SimpleNamespace(
+        p1={"structure": {}, "scanner": {"fetch_15m_context": True}},
+        binance_kline_limit=100,
+        binance_fetch_orderbook=False,
+        execution_notional_usd=0.0,
+        trading_fee_bps_per_side=5.0,
+    )
+    technical = _technical_for_symbol(FakeBinance(), "STRKUSDT_PERP.A", settings)
+    assert technical["context_15m"]["direction"] == "BULLISH"
+    assert technical["context_15m"]["last_closed_change_pct"] > 0
+    assert technical["context_15m"]["source"] == "last closed Binance 15m candle"
+    assert technical["range_24h_1h"]["low"] == 95.0
+    assert technical["range_24h_1h"]["distance_from_low_pct"] is not None

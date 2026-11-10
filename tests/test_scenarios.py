@@ -179,3 +179,18 @@ def test_grass_keeps_six_of_six_but_surfaces_funding_sign_reversal_warning():
     assert "qualitative warning only" in long_a.reason
     assert any("changes sign versus current FR" in note for note in enriched[0].diagnostic_notes)
     assert "OI 4H change is small in USD" in enriched[0].diagnostic_notes
+
+
+def test_oi_growth_threshold_uses_exact_major_asset_codes_only():
+    from screener.scenarios import _oi_growth_min, _symbol_base
+
+    thresholds = {"oi_4h_major_pct": 0.3, "oi_4h_alt_pct": 1.0}
+    assert _symbol_base("BTCUSDT_PERP.A") == "BTC"
+    assert _symbol_base("ETHUSDT_PERP.A") == "ETH"
+    assert _symbol_base("ETHFIUSDT_PERP.A") == "ETHFI"
+    assert _symbol_base("ETHWUSDT_PERP.A") == "ETHW"
+    assert _symbol_base("BTCDOMUSDT_PERP.A") == "BTCDOM"
+    assert _oi_growth_min("BTCUSDT_PERP.A", thresholds) == 0.3
+    assert _oi_growth_min("ETHUSDT_PERP.A", thresholds) == 0.3
+    for symbol in ("ETHFIUSDT_PERP.A", "ETHWUSDT_PERP.A", "BTCDOMUSDT_PERP.A", "STRKUSDT_PERP.A"):
+        assert _oi_growth_min(symbol, thresholds) == 1.0
