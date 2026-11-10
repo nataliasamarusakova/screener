@@ -35,12 +35,26 @@ def _no_flags(flags: list[str]) -> bool:
 
 
 def _symbol_base(symbol: str) -> str:
-    return symbol.upper().split(".", 1)[0].replace("_PERP", "").replace("-PERP", "")
+    value = str(symbol or "").upper().strip().split(".", 1)[0]
+    for suffix in ("_PERPETUAL", "-PERPETUAL", "_PERP", "-PERP", "PERPETUAL", "PERP", "_SWAP", "-SWAP"):
+        if value.endswith(suffix):
+            value = value[:-len(suffix)]
+            break
+    for quote in ("USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USD", "BTC", "ETH", "BNB", "EUR"):
+        if value.endswith(quote) and len(value) > len(quote):
+            value = value[:-len(quote)]
+            break
+    return value
 
 
 def _oi_growth_min(symbol: str, thresholds: dict[str, Any]) -> float:
-    base = _symbol_base(symbol)
-    return float(thresholds.get("oi_4h_major_pct", 0.3) if base.startswith(("BTC", "ETH")) else thresholds.get("oi_4h_alt_pct", 1.0))
+    # P1's lower major-asset threshold applies to BTC and ETH only. Prefix
+    # matching incorrectly classified ETHFI/ETHW/BTCDOM as majors.
+    base_asset = _symbol_base(symbol)
+    is_major = base_asset in {"BTC", "ETH"}
+    key = "oi_4h_major_pct" if is_major else "oi_4h_alt_pct"
+    default = 0.3 if is_major else 1.0
+    return float(thresholds.get(key, default))
 
 
 def _result(row: EnrichedRow, scenario: str, direction: str, checks: list[Check], status: str = "NOT_MET", reason: str = "", technical: dict[str, Any] | None = None) -> ScenarioResult:

@@ -3,6 +3,8 @@ from __future__ import annotations
 import html
 import logging
 import math
+import time
+from html.parser import HTMLParser
 from datetime import datetime, timezone
 from typing import Any
 
@@ -10,12 +12,51 @@ import requests
 
 from .metrics import EnrichedRow, _rank_tail_count
 from .models import MarketStats, ScenarioResult
+from .structure import scenario_invalidation
 
 log = logging.getLogger(__name__)
 DISCLAIMER = (
     "\n\n<i>Наблюдение по P1, не торговый сигнал и не команда на вход. "
     "Вход требует проверки графика и риска. Параметры P1 не проходили backtest.</i>"
 )
+
+
+class _PlainTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def _safe_telegram_truncate(message: str, limit: int = 3900) -> str:
+    """Keep the Telegram message within the limit without cutting HTML tags."""
+    if len(message) <= limit:
+        return message
+    parser = _PlainTextExtractor()
+    parser.feed(message)
+    plain = "".join(parser.parts)
+    disclaimer_plain = (
+        "Наблюдение по P1, не торговый сигнал и не команда на вход. "
+        "Вход требует проверки графика и риска. Параметры P1 не проходили backtest."
+    )
+    if plain.endswith(disclaimer_plain):
+        body = plain[:-len(disclaimer_plain)].rstrip()
+    else:
+        body = plain.rstrip()
+    suffix = "…\n\n" + DISCLAIMER
+    budget = max(0, limit - len(suffix))
+    # Escaping can expand text (for example '&' -> '&amp;'), so choose the
+    # longest prefix by escaped length rather than slicing raw characters.
+    low, high = 0, min(len(body), budget)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(html.escape(body[:middle].rstrip(), quote=False)) <= budget:
+            low = middle
+        else:
+            high = middle - 1
+    return html.escape(body[:low].rstrip(), quote=False) + suffix
 
 
 def _esc(value: Any) -> str:
@@ -175,6 +216,51 @@ def _technical_bullets(result: ScenarioResult, technical: dict[str, Any]) -> lis
             bullets.append("Последовательность положительного Spot Imbalance не подтверждена.")
         else:
             bullets.append("Истории 4H Spot Imbalance недостаточно.")
+
+    context15 = technical.get("context_15m") or {}
+    if isinstance(context15, dict) and isinstance(context15.get("last_closed_change_pct"), (int, float)):
+        direction15 = str(context15.get("direction") or "UNKNOWN").upper()
+        direction_label = {"BULLISH": "бычья", "BEARISH": "медвежья", "DOJI": "нейтральная"}.get(direction15, "неизвестная")
+        bullets.append(
+            f"15m контекст (последняя закрытая свеча): {direction_label}, "
+            f"изменение {_number(context15.get('last_closed_change_pct'), 2, signed=True)}%. "
+            "Это контекст тайминга, не отдельное условие P1."
+        )
+    elif isinstance(context15, dict) and context15.get("error"):
+        bullets.append("15m контекст недоступен; отдельного формального числового порога для него P1 не задаёт.")
+
+    range24 = technical.get("range_24h_1h") or {}
+    distance_low = range24.get("distance_from_low_pct") if isinstance(range24, dict) else None
+    low24 = range24.get("low") if isinstance(range24, dict) else None
+    if isinstance(low24, (int, float)) and isinstance(distance_low, (int, float)):
+        bullets.append(
+            f"Диапазон Binance 24H по закрытым 1H свечам: low {_number(low24, 8)}, "
+            f"закрытие выше low на {_number(distance_low, 2)}%. "
+            "P1 не задаёт числовую границу слова «рядом с минимумом»; это справочная оценка."
+        )
+
+    invalidation = scenario_invalidation(result.direction, result.scenario, technical)
+    if isinstance(invalidation.get("level"), (int, float)):
+        if result.direction.upper() == "LONG":
+            invalidation_rule = "закрытие 1H ниже уровня отменяет LONG"
+        else:
+            invalidation_rule = "закрытие 1H выше уровня отменяет SHORT"
+        source_labels = {
+            "latest confirmed 1H higher-low pivot": "последний подтверждённый минимум Higher Low 1H",
+            "1H breakout/retest level": "уровень пробоя и ретеста 1H",
+            "1H weak-bounce resistance": "сопротивление слабого 1H-отскока",
+            "failed 1H breakout level": "уровень неудавшегося пробоя 1H",
+            "1H bearish structure level": "уровень медвежьей структуры 1H",
+            "1H swing-low structure level": "уровень минимума структуры 1H",
+            "1H breakdown/retest level": "уровень пробоя и ретеста вниз 1H",
+        }
+        source_label = source_labels.get(str(invalidation.get("source")), str(invalidation.get("source") or "источник не определён"))
+        bullets.append(
+            f"Уровень отмены сценария: {_number(invalidation['level'], 8)}; "
+            f"{invalidation_rule} ({source_label})."
+        )
+    else:
+        bullets.append("Уровень отмены сценария по закрытым 1H свечам: не определён — не придумывать уровень.")
     return bullets
 
 
@@ -349,9 +435,7 @@ def format_alert(
 
     lines.extend(["", f"<b>Вывод:</b> {_esc(_conclusion(result, row, technical))}"])
     text = "\n".join(lines) + DISCLAIMER
-    if len(text) > 3900:
-        text = text[: 3900 - len(DISCLAIMER) - 2].rstrip() + "…" + DISCLAIMER
-    return text
+    return _safe_telegram_truncate(text)
 
 
 def _share(count: int, total: int) -> str:
@@ -523,9 +607,7 @@ def format_market_summary(
         "P1 — стартовые гипотезы без backtest; по одному показателю вход не определяется.",
     ])
     text = "\n".join(lines)
-    if len(text) > 3900:
-        text = text[:3897].rstrip() + "…"
-    return text
+    return _safe_telegram_truncate(text)
 
 
 class TelegramClient:
@@ -548,24 +630,46 @@ class TelegramClient:
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         results: list[dict[str, Any]] = []
         for chat_id in recipients:
-            try:
-                response = requests.post(
-                    url,
-                    json={
-                        "chat_id": chat_id,
-                        "text": text,
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": True,
-                    },
-                    timeout=self.timeout_sec,
-                )
-                response.raise_for_status()
-                payload = response.json()
-                if not payload.get("ok"):
-                    raise RuntimeError(payload.get("description", "Telegram API returned ok=false"))
-                message_id = (payload.get("result") or {}).get("message_id")
-                results.append({"chat_id": chat_id, "sent": True, "message_id": message_id})
-            except (requests.RequestException, ValueError, RuntimeError) as exc:
-                log.exception("Telegram delivery failed for chat_id=%s", chat_id)
-                results.append({"chat_id": chat_id, "sent": False, "error": str(exc)})
+            last_error: str | None = None
+            for attempt in range(3):
+                try:
+                    response = requests.post(
+                        url,
+                        json={
+                            "chat_id": chat_id,
+                            "text": _safe_telegram_truncate(text),
+                            "parse_mode": "HTML",
+                            "disable_web_page_preview": True,
+                        },
+                        timeout=self.timeout_sec,
+                    )
+                    if response.status_code == 429:
+                        try:
+                            retry_after = float((response.json().get("parameters") or {}).get("retry_after", 1))
+                        except (ValueError, TypeError, AttributeError):
+                            retry_after = 1.0
+                        last_error = f"Telegram rate limit (429); retry_after={retry_after}s"
+                        if attempt < 2:
+                            time.sleep(min(max(retry_after, 1.0), 30.0))
+                            continue
+                        raise RuntimeError(last_error)
+                    if response.status_code >= 500 and attempt < 2:
+                        last_error = f"Telegram server error {response.status_code}"
+                        time.sleep(2 ** attempt)
+                        continue
+                    response.raise_for_status()
+                    payload = response.json()
+                    if not payload.get("ok"):
+                        raise RuntimeError(payload.get("description", "Telegram API returned ok=false"))
+                    message_id = (payload.get("result") or {}).get("message_id")
+                    results.append({"chat_id": chat_id, "sent": True, "message_id": message_id})
+                    break
+                except (requests.RequestException, ValueError, RuntimeError) as exc:
+                    last_error = str(exc)
+                    if attempt < 2 and isinstance(exc, requests.RequestException):
+                        time.sleep(2 ** attempt)
+                        continue
+                    log.error("Telegram delivery failed for chat_id=%s: %s", chat_id, last_error)
+                    results.append({"chat_id": chat_id, "sent": False, "error": last_error})
+                    break
         return results

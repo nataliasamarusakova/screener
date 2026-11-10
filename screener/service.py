@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import math
 import statistics
 from datetime import datetime, timezone
 from typing import Any
@@ -20,6 +23,7 @@ from .structure import (
     rising_1h,
     weak_bounce_rejection,
     confirmed_pivots,
+    scenario_invalidation,
 )
 from .telegram import TelegramClient, format_alert, format_market_summary
 
@@ -104,6 +108,22 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
             "low": candles1h[-1].low,
             "close": candles1h[-1].close,
         }
+        # The Coinalyze table has no 24H low column. Surface the low derived
+        # from the last 24 *closed* Binance 1H candles, without inventing a
+        # numeric definition of "near the low".
+        last_24h = candles1h[-24:]
+        if last_24h:
+            low_24h = min(candle.low for candle in last_24h)
+            high_24h = max(candle.high for candle in last_24h)
+            last_close = candles1h[-1].close
+            result["range_24h_1h"] = {
+                "low": low_24h,
+                "high": high_24h,
+                "last_closed_close": last_close,
+                "distance_from_low_pct": ((last_close / low_24h) - 1.0) * 100.0 if low_24h > 0 else None,
+                "distance_from_high_pct": ((high_24h / last_close) - 1.0) * 100.0 if last_close > 0 else None,
+                "source": "last 24 closed Binance 1H candles",
+            }
     except Exception as exc:
         result["candle_error_1h"] = str(exc)
         result["higher_low"] = {"confirmed": False, "reason": f"1H candle data unavailable: {exc}"}
@@ -121,9 +141,18 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
         try:
             candles15m = client.fetch_candles(symbol, "15m", settings.binance_kline_limit)
             latest = candles15m[-1]
+            candle_change = ((latest.close / latest.open) - 1.0) * 100.0 if latest.open else None
             result["context_15m"] = {
                 "last_closed_open_time_ms": latest.open_time_ms,
-                "last_closed_change_pct": ((latest.close / latest.open) - 1.0) * 100.0 if latest.open else None,
+                "last_closed_close_time_ms": latest.close_time_ms,
+                "open": latest.open,
+                "high": latest.high,
+                "low": latest.low,
+                "close": latest.close,
+                "last_closed_change_pct": candle_change,
+                "direction": "BULLISH" if latest.close > latest.open else "BEARISH" if latest.close < latest.open else "DOJI",
+                "source": "last closed Binance 15m candle",
+                "use": "entry-timing context only; P1 defines no separate numeric 15m trigger threshold",
             }
         except Exception as exc:
             result["context_15m"] = {"error": str(exc)}
@@ -248,6 +277,89 @@ def _snapshot_deltas(
     return deltas
 
 
+def _fingerprint_number(value: Any) -> Any:
+    if isinstance(value, float):
+        return round(value, 8) if math.isfinite(value) else None
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    return None
+
+
+def _scenario_event_fingerprint(result: ScenarioResult) -> str:
+    """Hash only meaningful scenario/structure state, not every market tick."""
+    technical = result.technical or {}
+    tracked = (
+        "higher_low",
+        "trend_retest_long",
+        "trend_retest_short",
+        "bearish_structure_break",
+        "weak_bounce_rejection",
+        "failed_breakout_rejection",
+    )
+    technical_state: dict[str, Any] = {}
+    for key in tracked:
+        value = technical.get(key)
+        if not isinstance(value, dict):
+            continue
+        technical_state[key] = {
+            field: _fingerprint_number(value.get(field))
+            for field in (
+                "confirmed", "level", "latest_low", "latest_open_time_ms",
+                "breakout_open_time_ms", "retest_open_time_ms", "resistance",
+                "candidate_resistance", "rejection_open_time_ms", "failed_level",
+                "last_close",
+            )
+            if field in value
+        }
+    context_4h = technical.get("context_4h") or {}
+    if isinstance(context_4h, dict):
+        ema20, ema50 = context_4h.get("ema20"), context_4h.get("ema50")
+        technical_state["context_4h"] = {
+            "trend": context_4h.get("trend"),
+            "close_vs_support": (
+                "below" if isinstance(context_4h.get("last_close"), (int, float))
+                and isinstance(context_4h.get("last_confirmed_support"), (int, float))
+                and context_4h["last_close"] < context_4h["last_confirmed_support"]
+                else "above_or_unknown"
+            ),
+            "close_vs_resistance": (
+                "above" if isinstance(context_4h.get("last_close"), (int, float))
+                and isinstance(context_4h.get("last_confirmed_resistance"), (int, float))
+                and context_4h["last_close"] > context_4h["last_confirmed_resistance"]
+                else "below_or_unknown"
+            ),
+            "ema_relation": (
+                "bullish" if isinstance(ema20, (int, float)) and isinstance(ema50, (int, float)) and ema20 > ema50
+                else "bearish" if isinstance(ema20, (int, float)) and isinstance(ema50, (int, float)) and ema20 < ema50
+                else "unknown"
+            ),
+        }
+    context_15m = technical.get("context_15m") or {}
+    if isinstance(context_15m, dict):
+        # Directional change is meaningful for timing; candle timestamp is not
+        # included, avoiding one repeated alert for every new 15m candle.
+        technical_state["context_15m"] = {"direction": context_15m.get("direction")}
+    invalidation = scenario_invalidation(result.direction, result.scenario, technical)
+    payload = {
+        "status": result.status,
+        "checks": [(check.name, check.passed) for check in result.checks],
+        "technical": technical_state,
+        "invalidation": {
+            "level": _fingerprint_number(invalidation.get("level")),
+            "rule": invalidation.get("rule"),
+            "source": invalidation.get("source"),
+        },
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+
+
+def _market_summary_event_key(contract_type: str, fetched_at: datetime) -> str:
+    timestamp = fetched_at if fetched_at.tzinfo else fetched_at.replace(tzinfo=timezone.utc)
+    timestamp = timestamp.astimezone(timezone.utc)
+    return f"MARKET_SUMMARY|{contract_type}|{timestamp.strftime('%Y%m%dT%H%M%SZ')}"
+
+
 def _collect_notifications(
     results: list[ScenarioResult],
     rows: list[EnrichedRow],
@@ -262,6 +374,7 @@ def _collect_notifications(
     contract_type: str = "PERPETUAL",
     snapshot_deltas: dict[str, dict[str, Any]] | None = None,
     missing_columns: list[str] | None = None,
+    emit_market_summary: bool = True,
 ) -> list[dict[str, Any]]:
     by_symbol = {row.symbol: row for row in rows}
     telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_ids)
@@ -274,8 +387,32 @@ def _collect_notifications(
     if not recipients:
         log.warning("No Telegram recipients configured; analysis remains available in dry-run logs")
 
-    def deliver(event_key: str, message: str, *, kind: str, symbol: str | None = None) -> None:
-        if no_new_data:
+    def deliver(
+        event_key: str,
+        message: str,
+        *,
+        kind: str,
+        symbol: str | None = None,
+        event_group: str | None = None,
+        fingerprint: str | None = None,
+    ) -> None:
+        if event_group is not None and fingerprint is not None:
+            pending = []
+            for chat_id in recipients:
+                last_state = store.latest_notification_state(event_group, chat_id)
+                if last_state is None or last_state.get("fingerprint") != fingerprint:
+                    # A new structural state is delivered immediately, even if
+                    # this exact fingerprint appeared before and the cooldown
+                    # has not elapsed (e.g. A -> B -> A).
+                    pending.append(chat_id)
+                elif not no_new_data and store.notification_due(
+                    event_key, settings.telegram_cooldown_hours, chat_id
+                ):
+                    pending.append(chat_id)
+            already_sent_without_recipient_tracking = not recipients and store.notification_exists(event_key)
+            if already_sent_without_recipient_tracking:
+                return
+        elif no_new_data:
             pending = [chat_id for chat_id in recipients if not store.notification_exists(event_key, chat_id)]
             already_sent_without_recipient_tracking = not recipients and store.notification_exists(event_key)
             if already_sent_without_recipient_tracking:
@@ -304,6 +441,8 @@ def _collect_notifications(
                 event_key,
                 item.get("message_id"),
                 chat_id=str(item.get("chat_id")),
+                event_group=event_group,
+                fingerprint=fingerprint,
             )
         outcomes.append({
             "type": kind,
@@ -312,9 +451,10 @@ def _collect_notifications(
             "delivery": delivery,
         })
 
-    if stats is not None and fetched_at is not None and rows:
-        snapshot_hash = store._canonical_snapshot(contract_type, [item.market for item in rows])
-        summary_key = f"MARKET_SUMMARY|{contract_type}|{snapshot_hash}"
+    if emit_market_summary and stats is not None and fetched_at is not None and rows:
+        # One whole-market digest per P1 4H observation window; do not create a
+        # new summary event for every five-minute table change.
+        summary_key = _market_summary_event_key(contract_type, fetched_at)
         summary = format_market_summary(rows, stats, fetched_at, contract_type, missing_columns)
         deliver(summary_key, summary, kind="market_summary")
 
@@ -334,7 +474,8 @@ def _collect_notifications(
         if row is None:
             log.error("Cannot format Telegram notification: market row missing for %s", result.symbol)
             continue
-        key = f"{result.symbol}|{result.scenario}|{result.status}"
+        fingerprint = _scenario_event_fingerprint(result)
+        key = f"{result.symbol}|{result.scenario}|{fingerprint}"
         message = format_alert(
             result,
             row,
@@ -342,7 +483,11 @@ def _collect_notifications(
             fetched_at=fetched_at,
             snapshot_delta=(snapshot_deltas or {}).get(result.symbol),
         )
-        deliver(key, message, kind="scenario", symbol=result.symbol)
+        event_group = f"{result.symbol}|{result.scenario}"
+        deliver(
+            key, message, kind="scenario", symbol=result.symbol,
+            event_group=event_group, fingerprint=fingerprint,
+        )
     return outcomes
 
 
@@ -363,12 +508,26 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             timeout_ms=settings.coinalyze_timeout_ms,
         )
         unchanged = store.snapshot_unchanged(scrape.contract_type, scrape.rows)
-        if not unchanged:
+        snapshot_cfg = settings.p1.get("scenario", {})
+        snapshot_interval_hours = float(snapshot_cfg.get("snapshot_interval_hours", 4.0))
+        snapshot_tolerance_minutes = int(snapshot_cfg.get("snapshot_interval_tolerance_minutes", 10))
+        snapshot_saved = False
+        if not unchanged and store.snapshot_due(
+            scrape.fetched_at,
+            interval_hours=snapshot_interval_hours,
+            tolerance_minutes=snapshot_tolerance_minutes,
+        ):
             store.add_snapshot(scrape.fetched_at, scrape.contract_type, scrape.rows)
+            snapshot_saved = True
         enriched, stats = analyze_universe(scrape.rows, settings.p1)
         if unchanged:
             stats.warnings.append("No new Coinalyze table data: parsed values fully match the previous saved snapshot")
             log.info("Coinalyze values unchanged vs the previous saved snapshot")
+        elif not snapshot_saved:
+            stats.warnings.append(
+                f"Market values changed, but durable history is sampled every ~{snapshot_interval_hours:g}h; "
+                "this poll is not counted as an independent P1 snapshot"
+            )
         if scrape.missing_columns:
             stats.warnings.append("Missing recognized optional/required columns: " + ", ".join(scrape.missing_columns))
         if scrape.missing_required_columns:
@@ -422,6 +581,7 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             contract_type=scrape.contract_type,
             snapshot_deltas=deltas_by_symbol,
             missing_columns=scrape.missing_columns,
+            emit_market_summary=snapshot_saved,
         )
         visible_results = [r for r in results if r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE", "OBSERVATION_AFTER_BOUNCE"}]
         store.finish_run(run_id, len(scrape.rows), len(visible_results), "OK")
@@ -433,6 +593,7 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             "missing_columns": scrape.missing_columns,
             "missing_required_columns": scrape.missing_required_columns,
             "no_new_coinalyze_data": unchanged,
+            "snapshot_saved": snapshot_saved,
             "stats": stats,
             "results": visible_results,
             "notifications": notifications,

@@ -214,6 +214,39 @@ class Store:
             return False
         return previous.get("snapshot_hash") == self._canonical_snapshot(contract_type, rows)
 
+    def snapshot_due(
+        self,
+        fetched_at: datetime,
+        *,
+        interval_hours: float = 4.0,
+        tolerance_minutes: int = 10,
+    ) -> bool:
+        """Persist at most one changed market snapshot per approximate P1 4H window.
+
+        The polling interval may be five minutes, but P1 explicitly says snapshots
+        closer than four hours are overlapping and are not independent observations.
+        The tolerance allows the first poll after the expected four-hour boundary.
+        """
+        manifests = self._snapshot_manifests()
+        if not manifests:
+            return True
+        previous_value = manifests[-1].get("fetched_at")
+        try:
+            previous_at = datetime.fromisoformat(str(previous_value))
+        except (TypeError, ValueError):
+            return True
+        current_at = fetched_at
+        if current_at.tzinfo is None:
+            current_at = current_at.replace(tzinfo=timezone.utc)
+        if previous_at.tzinfo is None:
+            previous_at = previous_at.replace(tzinfo=timezone.utc)
+        elapsed_seconds = (current_at.astimezone(timezone.utc) - previous_at.astimezone(timezone.utc)).total_seconds()
+        required_seconds = max(
+            0.0,
+            max(0.0, float(interval_hours)) * 3600.0 - max(0, int(tolerance_minutes)) * 60.0,
+        )
+        return elapsed_seconds >= required_seconds
+
     def add_snapshot(self, fetched_at: datetime, contract_type: str, rows: list[MarketRow]) -> str:
         snapshot_id = uuid.uuid4().hex
         timestamp = self._utc_iso(fetched_at)
@@ -299,6 +332,17 @@ class Store:
     def notification_exists(self, event_key: str, chat_id: str | None = None) -> bool:
         return bool(self._notification_records(event_key, chat_id))
 
+    def latest_notification_state(self, event_group: str, chat_id: str) -> dict[str, Any] | None:
+        """Return the latest successfully delivered scenario state for one recipient."""
+        recipient = str(chat_id)
+        matching = [
+            item for item in self._read_jsonl(self.notifications_path)
+            if item.get("event_group") == event_group
+            and str(item.get("chat_id")) == recipient
+            and item.get("fingerprint")
+        ]
+        return matching[-1] if matching else None
+
     def notification_due(
         self, event_key: str, cooldown_hours: float, chat_id: str | None = None
     ) -> bool:
@@ -327,6 +371,9 @@ class Store:
         event_key: str,
         message_id: str | int | None = None,
         chat_id: str | None = None,
+        *,
+        event_group: str | None = None,
+        fingerprint: str | None = None,
     ) -> None:
         record: dict[str, Any] = {
             "record_type": "notification",
@@ -336,6 +383,10 @@ class Store:
         }
         if chat_id is not None:
             record["chat_id"] = str(chat_id)
+        if event_group is not None:
+            record["event_group"] = str(event_group)
+        if fingerprint is not None:
+            record["fingerprint"] = str(fingerprint)
         self._append_jsonl(self.notifications_path, record)
 
     def start_run(self) -> str:
