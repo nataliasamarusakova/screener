@@ -89,6 +89,44 @@ jobs:
           echo "VPN_DIR=$vpn_dir" >> "$GITHUB_ENV"
           printf '%s\n' "$WIREGUARD_CONF" > "$vpn_dir/wg.conf"
           chmod 600 "$vpn_dir/wg.conf"
+          # Validate key material without ever printing key values to Actions logs.
+          python - "$vpn_dir/wg.conf" <<'PY'
+          import base64
+          import binascii
+          import sys
+          from pathlib import Path
+
+          sections = {}
+          current = None
+          for raw_line in Path(sys.argv[1]).read_text(encoding="utf-8-sig").splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith(("#", ";")):
+                  continue
+              if line.startswith("[") and line.endswith("]"):
+                  current = line[1:-1].strip().lower()
+                  sections.setdefault(current, {})
+                  continue
+              if current and "=" in line:
+                  key, value = line.split("=", 1)
+                  sections[current][key.strip().lower()] = value.strip()
+
+          required = (("interface", "privatekey"), ("peer", "publickey"))
+          for section, key in required:
+              if key not in sections.get(section, {}):
+                  raise SystemExit(f"Invalid WireGuard config: missing [{section.title()}] {key}.")
+          keys = list(required)
+          if "presharedkey" in sections.get("peer", {}):
+              keys.append(("peer", "presharedkey"))
+          for section, key in keys:
+              value = sections[section][key]
+              try:
+                  decoded = base64.b64decode(value, validate=True)
+              except (ValueError, binascii.Error):
+                  raise SystemExit(f"Invalid WireGuard config: [{section.title()}] {key} is not valid Base64.")
+              if len(decoded) != 32:
+                  raise SystemExit(f"Invalid WireGuard config: [{section.title()}] {key} must decode to 32 bytes.")
+          print("WireGuard key fields: valid Base64 and 32-byte length.")
+          PY
           cat > "$vpn_dir/wireproxy.conf" <<EOF2
           WGConfig = $vpn_dir/wg.conf
 
@@ -96,7 +134,10 @@ jobs:
           BindAddress = 127.0.0.1:18080
           EOF2
           chmod 600 "$vpn_dir/wireproxy.conf"
-          "$HOME/.local/bin/wireproxy" --configtest -c "$vpn_dir/wireproxy.conf"
+          if ! "$HOME/.local/bin/wireproxy" --configtest -c "$vpn_dir/wireproxy.conf" >/dev/null 2>&1; then
+            echo "::error::wireproxy rejected the WireGuard configuration. Key material passed the Base64 check; verify Address, DNS, Endpoint, AllowedIPs and configuration syntax. Raw parser output is suppressed to protect keys."
+            exit 1
+          fi
           "$HOME/.local/bin/wireproxy" -c "$vpn_dir/wireproxy.conf" >"$vpn_dir/wireproxy.log" 2>&1 &
           echo $! > "$vpn_dir/wireproxy.pid"
           for attempt in $(seq 1 30); do
