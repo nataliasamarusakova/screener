@@ -115,7 +115,7 @@ def analyze_universe(rows: list[MarketRow], p1: dict[str, Any]) -> tuple[list[En
         vol_mc = row.vol_mktcap_ratio
         if vol_mc is None and row.volume24_usd is not None and row.market_cap_usd and row.market_cap_usd > 0:
             vol_mc = row.volume24_usd / row.market_cap_usd
-        # Persist derived ratios on the row so reports/guards use the same source of truth.
+        # Persist derived ratios on the row so downstream analysis uses one source of truth.
         if row.oi_vol_ratio is None:
             row.oi_vol_ratio = oi_vol
         if row.vol_mktcap_ratio is None:
@@ -146,8 +146,11 @@ def analyze_universe(rows: list[MarketRow], p1: dict[str, Any]) -> tuple[list[En
             flags.append("SPOT_IMBALANCE_NA")
         if delta_funding is not None:
             notes.append("PFR-vs-FR divergence has no numeric P1 threshold; not auto-flagged")
-        if row.btc_corr7d is not None and row.btc_corr7d > 0.7:
-            notes.append("BTC Correlation 7D > 0.7: treat as BTC-correlated exposure, not an independent position")
+        base_symbol = row.symbol.upper().split(".", 1)[0].replace("_PERP", "").replace("-PERP", "")
+        is_bitcoin = base_symbol in {"BTC", "BTCUSDT", "BTCUSDC", "BTCUSD"}
+        if not is_bitcoin and row.btc_corr7d is not None and abs(row.btc_corr7d) >= 0.7:
+            relation = "positive" if row.btc_corr7d > 0 else "inverse"
+            notes.append(f"BTC Correlation 7D is strong ({relation}); treat as BTC-linked exposure, not an independent position")
         if row.oi_chg4h_usd is not None and abs(row.oi_chg4h_usd) < float(thresholds.get("oi_4h_small_usd", 2_000_000.0)):
             notes.append("OI 4H change is small in USD")
         if voluntary is True:

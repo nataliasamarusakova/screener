@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import html
 import logging
+import math
+import re
 from typing import Any
 
 import requests
 
 from .metrics import EnrichedRow
 from .models import ScenarioResult
-from .structure import scenario_invalidation
 
 log = logging.getLogger(__name__)
+
+DISCLAIMER = (
+    "\n\n<i>Наблюдение по P1, не торговый сигнал и не команда на вход. "
+    "Вход требует проверки графика и риска.</i>"
+)
 
 
 def _esc(value: Any) -> str:
@@ -19,102 +25,224 @@ def _esc(value: Any) -> str:
     return html.escape(str(value), quote=False)
 
 
-def format_alert(result: ScenarioResult, row: EnrichedRow, technical: dict[str, Any] | None = None) -> str:
-    m = row.market
-    technical = technical or result.technical
-    if result.status == "WAIT_BOUNCE":
-        title = f"⚠️ КАСКАД / ЖДАТЬ ОТСКОК — {result.name} ({result.symbol})"
-    elif result.status == "OBSERVATION_AFTER_BOUNCE":
-        title = f"🔴 SHORT ПОСЛЕ ОТСКОКА — НАБЛЮДЕНИЕ — {result.name} ({result.symbol})"
-    elif result.status == "PREPARATION":
-        title = f"🟡 ПОДГОТОВКА LONG — {result.name} ({result.symbol})"
-    elif result.direction == "LONG":
-        title = f"🟢 КАНДИДАТ LONG — {result.name} ({result.symbol})"
+def _decimal(value: float | int | None, precision: int = 2, *, signed: bool = False) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        number = float(value)
+        if not math.isfinite(number):
+            return "n/a"
+        rendered = f"{number:+,.{precision}f}" if signed else f"{number:,.{precision}f}"
+    except (TypeError, ValueError):
+        return "n/a"
+    return rendered.replace(",", "\u0000").replace(".", ",").replace("\u0000", " ")
+
+
+def _percent(value: float | int | None, precision: int = 2, *, signed: bool = True) -> str:
+    rendered = _decimal(value, precision, signed=signed)
+    return f"{rendered}%" if rendered != "n/a" else "n/a"
+
+
+def _display_symbol(symbol: str) -> str:
+    base = str(symbol or "").upper().split(".", 1)[0]
+    base = re.sub(r"[-_]?PERPETUAL$|[-_]?PERP$", "", base)
+    for quote in ("USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USD", "BTC", "ETH", "BNB", "EUR"):
+        if base.endswith(quote) and len(base) > len(quote):
+            base = base[: -len(quote)]
+            break
+    return base or str(symbol)
+
+
+def _scenario_code(scenario: str) -> str:
+    return str(scenario or "").split(" — ", 1)[0].strip() or "SCENARIO"
+
+
+def _confirmed(value: Any) -> bool | None:
+    if not isinstance(value, dict):
+        return None
+    flag = value.get("confirmed")
+    return flag if isinstance(flag, bool) else None
+
+
+def _looks_unavailable(value: dict[str, Any]) -> bool:
+    reason = str(value.get("reason") or "").lower()
+    return any(token in reason for token in ("unavailable", "insufficient candles", "candle data", "error"))
+
+
+def _technical_bullets(result: ScenarioResult, technical: dict[str, Any]) -> list[str]:
+    bullets: list[str] = []
+    context = technical.get("context_4h") or {}
+    ema20, ema50 = context.get("ema20"), context.get("ema50")
+    if isinstance(ema20, (int, float)) and isinstance(ema50, (int, float)):
+        relation = "выше" if ema20 > ema50 else "ниже" if ema20 < ema50 else "на уровне"
+        bullets.append(f"4H EMA20 {relation} EMA50.")
     else:
-        title = f"🔴 КАНДИДАТ SHORT — {result.name} ({result.symbol})"
+        trend = str(context.get("trend") or "")
+        if "unavailable" in trend.lower() or "insufficient" in trend.lower():
+            bullets.append("4H EMA20/EMA50: свечных данных недостаточно.")
+
+    close = context.get("last_close")
+    level_key = "last_confirmed_support" if result.direction.upper() == "LONG" else "last_confirmed_resistance"
+    level = context.get(level_key)
+    level_name = "подтверждённой поддержки" if result.direction.upper() == "LONG" else "подтверждённого сопротивления"
+    if isinstance(close, (int, float)) and isinstance(level, (int, float)):
+        if close < level:
+            relation = "ниже"
+        elif close > level:
+            relation = "выше"
+        else:
+            relation = "на уровне"
+        bullets.append(f"Последнее закрытие 4H {relation} {level_name}.")
+    elif context:
+        bullets.append(f"Уровень {level_name} по 4H: нет данных.")
+    else:
+        bullets.append("4H контекст: нет данных.")
+
+    higher = technical.get("higher_low") or {}
+    higher_state = _confirmed(higher)
+    if higher_state is True:
+        bullets.append("Higher Low подтверждён.")
+    elif higher_state is False:
+        if _looks_unavailable(higher):
+            bullets.append("Higher Low: свечные данные недоступны.")
+        elif "need at least two" in str(higher.get("reason") or "").lower():
+            bullets.append("Higher Low не подтверждён: недостаточно подтверждённых минимумов.")
+        else:
+            bullets.append("Higher Low отсутствует.")
+    else:
+        bullets.append("Higher Low: нет данных.")
+
+    code = _scenario_code(result.scenario)
+    if code == "LONG A":
+        retest = technical.get("trend_retest_long") or technical.get("1h_retest") or {}
+        state = _confirmed(retest)
+        if state is True:
+            bullets.append("LONG retest подтверждён.")
+        elif state is False:
+            bullets.append("LONG retest: свечные данные недоступны." if _looks_unavailable(retest) else "LONG retest не подтверждён.")
+        else:
+            bullets.append("LONG retest: нет данных.")
+    elif code == "SHORT A":
+        retest = technical.get("trend_retest_short") or technical.get("1h_retest") or {}
+        state = _confirmed(retest)
+        if state is True:
+            bullets.append("SHORT retest подтверждён.")
+        elif state is False:
+            bullets.append("SHORT retest: свечные данные недоступны." if _looks_unavailable(retest) else "SHORT retest не подтверждён.")
+        else:
+            bullets.append("SHORT retest: нет данных.")
+    elif code == "SHORT C":
+        structure = technical.get("bearish_structure_break") or {}
+        state = _confirmed(structure)
+        if state is True:
+            bullets.append("Медвежий пробой 1H подтверждён.")
+        elif state is False:
+            bullets.append("Медвежий пробой 1H не подтверждён.")
+    elif code == "SHORT D":
+        structure = technical.get("weak_bounce_rejection") or {}
+        state = _confirmed(structure)
+        if state is True:
+            bullets.append("Отбой слабого 1H-отскока от сопротивления подтверждён.")
+        elif state is False:
+            bullets.append("Отказ от сопротивления после 1H-отскока не подтверждён.")
+    elif code == "SHORT E":
+        structure = technical.get("failed_breakout_rejection") or {}
+        state = _confirmed(structure)
+        if state is True:
+            bullets.append("Ложный пробой вверх на 1H подтверждён.")
+        elif state is False:
+            bullets.append("Ложный пробой вверх на 1H не подтверждён.")
+    return bullets
+
+
+def _conclusion(result: ScenarioResult, technical: dict[str, Any]) -> str:
+    if result.status == "WAIT_BOUNCE":
+        return "Есть признаки каскада ликвидаций. SHORT у локального дна запрещён: ждать слабого отскока и подтверждённого отказа от сопротивления."
+    if result.status == "OBSERVATION_AFTER_BOUNCE":
+        return "Отскок и отказ от сопротивления обнаружены. Это наблюдение, не точка входа; отдельно проверить структуру и риск."
+    if result.status == "TRIGGER":
+        return "Условия P1 совпали, но это не команда на вход. Перед решением обязательны проверка графика, стопа и размера позиции."
+
+    context = technical.get("context_4h") or {}
+    ema20, ema50 = context.get("ema20"), context.get("ema50")
+    close, support = context.get("last_close"), context.get("last_confirmed_support")
+    close_below_support = (
+        isinstance(close, (int, float)) and isinstance(support, (int, float)) and close < support
+    )
+    code = _scenario_code(result.scenario)
+
+    if result.direction.upper() == "LONG":
+        ema_against = isinstance(ema20, (int, float)) and isinstance(ema50, (int, float)) and ema20 < ema50
+        retest = technical.get("trend_retest_long") or technical.get("1h_retest") or {}
+        retest_state = _confirmed(retest)
+        if ema_against or close_below_support:
+            return "Табличные условия выполнены, но графическая структура против LONG. Не входить."
+        if code == "LONG A" and retest_state is False:
+            return "Табличные условия хорошие, но LONG retest не подтверждён. Не входить до пробоя и успешного ретеста."
+        if code == "LONG A" and retest_state is None:
+            return "Табличные условия есть, но данных свечей недостаточно для проверки LONG retest. Не входить."
+        if result.status == "OBSERVATION":
+            return "Условия для наблюдения выполнены. Это не точка входа: дождаться подтверждения структуры и проверить риск."
+        return "Есть предварительное совпадение условий, но подтверждённого входа нет. Наблюдать, не входить."
+
+    resistance = context.get("last_confirmed_resistance")
+    close_above_resistance = (
+        isinstance(close, (int, float)) and isinstance(resistance, (int, float)) and close > resistance
+    )
+    ema_against = isinstance(ema20, (int, float)) and isinstance(ema50, (int, float)) and ema20 > ema50
+    retest = technical.get("trend_retest_short") or technical.get("1h_retest") or {}
+    retest_state = _confirmed(retest)
+    if ema_against or close_above_resistance:
+        return "Табличные условия выполнены, но графическая структура против SHORT. Не входить."
+    if code == "SHORT A" and retest_state is False:
+        return "Табличные условия хорошие, но SHORT retest не подтверждён. Не входить до пробоя и успешного ретеста снизу."
+    if code == "SHORT A" and retest_state is None:
+        return "Табличные условия есть, но данных свечей недостаточно для проверки SHORT retest. Не входить."
+    if result.status == "OBSERVATION":
+        return "Условия для наблюдения выполнены. Это не точка входа: дождаться подтверждения структуры и проверить риск."
+    return "Есть предварительное совпадение условий, но подтверждённого входа нет. Наблюдать, не входить."
+
+
+def format_alert(result: ScenarioResult, row: EnrichedRow, technical: dict[str, Any] | None = None) -> str:
+    market = row.market
+    technical = technical or result.technical or {}
+    scenario_code = _scenario_code(result.scenario)
+    status = {
+        "OBSERVATION_AFTER_BOUNCE": "OBSERVATION",
+    }.get(result.status.upper(), result.status.upper())
+    title = f"{_display_symbol(result.symbol)} — {scenario_code}"
 
     lines = [
         f"<b>{_esc(title)}</b>",
-        f"Сценарий: <b>{_esc(result.scenario)}</b>",
-        f"Условия: <b>{result.passed_count}/{result.total_count}</b>",
-        f"Цена: <code>{_esc(m.price)}</code> | 24H: <code>{_esc(m.chg24_pct)}%</code>",
-        f"F: <code>{_esc(m.futures_imbalance_4h)}</code> | S: <code>{_esc(m.spot_imbalance_4h)}</code>",
-        f"OI 4H: <code>{_esc(m.oi_chg4h_pct)}%</code> ({_esc(_money(m.oi_chg4h_usd))})",
-        f"OI 24H: <code>{_esc(m.oi_chg24_pct)}%</code> ({_esc(_money(m.oi_chg24_usd))})",
-        f"Funding OI_W: <code>{_esc(m.fr_oiw_pct)}%</code> | L/S 1D: <code>{_esc(m.ls_ratio_1d)}</code>",
+        f"<b>{_esc(status)} · {result.passed_count}/{result.total_count}</b>",
+        "",
+        f"F = <code>{_esc(_decimal(market.futures_imbalance_4h, 4, signed=True))}</code> · "
+        f"S = <code>{_esc(_decimal(market.spot_imbalance_4h, 4, signed=True))}</code>",
+        "",
+        f"- OI 4H: <code>{_esc(_percent(market.oi_chg4h_pct, 2, signed=True))}</code>.",
+        f"- Цена 24H: <code>{_esc(_percent(market.chg24_pct, 2, signed=True))}</code>.",
+        f"- Funding OI_W: <code>{_esc(_percent(market.fr_oiw_pct, 4, signed=True))}</code>.",
+        f"- L/S 1D: <code>{_esc(_decimal(market.ls_ratio_1d, 2))}</code>.",
     ]
-    if m.liq_long24_usd is not None or m.liq_short24_usd is not None:
-        lines.append(f"Liqs 24H long/short: <code>{_money(m.liq_long24_usd)} / {_money(m.liq_short24_usd)}</code>")
-    for check in result.checks:
-        mark = "✔" if check.passed is True else ("✖" if check.passed is False else "?")
-        lines.append(f"{mark} {_esc(check.name)}: {_esc(check.actual)} (правило: {_esc(check.rule)})")
-    for check in technical.get("trigger_checks", []):
-        mark = "✔" if check.get("passed") is True else ("✖" if check.get("passed") is False else "?")
-        lines.append(f"Триггер {mark} {_esc(check.get('name'))}: {_esc(check.get('actual'))} (правило: {_esc(check.get('rule'))})")
-    if row.long_liq_share is not None:
-        lines.append(f"Доля ликвидаций лонгов: <code>{row.long_liq_share:.1%}</code>")
-    if row.rel_strength_vs_btc_pp is not None:
-        lines.append(f"RelStrength к BTC: <code>{row.rel_strength_vs_btc_pp:+.2f} п.п.</code>")
-    if m.btc_corr7d is not None:
-        if m.btc_corr7d > 0.7:
-            lines.append(f"BTC Correlation 7D: <code>{m.btc_corr7d:.3f}</code> — считать BTC-коррелированной экспозицией, не отдельной независимой ставкой.")
-        else:
-            lines.append(f"BTC Correlation 7D: <code>{m.btc_corr7d:.3f}</code>")
-    else:
-        lines.append("BTC Correlation 7D: n/a — корреляция не проверена")
-    if result.status == "WAITING_FOR_HISTORY_OR_HIGHER_LOW":
-        lines.append(f"Spot sequence 4H: <code>{technical.get('spot_sequence_ok')}</code>; 1H higher low: <code>{(technical.get('higher_low') or {}).get('confirmed')}</code>")
-    orderbook = technical.get("orderbook") or {}
-    if orderbook.get("spread_bps") is not None:
+    if market.btc_corr7d is not None:
+        correlation_note = ""
+        if _display_symbol(result.symbol) != "BTC" and market.btc_corr7d >= 0.7:
+            correlation_note = " — высокая положительная связь с BTC; не независимая экспозиция"
+        elif _display_symbol(result.symbol) != "BTC" and market.btc_corr7d <= -0.7:
+            correlation_note = " — сильная обратная связь с BTC; не независимая экспозиция"
         lines.append(
-            f"Стакан Binance: spread <code>{orderbook['spread_bps']:.2f} bps</code>; "
-            f"depth ±1% bid/ask <code>{_money(orderbook.get('bid_depth_1pct_usd'))} / {_money(orderbook.get('ask_depth_1pct_usd'))}</code>"
+            f"- BTC Corr. 7D: <code>{_esc(_decimal(market.btc_corr7d, 2, signed=True))}</code>{_esc(correlation_note)}."
         )
-        lines.append(f"Глубина imbalance ±1%: <code>{orderbook.get('depth_imbalance_1pct')}</code>")
-        if orderbook.get("notional_usd"):
-            buy = orderbook.get("market_buy_estimate", {})
-            sell = orderbook.get("market_sell_estimate", {})
-            lines.append(
-                f"Оценка проскальзывания на ${orderbook['notional_usd']:,.0f}: "
-                f"buy <code>{buy.get('slippage_bps') if buy.get('slippage_bps') is not None else 'n/a'} bps</code>; "
-                f"sell <code>{sell.get('slippage_bps') if sell.get('slippage_bps') is not None else 'n/a'} bps</code> (оценка по снимку стакана)"
-            )
-    fee = technical.get("execution_cost_assumptions", {}).get("taker_fee_bps_per_side")
-    lines.append(f"Комиссия taker/сторону: <code>{fee} bps</code>" if fee is not None else "Комиссия аккаунта: не задана")
-    if result.quality_flags:
-        lines.append(f"Качество рынка: <code>{_esc('; '.join(result.quality_flags))}</code>")
-    if result.reason:
-        lines.extend(["", _esc(result.reason)])
-    chart_context = technical.get("context_4h")
-    if chart_context:
-        lines.append(
-            f"4H контекст: <code>{_esc(chart_context.get('trend'))}</code>; "
-            f"support=<code>{_esc(chart_context.get('last_confirmed_support'))}</code>; "
-            f"resistance=<code>{_esc(chart_context.get('last_confirmed_resistance'))}</code>"
-        )
-    context15m = technical.get("context_15m") or {}
-    if context15m:
-        lines.append(f"15m последняя закрытая свеча: <code>{_esc(context15m.get('last_closed_change_pct'))}%</code>")
-    invalidation = scenario_invalidation(result.direction, result.scenario, technical)
-    if invalidation["level"] is not None:
-        lines.append(f"Уровень отмены: <code>{invalidation['level']}</code> — {_esc(invalidation['rule'])}")
     else:
-        lines.append("Уровень отмены: не определён по доступным закрытым свечам")
-    structure = result.technical.get("1h_retest") or result.technical.get("higher_low") or result.technical.get("bearish_structure_break") or result.technical.get("weak_bounce_rejection")
-    if isinstance(structure, dict) and structure.get("reason"):
-        lines.append(f"1H: {_esc(structure['reason'])}")
-    disclaimer = "\n\n<i>Наблюдение по P1, не торговый сигнал и не команда на вход. Вход требует проверки графика и риска.</i>"
-    text = "\n".join(lines) + disclaimer
+        lines.append("- BTC Corr. 7D: n/a.")
+
+    lines.extend(f"- {_esc(item)}" for item in _technical_bullets(result, technical))
+    lines.extend(["", f"<b>Вывод:</b> {_esc(_conclusion(result, technical))}"])
+    text = "\n".join(lines) + DISCLAIMER
     if len(text) > 3900:
-        # Preserve the safety disclaimer even when the detailed checks are truncated.
-        text = text[: 3900 - len(disclaimer) - 2].rstrip() + "…" + disclaimer
+        text = text[: 3900 - len(DISCLAIMER) - 2].rstrip() + "…" + DISCLAIMER
     return text
 
-
-def _money(value: float | None) -> str:
-    if value is None:
-        return "n/a"
-    return f"${value:,.0f}" if abs(value) >= 1_000_000 else f"${value:,.2f}"
 
 
 class TelegramClient:

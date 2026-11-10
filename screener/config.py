@@ -73,7 +73,6 @@ class Settings:
     telegram_cooldown_hours: float
     telegram_send_wait_states: bool
     data_dir: Path
-    output_dir: Path
     log_level: str
     dry_run: bool
     p1: dict[str, Any]
@@ -96,11 +95,8 @@ def load_settings(root: Path = ROOT) -> Settings:
         if item.strip()
     ]
     data_dir = Path(os.getenv("DATA_DIR", "data"))
-    output_dir = Path(os.getenv("OUTPUT_DIR", "reports"))
     if not data_dir.is_absolute():
         data_dir = root / data_dir
-    if not output_dir.is_absolute():
-        output_dir = root / output_dir
 
     fee_value = os.getenv("TRADING_FEE_BPS_PER_SIDE", "").strip()
     settings = Settings(
@@ -124,7 +120,6 @@ def load_settings(root: Path = ROOT) -> Settings:
         telegram_cooldown_hours=max(0.0, float(os.getenv("TELEGRAM_COOLDOWN_HOURS", "4"))),
         telegram_send_wait_states=_bool_env("TELEGRAM_SEND_WAIT_STATES", True),
         data_dir=data_dir,
-        output_dir=output_dir,
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         dry_run=_bool_env("DRY_RUN", True),
         p1={section: values.copy() for section, values in strategy.items()},

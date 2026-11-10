@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import logging
 import statistics
-import time
-from datetime import datetime, timezone
 from typing import Any
 
 from .binance import BinanceClient
@@ -11,7 +9,6 @@ from .coinalyze import IncompleteUniverseError, ScrapeResult, fetch_table
 from .config import Settings
 from .metrics import EnrichedRow, analyze_universe
 from .models import Candle, ScenarioResult
-from .report import write_outputs
 from .scenarios import evaluate_scenarios
 from .storage import Store
 from .structure import (
@@ -171,85 +168,6 @@ def _can_send_alerts(scrape: ScrapeResult, settings: Settings) -> tuple[bool, st
     return True, "OK"
 
 
-def _snapshot_deltas(
-    store: Store, rows: list[EnrichedRow], fetched_at: datetime, unchanged: bool = False
-) -> dict[str, dict[str, Any]]:
-    deltas: dict[str, dict[str, Any]] = {}
-    for enriched in rows:
-        history = store.recent_symbol_history(enriched.symbol, limit=2)
-        if not history:
-            continue
-        if unchanged:
-            previous = history[-1]
-            current = enriched.market.to_dict()
-            current["snapshot_at"] = fetched_at.isoformat()
-        else:
-            if len(history) < 2:
-                continue
-            previous, current = history[-2], history[-1]
-        try:
-            previous_at = datetime.fromisoformat(previous["snapshot_at"])
-            current_at = datetime.fromisoformat(current["snapshot_at"])
-            gap_hours = (current_at - previous_at).total_seconds() / 3600.0
-        except (KeyError, TypeError, ValueError):
-            continue
-
-        def difference(key: str) -> float | None:
-            old, new = previous.get(key), current.get(key)
-            return float(new) - float(old) if old is not None and new is not None else None
-
-        price_delta = None
-        old_price, new_price = previous.get("price"), current.get("price")
-        if old_price is not None and new_price is not None and float(old_price) != 0:
-            price_delta = (float(new_price) / float(old_price) - 1.0) * 100.0
-        oi_delta_usd = difference("oi_usd")
-        oi_delta_pct = None
-        old_oi, new_oi = previous.get("oi_usd"), current.get("oi_usd")
-        if old_oi is not None and new_oi is not None and float(old_oi) != 0:
-            oi_delta_pct = (float(new_oi) / float(old_oi) - 1.0) * 100.0
-        if unchanged:
-            note = "значения таблицы полностью совпадают с предыдущим снимком: новых данных Coinalyze нет"
-        elif gap_hours < 4.0:
-            note = "окна 4H перекрываются; только предварительное наблюдение, не независимые наблюдения"
-        elif gap_hours > 4.0:
-            note = "интервал >4h; окна уже несопоставимы как одно последовательное 4H наблюдение"
-        else:
-            note = "интервал ровно 4h; приблизительно сопоставимые последовательные окна"
-
-        price_x_oi = "unknown"
-        if unchanged:
-            price_x_oi = "no_new_table_data"
-        elif price_delta is not None and oi_delta_pct is not None:
-            if price_delta > 0 and oi_delta_pct > 0:
-                price_x_oi = "price_up_oi_up"
-            elif price_delta < 0 and oi_delta_pct > 0:
-                price_x_oi = "price_down_oi_up"
-            elif price_delta > 0 and oi_delta_pct < 0:
-                price_x_oi = "price_up_oi_down_possible_short_closing"
-            elif price_delta < 0 and oi_delta_pct < 0:
-                price_x_oi = "price_down_oi_down_possible_long_closing"
-            else:
-                price_x_oi = "mixed_or_flat"
-            if gap_hours < 4.0:
-                price_x_oi = "preliminary_overlapping_windows:" + price_x_oi
-            elif gap_hours > 4.0:
-                price_x_oi = "not_comparable_gap_over_4h:" + price_x_oi
-            else:
-                price_x_oi = "comparable_4h_interval:" + price_x_oi
-        deltas[enriched.symbol] = {
-            "interval_hours": round(gap_hours, 3),
-            "window_note": note,
-            "price_change_pct": round(price_delta, 6) if price_delta is not None else None,
-            "oi_change_usd": round(oi_delta_usd, 2) if oi_delta_usd is not None else None,
-            "oi_change_pct": round(oi_delta_pct, 6) if oi_delta_pct is not None else None,
-            "price_x_oi_classification": price_x_oi,
-            "futures_imbalance_delta": round(difference("futures_imbalance_4h"), 6) if difference("futures_imbalance_4h") is not None else None,
-            "spot_imbalance_delta": round(difference("spot_imbalance_4h"), 6) if difference("spot_imbalance_4h") is not None else None,
-            "funding_oiw_delta_pp": round(difference("fr_oiw_pct"), 6) if difference("fr_oiw_pct") is not None else None,
-        }
-    return deltas
-
-
 def _collect_notifications(
     results: list[ScenarioResult],
     rows: list[EnrichedRow],
@@ -380,20 +298,6 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         if not allowed:
             log.warning("Telegram alert guard: %s", guard_reason)
         notifications = _collect_notifications(results, enriched, settings, store, allowed, use_dry_run, no_new_data=unchanged)
-        deltas_by_symbol = _snapshot_deltas(store, enriched, scrape.fetched_at, unchanged=unchanged)
-        paths = write_outputs(
-            settings.output_dir,
-            scrape.fetched_at,
-            scrape.contract_type,
-            enriched,
-            stats,
-            results,
-            scrape.missing_columns,
-            notifications,
-            deltas_by_symbol,
-            scrape.missing_required_columns,
-            scrape.headers_found,
-        )
         visible_results = [r for r in results if r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE", "OBSERVATION_AFTER_BOUNCE"}]
         store.finish_run(run_id, len(scrape.rows), len(visible_results), "OK")
         log.info("Scan complete: rows=%d near-scenarios=%d contract=%s", len(scrape.rows), len(visible_results), scrape.contract_type)
@@ -407,7 +311,6 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             "stats": stats,
             "results": visible_results,
             "notifications": notifications,
-            "output_paths": paths,
             "alert_guard": guard_reason,
         }
     except IncompleteUniverseError as exc:

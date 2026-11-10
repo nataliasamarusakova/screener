@@ -27,8 +27,10 @@ def main() -> None:
         f"Scan: {result['status']} | rows={result['rows']} | "
         f"contract={result['contract_type']} | dry_run={dry_run}"
     )
-    for key, path in zip(("report", "csv", "json"), result["output_paths"]):
-        print(f"{key}: {path}")
+    print(
+        f"signals={len(result['results'])} | notifications={len(result['notifications'])} | "
+        f"alert_guard={result['alert_guard']}"
+    )
 
 
 if __name__ == "__main__":

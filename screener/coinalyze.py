@@ -87,7 +87,10 @@ ALIASES: dict[str, set[str]] = {
     "oi_share_pct": {"oi share", "open interest share"},
     "oi_vol_ratio": {"oi / vol24h", "oi / volume 24h", "open interest / volume 24h", "open interest / volume24h"},
     "oi_mktcap_ratio": {"oi / mktcap", "oi / market cap", "open interest / market capitalization", "open interest / market capitalisation"},
-    "vol_mktcap_ratio": {"vol24h / mktcap", "volume 24h / market cap", "vol 24h / mktcap"},
+    "vol_mktcap_ratio": {
+        "vol24h / mktcap", "volume 24h / market cap", "volume 24h / market capitalization",
+        "volume 24h / market capitalisation", "vol 24h / mktcap",
+    },
     "fr_avg_pct": {"fr avg", "funding rate average"},
     "pfr_avg_pct": {"pfr avg", "predicted funding rate average"},
     "fr_oiw_pct": {"fr avg oi w", "fr avg oi weighted", "funding rate average oi weighted", "funding rate average oi w"},
@@ -199,9 +202,11 @@ def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[
         if not symbol or not cells:
             raise CoinalyzeError(f"Invalid Coinalyze row {row_idx}: missing symbol or cells; refusing partial universe")
         name = symbol
-        if len(cells) > 1:
-            spans = cells[1].find_all("span")
-            name = spans[0].get_text(strip=True) if spans else (cells[1].get_text(" ", strip=True) or symbol)
+        coin_cell_index = index.get("coin")
+        if coin_cell_index is not None and coin_cell_index < len(cells):
+            coin_cell = cells[coin_cell_index]
+            spans = coin_cell.find_all("span")
+            name = spans[0].get_text(strip=True) if spans else (coin_cell.get_text(" ", strip=True) or symbol)
         oi24_pct, oi24_usd = _disambiguate_oi(cells, oi24_ambiguous) if len(oi24_ambiguous) >= 2 else (None, None)
         oi4h_pct, oi4h_usd = _disambiguate_oi(cells, oi4h_ambiguous) if len(oi4h_ambiguous) >= 2 else (None, None)
         if oi24_pct is None:
