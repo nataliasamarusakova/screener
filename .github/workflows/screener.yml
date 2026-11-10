@@ -16,6 +16,10 @@ permissions:
 
 concurrency:
   group: screener
+  # Cron-job.org dispatches every five minutes. Keep pending runs instead of
+  # replacing the previous pending run (GitHub's default concurrency behavior).
+  # Queue is bounded at 100 by GitHub; additional events are rejected when full.
+  queue: max
   cancel-in-progress: false
 
 jobs:
@@ -247,7 +251,12 @@ jobs:
           touch data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl data/runs.jsonl
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl data/runs.jsonl
+          # runs.jsonl is invocation diagnostics, not cross-run strategy state.
+          # Do not create a Git commit on every poll just because a run completed.
+          if git ls-files --error-unmatch data/runs.jsonl >/dev/null 2>&1; then
+            git rm --cached -f data/runs.jsonl
+          fi
+          git add data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl
           if git diff --cached --quiet; then
             echo "No JSONL state changes to commit"
             exit 0
