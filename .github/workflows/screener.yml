@@ -28,7 +28,6 @@ jobs:
       BINANCE_HTTP_PROXY: http://127.0.0.1:18080
       BINANCE_REQUEST_INTERVAL_SEC: "0.12"
       DATA_DIR: data
-      OUTPUT_DIR: reports
       LOG_LEVEL: INFO
 
     steps:
@@ -49,7 +48,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m playwright install --with-deps chromium
-          mkdir -p data reports
+          mkdir -p data
 
       - name: Test analysis modules
         run: python -m pytest -q
@@ -189,18 +188,6 @@ jobs:
             fi
           fi
           python -m screener
-
-      - name: Upload analysis reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: screener-report-${{ github.run_id }}
-          path: |
-            reports/screener_report.md
-            reports/candidates.csv
-            reports/analysis.json
-          if-no-files-found: ignore
-          retention-days: 14
 
       - name: Persist JSONL history on the current branch
         if: always() && !cancelled()
