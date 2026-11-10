@@ -159,3 +159,22 @@ def test_prune_removes_orphan_rows_even_when_no_snapshot_expired(tmp_path):
     assert deleted["snapshots_deleted"] == 0
     assert len(list(store._read_jsonl(store.market_rows_path))) == 1
     assert store.recent_symbol_history("BTCUSDT_PERP.A", limit=10)[0]["spot_imbalance_4h"] == 3.0
+
+
+def test_notification_state_is_recipient_specific_and_legacy_rows_are_broadcast(tmp_path):
+    store = Store(tmp_path / "data")
+    event = "BTC|LONG A|OBSERVATION"
+    store.record_notification(event, 11, chat_id="chat-a")
+
+    assert store.notification_exists(event, "chat-a") is True
+    assert store.notification_exists(event, "chat-b") is False
+    assert store.notification_due(event, 4, "chat-a") is False
+    assert store.notification_due(event, 4, "chat-b") is True
+
+    # Legacy event rows had no chat_id and were written only after all recipients succeeded.
+    legacy_event = "ETH|SHORT A|OBSERVATION"
+    store.record_notification(legacy_event, 12)
+    assert store.notification_exists(legacy_event, "chat-a") is True
+    assert store.notification_exists(legacy_event, "chat-b") is True
+    assert store.notification_due(legacy_event, 4, "chat-a") is False
+    assert store.notification_due(legacy_event, 4, "chat-b") is False

@@ -16,3 +16,11 @@ def test_workflow_persists_jsonl_on_current_branch_without_state_branch():
 def test_data_jsonl_is_not_ignored():
     gitignore = (Path(__file__).parents[1] / ".gitignore").read_text()
     assert "data/*.jsonl" not in gitignore
+
+
+def test_workflow_validates_wireguard_keys_without_logging_key_material():
+    workflow = (Path(__file__).parents[1] / ".github/workflows/screener.yml").read_text()
+    assert "base64.b64decode(value, validate=True)" in workflow
+    assert "must decode to 32 bytes" in workflow
+    assert "Raw parser output is suppressed to protect keys." in workflow
+    assert "--configtest -c" in workflow

@@ -44,7 +44,11 @@ def test_report_writes_market_ranks_calculations_and_csv_limit(tmp_path):
     with csv_path.open(encoding="utf-8-sig", newline="") as handle:
         csv_rows = list(csv.DictReader(handle))
     assert len(csv_rows) == 10
+    assert "версия_параметров" in csv_rows[0]
+    assert {row["версия_параметров"] for row in csv_rows} == {"P1"}
     payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["application_version"] == "1.0.1"
+    assert payload["parameter_version"] == "P1"
     assert payload["p1_backtested"] is False
     assert len(payload["universe_calculations"]) == len(markets)
     assert payload["universe_calculations"][0]["futures_buy_share_pct"] is not None
@@ -60,3 +64,4 @@ def test_no_signal_csv_contains_explicit_no_signal_row(tmp_path):
         csv_rows = list(csv.DictReader(handle))
     assert len(csv_rows) == 1
     assert csv_rows[0]["symbol"] == "нет сигнала"
+    assert csv_rows[0]["версия_параметров"] == "P1"

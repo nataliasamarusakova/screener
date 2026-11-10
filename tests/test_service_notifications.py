@@ -11,12 +11,12 @@ class FakeStore:
         self.exists_calls = []
         self.due_calls = []
 
-    def notification_exists(self, key):
-        self.exists_calls.append(key)
+    def notification_exists(self, key, chat_id=None):
+        self.exists_calls.append((key, chat_id))
         return True
 
-    def notification_due(self, key, cooldown):
-        self.due_calls.append((key, cooldown))
+    def notification_due(self, key, cooldown, chat_id=None):
+        self.due_calls.append((key, cooldown, chat_id))
         return True
 
 
@@ -47,7 +47,7 @@ def test_unchanged_table_suppresses_duplicate_notification_without_name_error():
     )
 
     assert notifications == []
-    assert store.exists_calls == ["ETHUSDT_PERP|LONG A|OBSERVATION"]
+    assert store.exists_calls == [("ETHUSDT_PERP|LONG A|OBSERVATION", None)]
     assert store.due_calls == []
 
 
@@ -162,3 +162,75 @@ def test_price_oi_snapshot_classification_marks_overlapping_windows_preliminary(
     assert delta["price_change_pct"] > 0
     assert delta["oi_change_pct"] > 0
     assert delta["price_x_oi_classification"].startswith("preliminary_overlapping_windows:")
+
+
+def test_partial_telegram_delivery_retries_only_recipients_without_success(tmp_path, monkeypatch):
+    import screener.service as service
+    from screener.storage import Store
+
+    market = MarketRow(
+        symbol="ETHUSDT_PERP", name="Ethereum", price=2000, chg24_pct=2,
+        market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=100_000_000,
+        oi_chg24_pct=1, oi_chg24_usd=1_000_000, oi_chg4h_pct=2, oi_chg4h_usd=3_000_000,
+        fr_avg_pct=0.001, fr_oiw_pct=0.002, pfr_oiw_pct=0.003,
+        liq_total24_usd=100_000, liq_long24_usd=50_000, liq_short24_usd=50_000,
+        ls_ratio_1d=1.2, futures_imbalance_4h=10, spot_imbalance_4h=10,
+    )
+    enriched, _ = analyze_universe([market], {"thresholds": {}})
+    result = ScenarioResult(
+        symbol=market.symbol, name=market.name, scenario="LONG A", direction="LONG",
+        checks=[Check("complete", True, "yes", "yes")], quality_flags=[], status="OBSERVATION",
+    )
+    settings = SimpleNamespace(
+        telegram_bot_token="token", telegram_chat_ids=["chat-a", "chat-b"],
+        telegram_send_wait_states=True, telegram_cooldown_hours=4,
+    )
+    store = Store(tmp_path / "data")
+    calls = []
+
+    class PartialTelegram:
+        def __init__(self, token, chat_ids):
+            self.chat_ids = chat_ids
+
+        @property
+        def configured(self):
+            return True
+
+        def send(self, text, chat_ids=None):
+            recipients = list(self.chat_ids if chat_ids is None else chat_ids)
+            calls.append(recipients)
+            return [
+                {
+                    "chat_id": chat_id,
+                    "sent": not (chat_id == "chat-b" and len(calls) == 1),
+                    "message_id": f"{chat_id}-message",
+                }
+                for chat_id in recipients
+            ]
+
+    monkeypatch.setattr(service, "TelegramClient", PartialTelegram)
+    key = "ETHUSDT_PERP|LONG A|OBSERVATION"
+
+    first = _collect_notifications(
+        [result], enriched, settings, store,
+        contract_alerts_allowed=True, dry_run=False, no_new_data=False,
+    )
+    assert first[0]["sent"] is False
+    assert calls == [["chat-a", "chat-b"]]
+    assert store.notification_exists(key, "chat-a") is True
+    assert store.notification_exists(key, "chat-b") is False
+
+    second = _collect_notifications(
+        [result], enriched, settings, store,
+        contract_alerts_allowed=True, dry_run=False, no_new_data=True,
+    )
+    assert second[0]["sent"] is True
+    assert calls == [["chat-a", "chat-b"], ["chat-b"]]
+    assert store.notification_exists(key, "chat-b") is True
+
+    third = _collect_notifications(
+        [result], enriched, settings, store,
+        contract_alerts_allowed=True, dry_run=False, no_new_data=True,
+    )
+    assert third == []
+    assert calls == [["chat-a", "chat-b"], ["chat-b"]]
