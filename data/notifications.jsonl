@@ -3,3 +3,7 @@
 {"chat_id":"614437802","event_key":"STRK|LONG A — Trend Continuation|OBSERVATION","record_type":"notification","sent_at":"2026-11-10T08:42:26.529115+00:00","telegram_message_id":"289"}
 {"chat_id":"614437802","event_key":"PONS|LONG A — Trend Continuation|OBSERVATION","record_type":"notification","sent_at":"2026-11-10T08:42:26.988735+00:00","telegram_message_id":"290"}
 {"chat_id":"614437802","event_key":"GRASS|LONG A — Trend Continuation|OBSERVATION","record_type":"notification","sent_at":"2026-11-10T08:42:27.461902+00:00","telegram_message_id":"291"}
+{"chat_id":"614437802","event_key":"XRP|SHORT D — Long Liquidation Cascade|OBSERVATION_AFTER_BOUNCE","record_type":"notification","sent_at":"2026-11-10T10:27:00.892619+00:00","telegram_message_id":"292"}
+{"chat_id":"614437802","event_key":"AAVE|SHORT D — Long Liquidation Cascade|WAIT_BOUNCE","record_type":"notification","sent_at":"2026-11-10T10:27:01.222534+00:00","telegram_message_id":"293"}
+{"chat_id":"614437802","event_key":"BCH|SHORT D — Long Liquidation Cascade|WAIT_BOUNCE","record_type":"notification","sent_at":"2026-11-10T10:27:01.554740+00:00","telegram_message_id":"294"}
+{"chat_id":"614437802","event_key":"CRV|LONG B — Spot Accumulation|WAITING_FOR_HISTORY_OR_HIGHER_LOW","record_type":"notification","sent_at":"2026-11-10T10:27:01.922380+00:00","telegram_message_id":"295"}
