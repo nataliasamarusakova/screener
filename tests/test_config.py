@@ -45,3 +45,10 @@ def test_settings_require_proxy_when_wireguard_mode_is_enabled(tmp_path: Path, m
 
     with pytest.raises(ValueError, match="BINANCE_HTTP_PROXY"):
         load_settings(tmp_path)
+
+
+def test_settings_do_not_have_an_output_reports_directory(tmp_path, monkeypatch):
+    _set_required_secrets(monkeypatch)
+    monkeypatch.delenv("OUTPUT_DIR", raising=False)
+    settings = load_settings(tmp_path)
+    assert not hasattr(settings, "output_dir")

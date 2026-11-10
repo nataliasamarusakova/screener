@@ -119,3 +119,63 @@ def test_short_e_requires_three_snapshots_and_actual_flow_turn_down():
     short_e_without_3 = next(item for item in result_without_3 if item.scenario.startswith("SHORT E"))
     assert short_e_without_3.status == "NOT_MET"
     assert short_e_without_3.checks[0].passed is False
+
+
+def test_pons_is_five_of_six_not_long_a_when_ranked_twelfth_in_both_flows():
+    from screener.config import DEFAULT_P1_CONFIG
+
+    rows = []
+    for index in range(75):
+        symbol = "PONS" if index == 11 else f"ALT{index:02d}"
+        spot = None if index >= 72 else float(100 - index)
+        rows.append(MarketRow(
+            symbol=symbol, name=symbol, price=1.0, chg24_pct=5.07,
+            market_cap_usd=1_000_000_000, volume24_usd=500_000_000, oi_usd=50_000_000,
+            oi_chg24_pct=1.0, oi_chg24_usd=1_000_000,
+            oi_chg4h_pct=2.62, oi_chg4h_usd=3_000_000,
+            oi_vol_ratio=0.5, oi_mktcap_ratio=0.05, vol_mktcap_ratio=0.5,
+            fr_avg_pct=0.01, fr_oiw_pct=0.0090, pfr_oiw_pct=0.0085,
+            liq_total24_usd=100_000, liq_long24_usd=50_000, liq_short24_usd=50_000,
+            ls_ratio_1d=1.74,
+            futures_imbalance_4h=float(100 - index),
+            spot_imbalance_4h=spot,
+        ))
+
+    enriched, stats = analyze_universe(rows, DEFAULT_P1_CONFIG)
+    pons = next(item for item in enriched if item.symbol == "PONS")
+    result = evaluate_scenarios(pons, stats, DEFAULT_P1_CONFIG)
+    long_a = next(item for item in result if item.scenario.startswith("LONG A"))
+
+    assert pons.f_rank_desc == 12
+    assert pons.s_rank_desc == 12
+    assert pons.f_strong_buy is False
+    assert pons.s_strong_buy is False
+    assert long_a.passed_count == 5
+    assert long_a.total_count == 6
+    assert long_a.status == "NOT_MET"
+
+
+def test_grass_keeps_six_of_six_but_surfaces_funding_sign_reversal_warning():
+    from screener.config import DEFAULT_P1_CONFIG
+
+    row = MarketRow(
+        symbol="GRASSUSDT_PERP.A", name="GRASS", price=1.0, chg24_pct=5.09,
+        market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=100_000_000,
+        oi_chg24_pct=5.21, oi_chg24_usd=5_000_000,
+        oi_chg4h_pct=1.67, oi_chg4h_usd=901_200,
+        oi_vol_ratio=0.5, oi_mktcap_ratio=0.1, vol_mktcap_ratio=0.2,
+        fr_avg_pct=0.0096, fr_oiw_pct=0.0096, pfr_oiw_pct=-0.0049,
+        liq_total24_usd=100_000, liq_long24_usd=50_000, liq_short24_usd=50_000,
+        ls_ratio_1d=1.08, futures_imbalance_4h=7.6293, spot_imbalance_4h=4.2696,
+        btc_corr7d=0.88,
+    )
+    enriched, stats = analyze_universe([row], DEFAULT_P1_CONFIG)
+    result = evaluate_scenarios(enriched[0], stats, DEFAULT_P1_CONFIG)
+    long_a = next(item for item in result if item.scenario.startswith("LONG A"))
+
+    assert long_a.passed_count == 6
+    assert long_a.total_count == 6
+    assert long_a.status == "OBSERVATION_WITH_WARNING"
+    assert "qualitative warning only" in long_a.reason
+    assert any("changes sign versus current FR" in note for note in enriched[0].diagnostic_notes)
+    assert "OI 4H change is small in USD" in enriched[0].diagnostic_notes

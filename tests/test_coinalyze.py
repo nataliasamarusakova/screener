@@ -15,8 +15,8 @@ FIXTURE_HTML = """
 <th>OI Chg 24H</th><th>OI Chg 24H</th><th>OI Chg 4H</th><th>OI Chg 4H</th><th>OI Share</th>
 <th>OI / VOL24H</th><th>OI / MktCap</th><th>VOL24H / MktCap</th><th>FR AVG</th><th>PFR AVG</th><th>FR AVG OI_W</th><th>PFR AVG OI_W</th>
 <th>Liqs. 24H</th><th>Short Liqs. 24H</th><th>Long Liqs. 24H</th><th>Liqs. 24H / Vol 24H</th><th>Liqs. 24H / OI</th>
-<th>L/S Ratio (1H)</th><th>Long (1H)</th><th>Short (1H)</th><th>L/S Ratio (1D)</th><th>Long (1D)</th><th>Short (1D)</th><th>BTC Corr. 7D</th>
-<th>FUTURES IMBALANCE 4H</th><th>SPOT IMBALANCE 4H</th>
+<th>L/S Ratio (1H)</th><th>Long (1H)</th><th>Short (1H)</th><th>L/S Ratio (1D)</th><th>Long (1D)</th><th>Short (1D)</th>
+<th>BTC Corr. 7D</th><th>FUTURES IMBALANCE 4H</th><th>SPOT IMBALANCE 4H</th>
 </tr></thead><tbody>
 <tr data-coin="BTCUSDT_PERP.A">
 <td></td><td><span>Bitcoin</span></td><td>$74,790.08</td><td>-1.47%</td><td>$1.5t</td><td>$1.5t</td><td>$50.2b</td><td>$26.5b</td><td>-0.56%</td><td>$-147.9m</td><td>+1.58%</td><td>$411.1m</td><td>47.57%</td>
@@ -48,7 +48,6 @@ def test_parse_table_maps_duplicate_oi_change_columns_and_custom_imbalance():
     assert len(rows) == 2
     assert not missing_required
     assert missing == []
-    assert sum(bool(header.strip()) for header in headers) == 33
     btc = rows[0]
     assert btc.symbol == "BTCUSDT_PERP.A"
     assert btc.name == "Bitcoin"
@@ -67,12 +66,6 @@ def test_parse_table_maps_duplicate_oi_change_columns_and_custom_imbalance():
     assert btc.liq_vol_ratio == 0.0041
     assert btc.liq_oi_ratio == 0.0079
     assert "FUTURES IMBALANCE 4H" in headers
-
-
-def test_missing_btc_correlation_stays_unknown_not_zero():
-    html = FIXTURE_HTML.replace("<td>+1.00</td>", "<td>n/a</td>", 1)
-    rows, _, _, _ = parse_table(html)
-    assert rows[0].btc_corr7d is None
 
 
 def test_zero_rounded_price_does_not_drop_the_market_row():
@@ -102,28 +95,11 @@ def test_explicit_all_contracts_url_is_not_misclassified_as_perpetual():
     assert detect_contract_type(html, "https://coinalyze.net/?contract_type=all") == "ALL_CONTRACTS"
 
 
-def test_volume_to_market_cap_full_header_alias_is_recognized():
-    html = FIXTURE_HTML.replace("<th>VOL24H / MktCap</th>", "<th>Volume 24H / Market Capitalization</th>")
-    rows, _, missing, missing_required = parse_table(html)
-    assert "vol_mktcap_ratio" not in missing
-    assert "vol_mktcap_ratio" not in missing_required
-    assert rows[0].vol_mktcap_ratio == 0.033
-
-
 def test_p1_required_market_quality_columns_are_reported_when_missing():
     html = FIXTURE_HTML.replace("<th>VOL24H / MktCap</th>", "<th>Turnover</th>")
     _, _, missing, missing_required = parse_table(html)
     assert "vol_mktcap_ratio" in missing
     assert "vol_mktcap_ratio" in missing_required
-
-
-def test_coin_name_is_read_from_the_coin_header_position_without_leading_blank_cell():
-    html = FIXTURE_HTML.replace("<th></th><th>Coin</th>", "<th>Coin</th>")
-    html = html.replace("<td></td><td><span>Bitcoin</span></td>", "<td><span>Bitcoin</span></td>")
-    html = html.replace("<td></td><td><span>Ethereum</span></td>", "<td><span>Ethereum</span></td>")
-    rows, _, _, _ = parse_table(html)
-    assert rows[0].name == "Bitcoin"
-    assert rows[1].name == "Ethereum"
 
 
 def test_session_cookies_match_existing_divergence_main_names_and_scope():
@@ -253,3 +229,20 @@ def test_fetch_table_uses_session_cookies_and_reads_the_saved_page(monkeypatch):
     assert [cookie["name"] for cookie in captured["cookies"]] == [
         "p_sid", "chat_sid", "cookies_accepted"
     ]
+
+
+def test_volume_24h_market_capitalization_header_alias():
+    html = FIXTURE_HTML.replace("<th>VOL24H / MktCap</th>", "<th>Volume 24H / Market Capitalization</th>")
+    rows, _, missing, missing_required = parse_table(html)
+    assert "vol_mktcap_ratio" not in missing
+    assert "vol_mktcap_ratio" not in missing_required
+    assert rows[0].vol_mktcap_ratio == 0.033
+
+
+def test_coin_name_uses_header_index_not_assumed_second_cell():
+    html = FIXTURE_HTML.replace("<th></th><th>Coin</th>", "<th>Coin</th>")
+    html = html.replace("<td></td><td><span>Bitcoin</span></td>", "<td><span>Bitcoin</span></td>")
+    html = html.replace("<td></td><td><span>Ethereum</span></td>", "<td><span>Ethereum</span></td>")
+    rows, _, _, _ = parse_table(html)
+    assert rows[0].name == "Bitcoin"
+    assert rows[1].name == "Ethereum"

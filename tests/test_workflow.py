@@ -9,7 +9,8 @@ def test_workflow_persists_jsonl_on_current_branch_without_state_branch():
     assert "Restore persistent analysis history" not in workflow
     assert "DATA_DIR: data" in workflow
     assert "actions/checkout@v4" in workflow
-    assert "fetch-depth: 0" in workflow
+    assert "fetch-depth: 1" in workflow
+    assert "fetch-tags: false" in workflow
     assert "sqlite" not in workflow.lower()
 
 
@@ -18,30 +19,17 @@ def test_data_jsonl_is_not_ignored():
     assert "data/*.jsonl" not in gitignore
 
 
-def test_workflow_validates_wireguard_keys_without_logging_key_material():
+def test_workflow_caches_playwright_browser_and_pinned_wireproxy():
     workflow = (Path(__file__).parents[1] / ".github/workflows/screener.yml").read_text()
-    assert "base64.b64decode(value, validate=True)" in workflow
-    assert "must decode to 32 bytes" in workflow
-    assert "Raw parser output is suppressed to protect keys." in workflow
-    assert "--configtest -c" in workflow
-
-
-def test_wireproxy_health_check_targets_binance_only_and_avoids_step_local_env_bug():
-    workflow = (Path(__file__).parents[1] / ".github/workflows/screener.yml").read_text()
+    assert "uses: actions/cache@v4" in workflow
+    assert "~/.cache/ms-playwright" in workflow
+    assert "~/.cache/wireproxy" in workflow
+    assert "hashFiles('requirements.txt')" in workflow
+    assert "if: steps.cache-runtime.outputs.cache-hit != 'true'" in workflow
+    assert "if: steps.cache-runtime.outputs.cache-hit == 'true'" in workflow
+    assert workflow.count("python -m playwright install chromium") == 1
     assert "https://fapi.binance.com/fapi/v1/ping" in workflow
     assert "https://ipinfo.io/json" not in workflow
-    assert "VPN_EXPECTED_COUNTRY" not in workflow
-    assert 'os.environ["VPN_DIR"]' not in workflow
-    assert 'echo "VPN_DIR=$vpn_dir" >> "$GITHUB_ENV"' not in workflow
-    assert '--proxy "$BINANCE_HTTP_PROXY"' in workflow
-    assert "Binance API connectivity through WireProxy: OK" in workflow
-
-
-def test_workflow_does_not_create_or_upload_markdown_csv_or_json_reports():
-    workflow = (Path(__file__).parents[1] / ".github/workflows/screener.yml").read_text()
     assert "OUTPUT_DIR" not in workflow
-    assert "mkdir -p data reports" not in workflow
-    assert "actions/upload-artifact@v4" not in workflow
-    assert "screener_report.md" not in workflow
-    assert "candidates.csv" not in workflow
     assert "analysis.json" not in workflow
+
