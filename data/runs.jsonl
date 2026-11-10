@@ -1,0 +1,2 @@
+{"record_type":"run_started","run_id":"31fcb4ceea45413a82023e4e0d23285f","started_at":"2026-11-10T08:41:08.739202+00:00"}
+{"completed_at":"2026-11-10T08:42:27.463360+00:00","error":null,"record_type":"run_finished","result_count":36,"row_count":74,"run_id":"31fcb4ceea45413a82023e4e0d23285f","status":"OK"}
