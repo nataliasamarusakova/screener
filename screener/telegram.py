@@ -127,13 +127,16 @@ class TelegramClient:
     def configured(self) -> bool:
         return bool(self.token and self.chat_ids)
 
-    def send(self, text: str) -> list[dict[str, Any]]:
+    def send(
+        self, text: str, chat_ids: list[str] | None = None
+    ) -> list[dict[str, Any]]:
         if not self.configured:
             log.warning("Telegram is not configured; notification skipped")
             return []
+        recipients = self.chat_ids if chat_ids is None else chat_ids
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         results: list[dict[str, Any]] = []
-        for chat_id in self.chat_ids:
+        for chat_id in recipients:
             try:
                 response = requests.post(
                     url,

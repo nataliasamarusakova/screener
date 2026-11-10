@@ -277,22 +277,43 @@ def _collect_notifications(
             outcomes.append({"symbol": result.symbol, "scenario": result.scenario, "sent": False, "reason": "contract/schema guard"})
             continue
         key = f"{result.symbol}|{result.scenario}|{result.status}"
-        if no_new_data and store.notification_exists(key):
-            # Exact table repeat is not a new alert; a new chart-confirmed status has its own key.
-            continue
-        if not store.notification_due(key, settings.telegram_cooldown_hours):
-            continue
         message = format_alert(result, by_symbol[result.symbol], result.technical)
         if dry_run or not telegram.configured:
+            if no_new_data and store.notification_exists(key):
+                # Preserve the old broadcast-level behavior for legacy state and dry runs.
+                continue
+            if not store.notification_due(key, settings.telegram_cooldown_hours):
+                continue
             log.info("[DRY RUN / NO TELEGRAM]\n%s", message.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", ""))
             outcomes.append({"symbol": result.symbol, "scenario": result.scenario, "sent": False, "reason": "dry-run" if dry_run else "telegram not configured", "text": message})
             continue
-        delivery = telegram.send(message)
-        successes = [x for x in delivery if x.get("sent")]
+
+        recipients = list(dict.fromkeys(str(chat_id) for chat_id in settings.telegram_chat_ids))
+        if no_new_data:
+            pending = [
+                chat_id for chat_id in recipients
+                if not store.notification_exists(key, chat_id)
+            ]
+        else:
+            pending = [
+                chat_id for chat_id in recipients
+                if store.notification_due(key, settings.telegram_cooldown_hours, chat_id)
+            ]
+        if not pending:
+            continue
+
+        delivery = telegram.send(message, chat_ids=pending)
+        successes = [item for item in delivery if item.get("sent")]
+        # Persist each recipient's confirmed success even when another recipient fails.
+        for item in successes:
+            store.record_notification(
+                key, item.get("message_id"), chat_id=str(item["chat_id"])
+            )
         all_success = bool(delivery) and len(successes) == len(delivery)
-        outcomes.append({"symbol": result.symbol, "scenario": result.scenario, "sent": all_success, "delivery": delivery})
-        if all_success:
-            store.record_notification(key, successes[0].get("message_id"))
+        outcomes.append({
+            "symbol": result.symbol, "scenario": result.scenario,
+            "sent": all_success, "delivery": delivery,
+        })
     return outcomes
 
 

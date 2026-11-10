@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import __version__ as APPLICATION_VERSION
+from .config import P1_PARAMETERS_VERSION
 from .metrics import EnrichedRow
 from .models import MarketStats, ScenarioResult
 from .structure import scenario_invalidation
@@ -368,17 +370,18 @@ def write_outputs(
 
     with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=[
-            "snapshot_at_utc", "symbol", "name", "direction", "scenario", "status", "checks",
+            "snapshot_at_utc", "версия_параметров", "symbol", "name", "direction", "scenario", "status", "checks",
             "F", "S", "OI4H_pct", "OI4H_usd", "OI24H_pct", "OI24H_usd", "funding_OI_W_pct", "LS_1D", "quality_flags",
         ])
         writer.writeheader()
         if not report_results:
-            writer.writerow({"snapshot_at_utc": fetched_at.isoformat(), "symbol": "нет сигнала", "scenario": "нет сигнала", "status": "NO_SIGNAL"})
+            writer.writerow({"snapshot_at_utc": fetched_at.isoformat(), "версия_параметров": P1_PARAMETERS_VERSION, "symbol": "нет сигнала", "scenario": "нет сигнала", "status": "NO_SIGNAL"})
         for item in report_results[:10]:
             row = rows_by_symbol[item.symbol]
             m = row.market
             writer.writerow({
                 "snapshot_at_utc": fetched_at.isoformat(),
+                "версия_параметров": P1_PARAMETERS_VERSION,
                 "symbol": item.symbol,
                 "name": item.name,
                 "direction": item.direction,
@@ -430,6 +433,8 @@ def write_outputs(
         "csv_rows_limited_to": 10,
         "notifications": notifications or [],
         "snapshot_deltas": deltas_by_symbol or {},
+        "application_version": APPLICATION_VERSION,
+        "parameter_version": P1_PARAMETERS_VERSION,
         "p1_backtested": False,
     }
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

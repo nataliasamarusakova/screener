@@ -281,16 +281,30 @@ class Store:
                 return all(value is not None and value > 0 for _, value in selected)
         return None
 
-    def notification_exists(self, event_key: str) -> bool:
-        return any(
-            item.get("event_key") == event_key
-            for item in self._read_jsonl(self.notifications_path)
-        )
-
-    def notification_due(self, event_key: str, cooldown_hours: float) -> bool:
-        matching = [
+    def _notification_records(self, event_key: str, chat_id: str | None = None) -> list[dict[str, Any]]:
+        records = [
             item for item in self._read_jsonl(self.notifications_path)
-            if item.get("event_key") == event_key and item.get("sent_at")
+            if item.get("event_key") == event_key
+        ]
+        if chat_id is None:
+            return records
+        recipient = str(chat_id)
+        # Records written before recipient-scoped tracking represented a fully
+        # successful broadcast, so keep treating them as success for every chat.
+        return [
+            item for item in records
+            if item.get("chat_id") is None or str(item.get("chat_id")) == recipient
+        ]
+
+    def notification_exists(self, event_key: str, chat_id: str | None = None) -> bool:
+        return bool(self._notification_records(event_key, chat_id))
+
+    def notification_due(
+        self, event_key: str, cooldown_hours: float, chat_id: str | None = None
+    ) -> bool:
+        matching = [
+            item for item in self._notification_records(event_key, chat_id)
+            if item.get("sent_at")
         ]
         if not matching:
             return True
@@ -299,13 +313,19 @@ class Store:
             last_sent = last_sent.replace(tzinfo=timezone.utc)
         return datetime.now(timezone.utc) - last_sent >= timedelta(hours=cooldown_hours)
 
-    def record_notification(self, event_key: str, message_id: str | int | None = None) -> None:
-        self._append_jsonl(self.notifications_path, {
+    def record_notification(
+        self, event_key: str, message_id: str | int | None = None,
+        chat_id: str | None = None,
+    ) -> None:
+        record = {
             "record_type": "notification",
             "event_key": event_key,
             "sent_at": datetime.now(timezone.utc).isoformat(),
             "telegram_message_id": str(message_id) if message_id is not None else None,
-        })
+        }
+        if chat_id is not None:
+            record["chat_id"] = str(chat_id)
+        self._append_jsonl(self.notifications_path, record)
 
     def start_run(self) -> str:
         run_id = uuid.uuid4().hex
