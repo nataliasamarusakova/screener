@@ -25,7 +25,7 @@ from .structure import (
     confirmed_pivots,
     scenario_invalidation,
 )
-from .telegram import TelegramClient, format_alert, format_market_summary
+from .telegram import TelegramClient, format_alert
 
 log = logging.getLogger(__name__)
 
@@ -370,17 +370,19 @@ def _apply_1h_structure_invalidation(result: ScenarioResult) -> None:
         "LONG B": "higher_low",
         "LONG D": "higher_low",
         "SHORT A": "trend_retest_short",
+        "SHORT B": "trend_retest_short",
         "SHORT D": "weak_bounce_rejection",
     }
     source_name = sources.get(code)
     if not source_name:
         return
     active_statuses = {
-        "LONG A": {"OBSERVATION", "OBSERVATION_WITH_WARNING"},
-        "LONG B": {"WAITING_FOR_HISTORY_OR_HIGHER_LOW", "OBSERVATION", "OBSERVATION_WITH_WARNING"},
-        "LONG D": {"OBSERVATION", "OBSERVATION_WITH_WARNING"},
-        "SHORT A": {"OBSERVATION", "OBSERVATION_WITH_WARNING"},
-        "SHORT D": {"WAIT_BOUNCE", "OBSERVATION_AFTER_BOUNCE"},
+        "LONG A": {"WAITING_FOR_1H_BREAKOUT_RETEST", "CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"},
+        "LONG B": {"WAITING_FOR_HISTORY_OR_HIGHER_LOW", "CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"},
+        "LONG D": {"WAITING_FOR_HIGHER_LOW", "CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"},
+        "SHORT A": {"WAITING_FOR_1H_BREAKDOWN_RETEST", "CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"},
+        "SHORT B": {"WAITING_FOR_1H_BREAKDOWN_RETEST", "CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"},
+        "SHORT D": {"WAIT_BOUNCE", "CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"},
     }
     if result.status not in active_statuses.get(code, set()):
         return
@@ -473,10 +475,45 @@ def _scenario_event_fingerprint(result: ScenarioResult) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
 
 
-def _market_summary_event_key(contract_type: str, fetched_at: datetime) -> str:
-    timestamp = fetched_at if fetched_at.tzinfo else fetched_at.replace(tzinfo=timezone.utc)
-    timestamp = timestamp.astimezone(timezone.utc)
-    return f"MARKET_SUMMARY|{contract_type}|{timestamp.strftime('%Y%m%dT%H%M%SZ')}"
+
+def _has_required_confirmation(result: ScenarioResult) -> bool:
+    """Fail closed: only fully evaluated scenarios with their chart/history gate may be sent."""
+    if result.status not in {"CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"}:
+        return False
+    if result.quality_flags or not result.complete:
+        return False
+
+    technical = result.technical or {}
+    code = str(result.scenario or "").split(" — ", 1)[0].strip().upper()
+    if code == "LONG A":
+        return (technical.get("trend_retest_long") or {}).get("confirmed") is True
+    if code == "LONG B":
+        return (
+            technical.get("spot_sequence_ok") is True
+            and (technical.get("higher_low") or {}).get("confirmed") is True
+        )
+    if code == "LONG C":
+        trigger_checks = technical.get("trigger_checks")
+        return (
+            technical.get("rising_1h") is True
+            and isinstance(trigger_checks, list)
+            and bool(trigger_checks)
+            and all(isinstance(item, dict) and item.get("passed") is True for item in trigger_checks)
+        )
+    if code == "LONG D":
+        return (technical.get("higher_low") or {}).get("confirmed") is True
+    if code in {"SHORT A", "SHORT B"}:
+        return (technical.get("trend_retest_short") or {}).get("confirmed") is True
+    if code == "SHORT C":
+        return (
+            (technical.get("bearish_structure_break") or {}).get("confirmed") is True
+            and (technical.get("trend_retest_short") or {}).get("confirmed") is True
+        )
+    if code == "SHORT D":
+        return (technical.get("weak_bounce_rejection") or {}).get("confirmed") is True
+    if code == "SHORT E":
+        return (technical.get("failed_breakout_rejection") or {}).get("confirmed") is True
+    return False
 
 
 def _collect_notifications(
@@ -488,12 +525,8 @@ def _collect_notifications(
     dry_run: bool,
     no_new_data: bool = False,
     *,
-    stats: Any | None = None,
     fetched_at: datetime | None = None,
-    contract_type: str = "PERPETUAL",
     snapshot_deltas: dict[str, dict[str, Any]] | None = None,
-    missing_columns: list[str] | None = None,
-    emit_market_summary: bool = True,
 ) -> list[dict[str, Any]]:
     by_symbol = {row.symbol: row for row in rows}
     telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_ids)
@@ -570,28 +603,12 @@ def _collect_notifications(
             "delivery": delivery,
         })
 
-    if emit_market_summary and stats is not None and fetched_at is not None and rows:
-        # One whole-market digest per P1 4H observation window; do not create a
-        # new summary event for every five-minute table change.
-        summary_key = _market_summary_event_key(contract_type, fetched_at)
-        strong_flow_quantile = float(settings.p1.get("thresholds", {}).get("strong_flow_quantile", 0.15))
-        summary = format_market_summary(
-            rows, stats, fetched_at, contract_type, missing_columns,
-            strong_flow_quantile=strong_flow_quantile,
-        )
-        deliver(summary_key, summary, kind="market_summary")
-
-    eligible = {"OBSERVATION", "OBSERVATION_WITH_WARNING", "OBSERVATION_AFTER_BOUNCE", "TRIGGER", "INVALIDATED_1H_STRUCTURE"}
-    if settings.telegram_send_wait_states:
-        eligible.update({
-            "WAIT_BOUNCE",
-            "PREPARATION",
-            "WAITING_FOR_HISTORY_OR_HIGHER_LOW",
-            "WAITING_FOR_1H_STRUCTURE_BREAK",
-        })
+    # Telegram is deliberately confirmed-scenario-only. WAIT/PREPARATION/OBSERVATION
+    # states remain available in scan diagnostics but are never delivered.
+    eligible = {"CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"}
 
     for result in results:
-        if result.status not in eligible or result.quality_flags:
+        if result.status not in eligible or not _has_required_confirmation(result):
             continue
         row = by_symbol.get(result.symbol)
         if row is None:
@@ -719,12 +736,8 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             allowed,
             use_dry_run,
             no_new_data=unchanged,
-            stats=stats,
             fetched_at=scrape.fetched_at,
-            contract_type=scrape.contract_type,
             snapshot_deltas=deltas_by_symbol,
-            missing_columns=scrape.missing_columns,
-            emit_market_summary=snapshot_saved,
         )
         visible_results = [r for r in results if r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE", "OBSERVATION_AFTER_BOUNCE"}]
         store.finish_run(run_id, len(scrape.rows), len(visible_results), "OK")

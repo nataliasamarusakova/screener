@@ -10,14 +10,16 @@ from typing import Any
 
 import requests
 
-from .metrics import EnrichedRow, _rank_tail_count
-from .models import MarketStats, ScenarioResult
+from .metrics import EnrichedRow
+from .models import ScenarioResult
 from .structure import scenario_invalidation
 
 log = logging.getLogger(__name__)
 DISCLAIMER = (
-    "\n\n<i>Наблюдение по P1, не торговый сигнал и не команда на вход. "
-    "Вход требует проверки графика и риска. Параметры P1 не проходили backtest.</i>"
+    "\n\n<i>Сценарий прошёл формальные условия P1 и обязательное подтверждение графика. "
+    "Это не гарантия результата, не торговая рекомендация и не команда на вход. "
+    "Перед входом проверь стоп, риск, комиссии, funding и проскальзывание. "
+    "Параметры P1 не проходили backtest.</i>"
 )
 
 
@@ -38,8 +40,10 @@ def _safe_telegram_truncate(message: str, limit: int = 3900) -> str:
     parser.feed(message)
     plain = "".join(parser.parts)
     disclaimer_plain = (
-        "Наблюдение по P1, не торговый сигнал и не команда на вход. "
-        "Вход требует проверки графика и риска. Параметры P1 не проходили backtest."
+        "Сценарий прошёл формальные условия P1 и обязательное подтверждение графика. "
+        "Это не гарантия результата, не торговая рекомендация и не команда на вход. "
+        "Перед входом проверь стоп, риск, комиссии, funding и проскальзывание. "
+        "Параметры P1 не проходили backtest."
     )
     if plain.endswith(disclaimer_plain):
         body = plain[:-len(disclaimer_plain)].rstrip()
@@ -135,9 +139,12 @@ def _scenario_code(scenario: str) -> str:
 
 def _status_label(status: str) -> str:
     return {
-        "OBSERVATION_AFTER_BOUNCE": "OBSERVATION_AFTER_BOUNCE",
-        "OBSERVATION_WITH_WARNING": "OBSERVATION · WARNING",
+        "CONFIRMED_SIGNAL": "ПОДТВЕРЖДЁННЫЙ СЦЕНАРИЙ",
+        "CONFIRMED_SIGNAL_WITH_WARNING": "СЦЕНАРИЙ ПОДТВЕРЖДЁН · ЕСТЬ ПРЕДУПРЕЖДЕНИЕ",
         "WAITING_FOR_HISTORY_OR_HIGHER_LOW": "WAITING_HISTORY / HIGHER LOW",
+        "WAITING_FOR_HIGHER_LOW": "WAITING_FOR_HIGHER_LOW",
+        "WAITING_FOR_1H_BREAKOUT_RETEST": "WAITING_FOR_1H_BREAKOUT_RETEST",
+        "WAITING_FOR_1H_BREAKDOWN_RETEST": "WAITING_FOR_1H_BREAKDOWN_RETEST",
         "WAITING_FOR_1H_STRUCTURE_BREAK": "WAITING_FOR_1H_BREAK",
         "BLOCKED_QUALITY": "BLOCKED_QUALITY",
         "INVALIDATED_1H_STRUCTURE": "INVALIDATED · 1H STRUCTURE",
@@ -190,6 +197,7 @@ def _technical_bullets(result: ScenarioResult, technical: dict[str, Any]) -> lis
     check_map = {
         "LONG A": ("trend_retest_long", "LONG retest"),
         "SHORT A": ("trend_retest_short", "SHORT retest"),
+        "SHORT B": ("trend_retest_short", "SHORT breakdown/retest"),
         "SHORT C": ("bearish_structure_break", "Медвежий пробой 1H"),
         "SHORT D": ("weak_bounce_rejection", "Отказ от сопротивления после 1H-отскока"),
         "SHORT E": ("failed_breakout_rejection", "Ложный пробой вверх на 1H"),
@@ -325,6 +333,8 @@ def _conclusion(result: ScenarioResult, row: EnrichedRow, technical: dict[str, A
                 f"Последнее закрытие 1H находится {side_word} подтверждённой точки отмены "
                 f"({level_1h:g}). Структура нарушена; не входить и ждать нового подтверждения."
             )
+
+    # Keep a safe explanation for local/debug formatting of non-alert states.
     if status == "WAIT_BOUNCE":
         coverage = row.liquidation_coverage_of_oi_drop_pct
         if coverage is not None and coverage < 10:
@@ -333,53 +343,56 @@ def _conclusion(result: ScenarioResult, row: EnrichedRow, technical: dict[str, A
                 f"только {_number(coverage, 2)}% снижения OI. Каскадная интерпретация ослаблена; SHORT у минимума "
                 "запрещён. Ждать слабый отскок и подтверждённый отказ от сопротивления."
             )
-        return "Признаки long-liquidation cascade выполнены. SHORT у локального дна запрещён: ждать слабый отскок и подтверждённый отказ от сопротивления."
-    if status == "OBSERVATION_AFTER_BOUNCE":
-        return "Отскок и отказ от сопротивления подтверждены. Это наблюдение, не точка входа; проверить структуру, стоп и риск."
-    if status == "OBSERVATION_WITH_WARNING":
-        return "Числовые условия P1 выполнены, но прогнозный Funding меняет знак относительно текущего. Это качественное предупреждение без заданного P1 порога: сценарий спорный, не считать его безоговорочным наблюдением и не входить автоматически."
+        return "Признаки long-liquidation cascade есть, но SHORT у локального дна запрещён. Ждать подтверждённый слабый отскок и отказ от сопротивления."
     if status == "PREPARATION":
         return "Выполнена только стадия подготовки Short Squeeze. Триггера нет; LONG не открывать."
+    if status == "WAITING_FOR_HIGHER_LOW":
+        return "Higher Low ещё не подтверждён закрытыми свечами 1H. LONG D не подтверждён; не входить."
+    if status == "WAITING_FOR_1H_BREAKOUT_RETEST":
+        return "Закрытый 1H пробой и успешный ретест вверх ещё не подтверждены. Не входить."
+    if status == "WAITING_FOR_1H_BREAKDOWN_RETEST":
+        return "Закрытый 1H пробой вниз и успешный ретест ещё не подтверждены. Не входить."
+    if status == "WAITING_FOR_1H_STRUCTURE_BREAK":
+        return "Медвежий пробой структуры 1H ещё не подтверждён. Не входить."
+    if status.startswith("WAITING_"):
+        return "Условия P1 предварительно выполнены, но обязательное подтверждение ещё отсутствует. Не входить."
+
+    # A Telegram message may be created only for these two states by the
+    # notification collector. Each branch documents the exact confirmation.
+    confirmed = status in {"CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"}
+    if confirmed:
+        confirmations = {
+            "LONG A": "Табличные условия LONG A и закрытый 1H пробой с успешным ретестом подтверждены.",
+            "LONG B": "Табличные условия LONG B, три независимых положительных 4H Spot-снимка и Higher Low 1H подтверждены.",
+            "LONG C": "Обе стадии LONG C и растущая последняя закрытая 1H-свеча подтверждены.",
+            "LONG D": "Табличные условия LONG D и Higher Low 1H подтверждены.",
+            "SHORT A": "Табличные условия SHORT A и закрытый 1H пробой вниз с успешным ретестом подтверждены.",
+            "SHORT B": "Условия Spot Distribution и закрытый 1H пробой вниз с успешным ретестом подтверждены.",
+            "SHORT C": "Табличные условия SHORT C, медвежий пробой структуры 1H и успешный ретест уровня подтверждены.",
+            "SHORT D": "Условия liquidation cascade, слабый отскок и отказ от сопротивления на 1H подтверждены. Не открывать SHORT у минимума.",
+            "SHORT E": "Три сопоставимых 4H-снимка, разворот F/S вниз и неудавшийся пробой вверх на 1H подтверждены.",
+        }
+        conclusion = confirmations.get(code, "Сценарий и его обязательное техническое подтверждение выполнены.")
+        if status == "CONFIRMED_SIGNAL_WITH_WARNING":
+            conclusion += " Предупреждение: прогнозный PFR OI_W меняет знак относительно текущего FR OI_W; P1 не задаёт порог, поэтому это качественный фактор риска."
+
+        context = technical.get("context_4h") or {}
+        ema20, ema50 = context.get("ema20"), context.get("ema50")
+        if isinstance(ema20, (int, float)) and isinstance(ema50, (int, float)):
+            opposing = (result.direction.upper() == "LONG" and ema20 < ema50) or (result.direction.upper() == "SHORT" and ema20 > ema50)
+            if opposing:
+                conclusion += " Внимание: EMA20/EMA50 на 4H направлены против сценария — это противоречащий контекст, проверь риск особенно внимательно."
+        return conclusion + " Перед входом отдельно проверь уровень отмены, стоп, риск, ликвидность и издержки."
+
+    if status == "OBSERVATION_WITH_WARNING":
+        return "Числовые условия P1 выполнены, но прогнозный Funding меняет знак относительно текущего; сценарий не подтверждён для отправки."
     if status == "TRIGGER":
         return "Обе стадии Short Squeeze выполнены. Это триггер для проверки графика, не команда на вход."
     if status == "WAITING_FOR_HISTORY_OR_HIGHER_LOW":
-        return "Табличные условия выполнены, но для LONG B не хватает трёх положительных 4H Spot-снимков и/или Higher Low. Не входить."
+        return "Для LONG B не хватает трёх положительных 4H Spot-снимков и/или Higher Low. Не входить."
     if status == "WAITING_FOR_1H_STRUCTURE_BREAK":
         return "Табличные условия выполнены, но пробой структуры 1H не подтверждён. Не входить."
-
-    context = technical.get("context_4h") or {}
-    ema20, ema50 = context.get("ema20"), context.get("ema50")
-    close = context.get("last_close")
-    if result.direction.upper() == "LONG":
-        support = context.get("last_confirmed_support")
-        if isinstance(close, (int, float)) and isinstance(support, (int, float)) and close < support:
-            return "Табличные условия выполнены, но последнее закрытие 4H ниже подтверждённой поддержки. Графическая структура против LONG. Не входить."
-        if code == "LONG A":
-            retest = technical.get("trend_retest_long")
-            if not isinstance(retest, dict) or retest.get("confirmed") is not True:
-                return "Табличные условия выполнены, но LONG breakout/retest не подтверждён закрытыми свечами. Не входить до подтверждения."
-        if code == "LONG D":
-            higher = technical.get("higher_low")
-            if not isinstance(higher, dict) or higher.get("confirmed") is not True:
-                return "Табличные условия LONG D выполнены, но 1H Higher Low ещё не подтверждён. До его формирования LONG не рассматривать; ждать закрытых 1H-свечей и не входить."
-        if isinstance(ema20, (int, float)) and isinstance(ema50, (int, float)) and ema20 < ema50:
-            return "4H EMA20 ниже EMA50 — медвежий контекст против LONG. Даже при подтверждённом 1H Higher Low/retest это контртрендовая ситуация: только наблюдение, не входить автоматически."
-        if result.status == "OBSERVATION":
-            return "Условия P1 выполнены. График не отменяет сценарий, но статус остаётся наблюдательным; перед входом отдельно проверить точку отмены и риск."
-        return "Подтверждённого LONG-входа нет. Наблюдать, не входить."
-
-    resistance = context.get("last_confirmed_resistance")
-    if isinstance(close, (int, float)) and isinstance(resistance, (int, float)) and close > resistance:
-        return "Табличные условия выполнены, но последнее закрытие 4H выше подтверждённого сопротивления. Графическая структура против SHORT. Не входить."
-    if code == "SHORT A":
-        retest = technical.get("trend_retest_short")
-        if not isinstance(retest, dict) or retest.get("confirmed") is not True:
-            return "Табличные условия выполнены, но SHORT breakdown/retest не подтверждён закрытыми свечами. Не входить до подтверждения."
-    if isinstance(ema20, (int, float)) and isinstance(ema50, (int, float)) and ema20 > ema50:
-        return "4H EMA20 выше EMA50 — бычий контекст против SHORT. Даже при подтверждённом 1H пробое это противоречащий фактор: только наблюдение, не входить автоматически."
-    if result.status == "OBSERVATION":
-        return "Условия P1 выполнены. Статус наблюдательный; проверить подтверждение структуры, точку отмены и риск."
-    return "Подтверждённого SHORT-входа нет. Наблюдать, не входить."
+    return "Обязательные подтверждения отсутствуют. Не входить."
 
 
 def format_alert(
@@ -461,196 +474,6 @@ def format_alert(
     return _safe_telegram_truncate(text)
 
 
-def _share(count: int, total: int) -> str:
-    return f"{count}/{total} ({count / total:.1%})" if total else "n/a"
-
-
-def _market_asset_line(symbol: str, rows: list[EnrichedRow]) -> str | None:
-    item = next((row for row in rows if _base_symbol(row.symbol) == symbol), None)
-    if item is None:
-        return None
-    m = item.market
-    return (
-        f"{symbol}: Цена 24H {_percent(m.chg24_pct, 2)}; "
-        f"OI 24H {_percent(m.oi_chg24_pct, 2)}/{_money(m.oi_chg24_usd)}; "
-        f"OI 4H {_percent(m.oi_chg4h_pct, 2)}/{_money(m.oi_chg4h_usd)}; "
-        f"F/S {_number(m.futures_imbalance_4h, 4, signed=True)}/{_number(m.spot_imbalance_4h, 4, signed=True)}; "
-        f"FR OI_W {_percent(m.fr_oiw_pct, 4)}; L/S 1D {_number(m.ls_ratio_1d, 2)}; "
-        f"BTC Corr. 7D {_number(m.btc_corr7d, 2, signed=True)}"
-    )
-
-
-def format_market_summary(
-    rows: list[EnrichedRow],
-    stats: MarketStats,
-    fetched_at: datetime,
-    contract_type: str,
-    missing_columns: list[str] | None = None,
-    *,
-    strong_flow_quantile: float = 0.15,
-) -> str:
-    quantile = min(max(float(strong_flow_quantile), 0.01), 0.49)
-    quantile_label = f"{quantile:.0%}"
-    timestamp = fetched_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    markets = [item.market for item in rows]
-    price_median_values = sorted(m.chg24_pct for m in markets if m.chg24_pct is not None)
-    price_median = None
-    if price_median_values:
-        middle = len(price_median_values) // 2
-        price_median = (
-            price_median_values[middle]
-            if len(price_median_values) % 2
-            else (price_median_values[middle - 1] + price_median_values[middle]) / 2
-        )
-
-    lines = [
-        "<b>СВОДКА РЫНКА P1</b>",
-        f"Снимок: <code>{timestamp}</code> · Контракты: <code>{_esc(contract_type)}</code> · Строк: <code>{len(rows)}</code>",
-        "",
-        f"Медианы: F <code>{_number(stats.median_f, 4, signed=True)}</code>; S <code>{_number(stats.median_s, 4, signed=True)}</code>; "
-        f"OI 24H <code>{_percent(stats.median_oi24_pct, 2)}</code> / <code>{_money(stats.median_oi24_usd)}</code>; "
-        f"OI 4H <code>{_percent(stats.median_oi4h_pct, 2)}</code> / <code>{_money(stats.median_oi4h_usd)}</code>; "
-        f"Цена 24H <code>{_percent(price_median, 2)}</code>.",
-        f"Распределение: F<0 <code>{_share(stats.f_negative_count, stats.f_count)}</code>; "
-        f"S<0 <code>{_share(stats.s_negative_count, stats.s_count)}</code>; "
-        f"OI 24H<0 <code>{_share(stats.oi24_negative_count, stats.oi24_count)}</code>; "
-        f"Цена 24H>0 <code>{_share(stats.price_positive_count, stats.price_count)}</code>.",
-    ]
-    for symbol in ("BTC", "ETH"):
-        asset = _market_asset_line(symbol, rows)
-        if asset:
-            lines.append(asset)
-
-    valid_f = [item for item in rows if item.market.futures_imbalance_4h is not None]
-    valid_s = [item for item in rows if item.market.spot_imbalance_4h is not None]
-    f_tail = _rank_tail_count(len(valid_f), quantile)
-    s_tail = _rank_tail_count(len(valid_s), quantile)
-
-    def ranked_line(label: str, values: list[EnrichedRow], metric: str, adjusted: str, reverse: bool) -> None:
-        target_count = f_tail if metric == "futures_imbalance_4h" else s_tail
-        rank_attr = "f_rank_desc" if metric == "futures_imbalance_4h" else "s_rank_desc"
-        valid_count = len(values)
-        if reverse:
-            selected = [item for item in values if getattr(item, rank_attr) is not None and getattr(item, rank_attr) <= target_count]
-        else:
-            bottom_rank = valid_count - target_count + 1
-            selected = [item for item in values if getattr(item, rank_attr) is not None and getattr(item, rank_attr) >= bottom_rank]
-        selected.sort(
-            key=lambda item: (
-                -getattr(item.market, metric) if reverse else getattr(item.market, metric),
-                item.symbol,
-            )
-        )
-        if not selected:
-            return
-        chunks = [
-            f"{_base_symbol(item.symbol)} {_number(getattr(item.market, metric), 4, signed=True)} "
-            f"(adj {_number(getattr(item, adjusted), 4, signed=True)}; rank {getattr(item, rank_attr):g})"
-            for item in selected
-        ]
-        tail_name = "верхние" if reverse else "нижние"
-        lines.append(
-            f"{label} (n={target_count}; ties included, фактически n={len(selected)}): "
-            + "; ".join(chunks)
-        )
-
-    if valid_f:
-        ranked_line(f"F верхние {quantile_label}", valid_f, "futures_imbalance_4h", "f_adj", True)
-        ranked_line(f"F нижние {quantile_label}", valid_f, "futures_imbalance_4h", "f_adj", False)
-    if valid_s:
-        ranked_line(f"S верхние {quantile_label}", valid_s, "spot_imbalance_4h", "s_adj", True)
-        ranked_line(f"S нижние {quantile_label}", valid_s, "spot_imbalance_4h", "s_adj", False)
-
-    f_s_valid = [item for item in rows if item.market.futures_imbalance_4h is not None and item.market.spot_imbalance_4h is not None]
-    price_spot_valid = [item for item in rows if item.market.chg24_pct is not None and item.market.spot_imbalance_4h is not None]
-    f_s_div = sum(1 for item in f_s_valid if item.market.futures_imbalance_4h * item.market.spot_imbalance_4h < 0)
-    price_up_spot_down = sum(1 for item in price_spot_valid if item.market.chg24_pct > 0 and item.market.spot_imbalance_4h < 0)
-    price_down_spot_up = sum(1 for item in price_spot_valid if item.market.chg24_pct < 0 and item.market.spot_imbalance_4h > 0)
-    price_oi_valid = [item for item in rows if item.market.chg24_pct is not None and item.market.oi_chg24_pct is not None]
-    price_up_oi_down = sum(1 for item in price_oi_valid if item.market.chg24_pct > 0 and item.market.oi_chg24_pct < 0)
-    price_down_oi_down = sum(1 for item in price_oi_valid if item.market.chg24_pct < 0 and item.market.oi_chg24_pct < 0)
-    price_down_oi_up = sum(1 for item in price_oi_valid if item.market.chg24_pct < 0 and item.market.oi_chg24_pct > 0)
-
-    rs_rows = [item for item in rows if item.rel_strength_vs_btc_pp is not None]
-    rs_positive = [item for item in rs_rows if item.rel_strength_vs_btc_pp > 0]
-    rs_negative = [item for item in rs_rows if item.rel_strength_vs_btc_pp < 0]
-    rs_top = sorted(rs_positive, key=lambda item: item.rel_strength_vs_btc_pp, reverse=True)[:5]
-    rs_bottom = sorted(rs_negative, key=lambda item: item.rel_strength_vs_btc_pp)[:5]
-    if rs_rows:
-        lines.append(
-            f"RelStrength к BTC: положительная <code>{len(rs_positive)}/{len(rs_rows)}</code>, "
-            f"отрицательная <code>{len(rs_negative)}/{len(rs_rows)}</code>. "
-            "Лидеры: "
-            + (", ".join(f"{_base_symbol(x.symbol)} {_number(x.rel_strength_vs_btc_pp, 2, signed=True)} п.п." for x in rs_top) or "нет")
-        )
-        lines.append(
-            "Отстают от BTC: "
-            + (", ".join(f"{_base_symbol(x.symbol)} {_number(x.rel_strength_vs_btc_pp, 2, signed=True)} п.п." for x in rs_bottom) or "нет")
-        )
-
-    corr_valid = [item for item in rows if item.market.btc_corr7d is not None]
-    corr_high = [item for item in corr_valid if item.market.btc_corr7d > 0.7]
-    # Include BTC itself in the market statistic (as the other report does),
-    # but exclude it from the list of altcoin exposures correlated with BTC.
-    corr_linked = [item for item in corr_high if _base_symbol(item.symbol) != "BTC"]
-    low_oi = [item for item in rows if item.market.oi_usd is not None and item.market.oi_usd < 40_000_000]
-    low_oi4h = [item for item in rows if item.market.oi_chg4h_usd is not None and abs(item.market.oi_chg4h_usd) < 2_000_000]
-    high_vol_mc = [item for item in rows if item.market.vol_mktcap_ratio is not None and item.market.vol_mktcap_ratio > 2.0]
-    low_oi_vol = [item for item in rows if item.market.oi_vol_ratio is not None and item.market.oi_vol_ratio < 0.1]
-    missing_spot = [item for item in rows if item.market.spot_imbalance_4h is None]
-    funding_flip = [
-        item for item in rows
-        if item.market.fr_oiw_pct is not None and item.market.pfr_oiw_pct is not None
-        and item.market.fr_oiw_pct * item.market.pfr_oiw_pct < 0
-    ]
-    voluntary = [
-        item for item in rows
-        if item.oi_drop_mostly_voluntary is True and item.liquidation_coverage_of_oi_drop_pct is not None
-    ]
-
-    lines.append(
-        f"Расхождения: F/S разного знака <code>{f_s_div}/{len(f_s_valid)}</code>; "
-        f"Цена↑/Spot↓ <code>{price_up_spot_down}/{len(price_spot_valid)}</code>; "
-        f"Цена↓/Spot↑ <code>{price_down_spot_up}/{len(price_spot_valid)}</code>; "
-        f"Цена↑/OI24↓ <code>{price_up_oi_down}/{len(price_oi_valid)}</code>; "
-        f"Цена↓/OI24↓ <code>{price_down_oi_down}/{len(price_oi_valid)}</code>; "
-        f"Цена↓/OI24↑ <code>{price_down_oi_up}/{len(price_oi_valid)}</code>."
-    )
-    lines.append(
-        f"Качество/экспозиция: OI<$40 млн <code>{len(low_oi)}</code>; OI 4H <$2 млн <code>{len(low_oi4h)}</code>; "
-        f"VOL24H/MktCap>2 <code>{len(high_vol_mc)}</code>; OI/VOL24H<0,1 <code>{len(low_oi_vol)}</code>; "
-        f"BTC Corr. 7D>0,7 <code>{len(corr_high)}/{len(corr_valid)}</code>; связанных альтов <code>{len(corr_linked)}</code>; "
-        f"Spot n/a <code>{len(missing_spot)}</code>."
-    )
-    if corr_linked:
-        lines.append("Связанные с BTC альты (не независимые позиции): " + ", ".join(_base_symbol(item.symbol) for item in corr_linked[:12]) + ("…" if len(corr_linked) > 12 else ""))
-    if funding_flip:
-        lines.append(
-            "PFR OI_W меняет знак относительно текущего FR OI_W (предупреждение, без выдуманного порога): "
-            + ", ".join(_base_symbol(item.symbol) for item in funding_flip[:12])
-            + ("…" if len(funding_flip) > 12 else "")
-        )
-    if voluntary:
-        lines.append(
-            "Покрытие падения OI ликвидациями <10% (вероятно, преобладает добровольное закрытие): "
-            + ", ".join(
-                f"{_base_symbol(item.symbol)} {_number(item.liquidation_coverage_of_oi_drop_pct, 2)}%"
-                for item in sorted(voluntary, key=lambda item: item.liquidation_coverage_of_oi_drop_pct)[:10]
-            )
-        )
-    if missing_spot:
-        lines.append("Spot Imbalance отсутствует: " + ", ".join(_base_symbol(item.symbol) for item in missing_spot[:12]) + ("…" if len(missing_spot) > 12 else ""))
-    if len(rows) < 20:
-        lines.append("⚠️ Менее 20 строк: ранги верхних/нижних 15% ненадёжны.")
-    if missing_columns:
-        lines.append("Не распознаны колонки Coinalyze (сигналы при обязательных пропусках блокируются): " + _esc(", ".join(missing_columns)))
-    lines.extend([
-        "",
-        "Интерпретация: доли и ранги описывают только эту выборку; F/S — нормированные дисбалансы, L/S — доли аккаунтов, рост OI не указывает сторону позиции.",
-        "P1 — стартовые гипотезы без backtest; по одному показателю вход не определяется.",
-    ])
-    text = "\n".join(lines)
-    return _safe_telegram_truncate(text)
 
 
 class TelegramClient:

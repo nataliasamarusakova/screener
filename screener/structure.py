@@ -373,7 +373,11 @@ def scenario_invalidation(direction: str, scenario: str, technical: dict[str, An
             source = technical.get("failed_breakout_rejection") or {}
             source_name = "confirmed failed 1H breakout level"
             level = source.get("failed_level")
-        elif scenario.startswith(("SHORT B", "SHORT C")):
+        elif scenario.startswith("SHORT B"):
+            source = technical.get("trend_retest_short") or technical.get("1h_retest") or {}
+            source_name = "confirmed 1H breakdown/retest level"
+            level = source.get("level")
+        elif scenario.startswith("SHORT C"):
             source = technical.get("bearish_structure_break") or {}
             source_name = "confirmed 1H bearish structure level"
             level = source.get("level")

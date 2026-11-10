@@ -59,17 +59,16 @@ def _oi_growth_min(symbol: str, thresholds: dict[str, Any]) -> float:
 
 
 def _result(row: EnrichedRow, scenario: str, direction: str, checks: list[Check], status: str = "NOT_MET", reason: str = "", technical: dict[str, Any] | None = None) -> ScenarioResult:
-    # A PFR OI_W sign reversal is explicitly qualitative in P1: there is no
-    # numeric threshold, so it must not change the k/N count or become a hard
-    # failed condition. It does, however, prevent an unqualified OBSERVATION.
+    # A PFR OI_W sign reversal is qualitative in P1: it does not cancel an
+    # otherwise confirmed setup, but it must remain visible as a warning.
     market = row.market
     funding_sign_reversal = (
         market.fr_oiw_pct is not None
         and market.pfr_oiw_pct is not None
         and market.fr_oiw_pct * market.pfr_oiw_pct < 0
     )
-    if status == "OBSERVATION" and funding_sign_reversal:
-        status = "OBSERVATION_WITH_WARNING"
+    if status == "CONFIRMED_SIGNAL" and funding_sign_reversal:
+        status = "CONFIRMED_SIGNAL_WITH_WARNING"
         warning = "PFR OI_W changes sign versus current FR OI_W; qualitative warning only (P1 has no numeric cutoff)."
         reason = f"{reason}; {warning}" if reason else warning
 
@@ -136,12 +135,13 @@ def evaluate_scenarios(
     status, reason = "NOT_MET", ""
     if all(c.passed is True for c in checks):
         retest = technical.get("trend_retest_long", {})
-        if retest.get("confirmed"):
-            reason = "All P1 table conditions and 1H breakout/retest confirmed; observation only, not an entry"
+        if retest.get("confirmed") is True:
+            status = "CONFIRMED_SIGNAL"
+            reason = "All P1 table conditions and the closed 1H breakout/retest are confirmed; verify execution risk before entry"
         else:
-            reason = "All P1 table conditions met; verify 1H close beyond the level and retest before any entry"
-        status = "OBSERVATION"
-    out.append(_result(row, "LONG A — Trend Continuation", "LONG", checks, status, reason, {"1h_retest": technical.get("trend_retest_long")}))
+            status = "WAITING_FOR_1H_BREAKOUT_RETEST"
+            reason = "P1 table conditions are met, but the closed 1H breakout and retest are not confirmed"
+    out.append(_result(row, "LONG A — Trend Continuation", "LONG", checks, status, reason, {"trend_retest_long": technical.get("trend_retest_long")}))
 
     # LONG B — Spot Accumulation
     spot_seq = technical.get("spot_sequence_ok")
@@ -156,8 +156,8 @@ def evaluate_scenarios(
         _check("Quality flags", no_flags, ", ".join(row.quality_flags) or "none", "none"),
     ]
     if all(c.passed is True for c in checks):
-        if spot_seq is True and higher_low.get("confirmed") and no_flags:
-            status, reason = "OBSERVATION", "Three separate positive Spot snapshots and 1H higher low confirmed; observation only"
+        if spot_seq is True and higher_low.get("confirmed") is True and no_flags:
+            status, reason = "CONFIRMED_SIGNAL", "Three separate positive Spot snapshots and the 1H higher low are confirmed; verify execution risk before entry"
         else:
             status, reason = "WAITING_FOR_HISTORY_OR_HIGHER_LOW", "Table conditions met; still need 3 positive Spot snapshots spaced about 4h apart and a 1H higher low"
     else:
@@ -180,7 +180,7 @@ def evaluate_scenarios(
         _check("Quality flags", no_flags, ", ".join(row.quality_flags) or "none", "none"),
     ]
     if all(c.passed is True for c in trigger_checks):
-        status, reason = "TRIGGER", "Both LONG C stages passed; chart still required for entry"
+        status, reason = "CONFIRMED_SIGNAL", "Both LONG C stages and the rising 1H trigger are confirmed; verify execution risk before entry"
         visible_checks = trigger_checks
     elif all(c.passed is True for c in prep_checks):
         status, reason = "PREPARATION", "Preparation stage passed (2/2); squeeze trigger is not confirmed"
@@ -208,10 +208,10 @@ def evaluate_scenarios(
     if all(c.passed is True for c in checks):
         if not no_flags:
             status, reason = "BLOCKED_QUALITY", "Data pattern matches but market-quality flags exclude this market"
-        elif higher_low.get("confirmed"):
-            status, reason = "OBSERVATION", "All table conditions and 1H higher low confirmed; observation only, not an entry"
+        elif higher_low.get("confirmed") is True:
+            status, reason = "CONFIRMED_SIGNAL", "All P1 table conditions and the 1H higher low are confirmed; verify execution risk before entry"
         else:
-            status, reason = "OBSERVATION", "All table conditions met; LONG is not considered until a 1H higher low forms"
+            status, reason = "WAITING_FOR_HIGHER_LOW", "P1 table conditions are met, but LONG D is not confirmed until a 1H higher low forms"
     else:
         status, reason = "NOT_MET", ""
     out.append(_result(row, "LONG D — Post-Long-Flush Reversal", "LONG", checks, status, reason, {"higher_low": higher_low, "liq_coverage_of_oi_drop_pct": row.liquidation_coverage_of_oi_drop_pct}))
@@ -232,13 +232,13 @@ def evaluate_scenarios(
     ]
     if all(c.passed is True for c in checks):
         retest = technical.get("trend_retest_short", {})
-        if retest.get("confirmed"):
-            status, reason = "OBSERVATION", "All P1 table conditions and 1H breakdown/retest confirmed; observation only, not an entry"
+        if retest.get("confirmed") is True:
+            status, reason = "CONFIRMED_SIGNAL", "All P1 table conditions and the closed 1H breakdown/retest are confirmed; verify execution risk before entry"
         else:
-            status, reason = "OBSERVATION", "All P1 table conditions met; verify 1H close below support and retest from below before any entry"
+            status, reason = "WAITING_FOR_1H_BREAKDOWN_RETEST", "P1 table conditions are met, but the closed 1H breakdown and retest are not confirmed"
     else:
         status, reason = "NOT_MET", ""
-    out.append(_result(row, "SHORT A — Trend Continuation", "SHORT", checks, status, reason, {"1h_retest": technical.get("trend_retest_short"), "cascade": cascade}))
+    out.append(_result(row, "SHORT A — Trend Continuation", "SHORT", checks, status, reason, {"trend_retest_short": technical.get("trend_retest_short"), "cascade": cascade}))
 
     # SHORT B — Spot Distribution
     checks = [
@@ -251,9 +251,17 @@ def evaluate_scenarios(
         _check("No liquidation-cascade prohibition", None if cascade is None else not cascade, str(cascade), "SHORT forbidden during active long-liquidation cascade"),
         _check("Quality flags", no_flags, ", ".join(row.quality_flags) or "none", "none"),
     ]
-    status = "OBSERVATION" if all(c.passed is True for c in checks) else "NOT_MET"
-    reason = "Full SHORT B data pattern; confirm distribution/failed structure on 1H" if status == "OBSERVATION" else ""
-    out.append(_result(row, "SHORT B — Spot Distribution", "SHORT", checks, status, reason))
+    if all(c.passed is True for c in checks):
+        retest = technical.get("trend_retest_short", {})
+        if retest.get("confirmed") is True:
+            status = "CONFIRMED_SIGNAL"
+            reason = "SHORT B Spot distribution conditions and the closed 1H breakdown/retest are confirmed; verify execution risk before entry"
+        else:
+            status = "WAITING_FOR_1H_BREAKDOWN_RETEST"
+            reason = "SHORT B table conditions are met, but the closed 1H breakdown and retest are not confirmed"
+    else:
+        status, reason = "NOT_MET", ""
+    out.append(_result(row, "SHORT B — Spot Distribution", "SHORT", checks, status, reason, {"trend_retest_short": technical.get("trend_retest_short")}))
 
     # SHORT C — Long Squeeze / Reversal
     checks = [
@@ -269,11 +277,19 @@ def evaluate_scenarios(
     ]
     if all(c.passed is True for c in checks):
         structure = technical.get("bearish_structure_break", {})
-        status = "OBSERVATION" if structure.get("confirmed") and no_flags else "WAITING_FOR_1H_STRUCTURE_BREAK"
-        reason = structure.get("reason", "Need confirmed 1H structure break")
+        retest = technical.get("trend_retest_short", {})
+        if structure.get("confirmed") is True and retest.get("confirmed") is True and no_flags:
+            status = "CONFIRMED_SIGNAL"
+            reason = "SHORT C table conditions, the closed 1H bearish structure break and successful breakdown retest are confirmed"
+        else:
+            status = "WAITING_FOR_1H_STRUCTURE_BREAK"
+            reason = "SHORT C table conditions are met, but the 1H breakdown and successful retest are not both confirmed"
     else:
         status, reason = "NOT_MET", ""
-    out.append(_result(row, "SHORT C — Long Squeeze / Reversal", "SHORT", checks, status, reason, {"bearish_structure_break": technical.get("bearish_structure_break")}))
+    out.append(_result(row, "SHORT C — Long Squeeze / Reversal", "SHORT", checks, status, reason, {
+        "bearish_structure_break": technical.get("bearish_structure_break"),
+        "trend_retest_short": technical.get("trend_retest_short"),
+    }))
 
     # SHORT D — Long Liquidation Cascade. Wait status only; never alert as an entry.
     checks = [
@@ -282,15 +298,25 @@ def evaluate_scenarios(
         _check("OI 4H negative", _lt(m.oi_chg4h_pct), f"{m.oi_chg4h_pct}%", "< 0%"),
         _check("F negative", _lt(m.futures_imbalance_4h), str(m.futures_imbalance_4h), "< 0"),
         _check("S negative", _lt(m.spot_imbalance_4h), str(m.spot_imbalance_4h), "< 0"),
+        _check(
+            "Liquidations cover at least 10% of OI decline",
+            _ge(row.liquidation_coverage_of_oi_drop_pct, 10.0),
+            f"{row.liquidation_coverage_of_oi_drop_pct:.2f}%" if row.liquidation_coverage_of_oi_drop_pct is not None else "n/a",
+            ">= 10%; below 10% P1 attributes most OI decline to voluntary closing, not a liquidation cascade",
+        ),
+        _check("Quality flags", no_flags, ", ".join(row.quality_flags) or "none", "none"),
     ]
-    if all(c.passed is True for c in checks) and no_flags:
+    cascade_inputs_pass = all(c.passed is True for c in checks[:5])
+    if cascade_inputs_pass and not no_flags:
+        status, reason = "BLOCKED_QUALITY", "Cascade inputs are present but quality flags exclude this market"
+    elif cascade_inputs_pass and checks[5].passed is not True:
+        status, reason = "BLOCKED_CAUSALITY", "Liquidations explain less than 10% of OI decline or coverage data is missing; P1 does not support calling this a liquidation cascade"
+    elif all(c.passed is True for c in checks):
         rejection = technical.get("weak_bounce_rejection", {})
         if rejection.get("confirmed"):
-            status, reason = "OBSERVATION_AFTER_BOUNCE", "Weak bounce and rejection at resistance confirmed; evaluate SHORT structure/risk, never enter at the low."
+            status, reason = "CONFIRMED_SIGNAL", "Liquidation-cascade filters, weak bounce and rejection at resistance are confirmed; verify execution risk before entry and never short the low"
         else:
             status, reason = "WAIT_BOUNCE", "Cascade conditions present; SHORT is prohibited at the low. Wait for weak bounce and rejection at resistance."
-    elif all(c.passed is True for c in checks):
-        status, reason = "BLOCKED_QUALITY", "Cascade pattern present but quality flags exclude this market"
     else:
         status, reason = "NOT_MET", ""
     out.append(_result(row, "SHORT D — Long Liquidation Cascade", "SHORT", checks, status, reason, {"weak_bounce_rejection": technical.get("weak_bounce_rejection"), "liq_coverage_of_oi_drop_pct": row.liquidation_coverage_of_oi_drop_pct}))
@@ -344,8 +370,8 @@ def evaluate_scenarios(
         _check("No liquidation-cascade prohibition", None if cascade is None else not cascade, str(cascade), "SHORT forbidden during active long-liquidation cascade"),
         _check("Quality flags", no_flags, ", ".join(row.quality_flags) or "none", "none"),
     ]
-    status = "OBSERVATION" if all(c.passed is True for c in checks) and no_flags else "NOT_MET"
-    reason = "Three consecutive 4H observations and 1H failed-breakout predicates align; manual chart/risk review required" if status == "OBSERVATION" else "Requires three consecutive 4H snapshots with valid spacing, earlier short liquidation/OI decline, F/S turn-down and 1H failed-breakout structure"
+    status = "CONFIRMED_SIGNAL" if all(c.passed is True for c in checks) and no_flags else "NOT_MET"
+    reason = "Three consecutive 4H observations, the F/S turn-down and the 1H failed-breakout are confirmed; verify execution risk before entry" if status == "CONFIRMED_SIGNAL" else "Requires three consecutive 4H snapshots with valid spacing, earlier short liquidation/OI decline, F/S turn-down and 1H failed-breakout structure"
 
     out.append(_result(row, "SHORT E — Failed Short Squeeze", "SHORT", checks, status, reason, {"failed_breakout_rejection": technical.get("failed_breakout_rejection")}))
 

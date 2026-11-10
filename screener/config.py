@@ -70,7 +70,6 @@ class Settings:
     telegram_bot_token: str
     telegram_chat_ids: list[str]
     telegram_cooldown_hours: float
-    telegram_send_wait_states: bool
     data_dir: Path
     log_level: str
     dry_run: bool
@@ -117,7 +116,6 @@ def load_settings(root: Path = ROOT) -> Settings:
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         telegram_chat_ids=chat_ids,
         telegram_cooldown_hours=max(0.0, float(os.getenv("TELEGRAM_COOLDOWN_HOURS", "4"))),
-        telegram_send_wait_states=_bool_env("TELEGRAM_SEND_WAIT_STATES", True),
         data_dir=data_dir,
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         dry_run=_bool_env("DRY_RUN", True),
