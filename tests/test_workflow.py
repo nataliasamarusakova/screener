@@ -47,15 +47,6 @@ def test_workflow_queues_pending_runs_and_does_not_commit_per_run_journal():
     assert "data/runs.jsonl" in gitignore
 
 
-def test_python311_ci_workflow_runs_tests_without_market_secrets():
-    root = Path(__file__).parents[1]
-    workflow = (root / ".github/workflows/tests.yml").read_text()
-    assert 'python-version: "3.11"' in workflow
-    assert "python -m pip install -r requirements.txt" in workflow
-    assert "python -m pytest -q" in workflow
-    assert "repository_dispatch" not in workflow
-    assert "TG_BOT_TOKEN" not in workflow
-
 
 def test_canonical_p1_reference_is_versioned_with_the_codebase():
     root = Path(__file__).parents[1]

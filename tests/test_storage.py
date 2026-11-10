@@ -183,9 +183,10 @@ def test_snapshot_due_samples_only_near_the_four_hour_p1_interval(tmp_path):
     base = datetime(2026, 11, 10, 8, 0, tzinfo=timezone.utc)
     store = Store(tmp_path / "sample-data")
     store.add_snapshot(base, "PERPETUAL", [_row()])
-    assert store.snapshot_due(base + timedelta(hours=3, minutes=49), interval_hours=4, tolerance_minutes=10) is False
-    assert store.snapshot_due(base + timedelta(hours=3, minutes=50), interval_hours=4, tolerance_minutes=10) is True
-    assert store.snapshot_due(base + timedelta(hours=4), interval_hours=4, tolerance_minutes=10) is True
+    assert store.snapshot_due(base + timedelta(hours=3, minutes=49), interval_hours=4) is False
+    assert store.snapshot_due(base + timedelta(hours=3, minutes=50), interval_hours=4) is False
+    assert store.snapshot_due(base + timedelta(hours=3, minutes=59), interval_hours=4) is False
+    assert store.snapshot_due(base + timedelta(hours=4), interval_hours=4) is True
 
 
 def test_latest_notification_state_tracks_transition_per_recipient(tmp_path):
@@ -198,3 +199,67 @@ def test_latest_notification_state_tracks_transition_per_recipient(tmp_path):
     assert store.latest_notification_state(group, "chat-1")["fingerprint"] == "B"
     store.record_notification("event-A-again", 3, chat_id="chat-1", event_group=group, fingerprint="A")
     assert store.latest_notification_state(group, "chat-1")["fingerprint"] == "A"
+
+
+def test_spot_sequence_does_not_reuse_an_older_run_after_latest_snapshot_gap(tmp_path):
+    store = Store(tmp_path / "spot-sequence-gap-data")
+    base = datetime(2026, 11, 9, 0, 0, tzinfo=timezone.utc)
+    for index, hours in enumerate((0, 4, 8, 16, 20)):
+        row = _row()
+        row.spot_imbalance_4h = 2.0 + index
+        store.add_snapshot(base + timedelta(hours=hours), "PERPETUAL", [row])
+    # The older t0/t4/t8 sequence was positive, but the *latest* three snapshots
+    # contain an 8-hour gap and cannot be treated as a consecutive P1 sequence.
+    assert store.spot_sequence_status("BTCUSDT_PERP.A", required=3, interval_hours=4, tolerance_minutes=10) is None
+
+
+def test_spot_sequence_rejects_overlapping_windows_but_allows_bounded_late_poll(tmp_path):
+    store = Store(tmp_path / "spot-sequence-boundary-data")
+    base = datetime(2026, 11, 9, 0, 0, tzinfo=timezone.utc)
+    # 3h55 gaps overlap the rolling 4H windows and cannot count as independent.
+    for index, hour in enumerate((0, 3.92, 7.84)):
+        row = _row()
+        row.spot_imbalance_4h = 1.0 + index
+        store.add_snapshot(base + timedelta(hours=hour), "PERPETUAL", [row])
+    assert store.spot_sequence_status("BTCUSDT_PERP.A", required=3, interval_hours=4, tolerance_minutes=10) is None
+
+    # Replace with clean 4h gaps; a small late scheduler poll is tolerated.
+    clean = Store(tmp_path / "spot-sequence-late-data")
+    for index, hour in enumerate((0, 4.05, 8.10)):
+        row = _row()
+        row.spot_imbalance_4h = 1.0 + index
+        clean.add_snapshot(base + timedelta(hours=hour), "PERPETUAL", [row])
+    assert clean.spot_sequence_status("BTCUSDT_PERP.A", required=3, interval_hours=4, tolerance_minutes=10) is True
+
+
+def test_spot_sequence_does_not_mix_all_contracts_with_perpetual_history(tmp_path):
+    store = Store(tmp_path / "contract-type-history-data")
+    base = datetime(2026, 11, 9, 0, 0, tzinfo=timezone.utc)
+    for hours, contract_type in ((0, "ALL_CONTRACTS"), (4, "ALL_CONTRACTS"), (8, "PERPETUAL"), (12, "PERPETUAL")):
+        row = _row()
+        row.spot_imbalance_4h = 2.0
+        store.add_snapshot(base + timedelta(hours=hours), contract_type, [row])
+
+    # The unfiltered history has three consecutive positive observations at t=4/8/12,
+    # but only two belong to the currently selected Perpetual universe.
+    assert len(store.recent_symbol_history("BTCUSDT_PERP.A", limit=10)) == 4
+    assert len(store.recent_symbol_history("BTCUSDT_PERP.A", limit=10, contract_type="PERPETUAL")) == 2
+    assert store.spot_sequence_status(
+        "BTCUSDT_PERP.A", required=3, interval_hours=4, tolerance_minutes=10,
+        contract_type="PERPETUAL",
+    ) is None
+
+
+def test_snapshot_due_starts_new_history_immediately_after_contract_view_change(tmp_path):
+    store = Store(tmp_path / "contract-switch-sampling-data")
+    base = datetime(2026, 11, 9, 0, 0, tzinfo=timezone.utc)
+    store.add_snapshot(base, "ALL_CONTRACTS", [_row()])
+
+    # A different contracts universe cannot be compared to the prior snapshot;
+    # it starts a separate series rather than waiting for the old series' 4H timer.
+    assert store.snapshot_due(
+        base + timedelta(hours=1), interval_hours=4, contract_type="PERPETUAL"
+    ) is True
+    assert store.snapshot_due(
+        base + timedelta(hours=1), interval_hours=4, contract_type="ALL_CONTRACTS"
+    ) is False

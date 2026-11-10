@@ -223,7 +223,7 @@ def test_price_oi_snapshot_classification_marks_overlapping_windows_preliminary(
     store.add_snapshot(first_time, "PERPETUAL", [first])
     store.add_snapshot(second_time, "PERPETUAL", [second])
     enriched, _ = analyze_universe([second], {"thresholds": {}})
-    delta = _snapshot_deltas(store, enriched, second_time)["BTCUSDT_PERP"]
+    delta = _snapshot_deltas(store, enriched, second_time, snapshot_saved=True)["BTCUSDT_PERP"]
     assert delta["price_change_pct"] > 0
     assert delta["oi_change_pct"] > 0
     assert delta["price_x_oi_classification"].startswith("preliminary_overlapping_windows:")
@@ -435,10 +435,10 @@ def test_market_summary_matches_75_row_reference_counts_ranks_and_correlations()
     assert pons.s_strong_buy is False
 
     text = format_market_summary(rows, stats, datetime.now(timezone.utc), "PERPETUAL")
-    assert "F верхние 15% (n=11)" in text
-    assert "F нижние 15% (n=11)" in text
-    assert "S верхние 15% (n=11)" in text
-    assert "S нижние 15% (n=11)" in text
+    assert "F верхние 15% (n=11;" in text
+    assert "F нижние 15% (n=11;" in text
+    assert "S верхние 15% (n=11;" in text
+    assert "S нижние 15% (n=11;" in text
     # BTC is included in the correlation statistic, but not in correlated-alt exposure count.
     assert "BTC Corr. 7D>0,7 <code>45/75</code>; связанных альтов <code>44</code>" in text
     assert "F/S разного знака <code>1/72</code>" in text
@@ -721,3 +721,208 @@ def test_technical_for_symbol_uses_closed_15m_and_derives_24h_low_from_closed_1h
     assert technical["context_15m"]["source"] == "last closed Binance 15m candle"
     assert technical["range_24h_1h"]["low"] == 95.0
     assert technical["range_24h_1h"]["distance_from_low_pct"] is not None
+
+
+def test_snapshot_delta_uses_live_unsaved_values_not_two_older_saved_snapshots(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from screener.service import _snapshot_deltas
+    from screener.storage import Store
+
+    first_at = datetime(2026, 11, 10, 0, 0, tzinfo=timezone.utc)
+    second_at = first_at + timedelta(hours=4)
+    live_at = second_at + timedelta(minutes=30)
+    first = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=100, oi_usd=100_000_000)
+    second = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=101, oi_usd=101_000_000)
+    live = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=120, oi_usd=120_000_000)
+    store = Store(tmp_path / "live-delta-data")
+    store.add_snapshot(first_at, "PERPETUAL", [first])
+    store.add_snapshot(second_at, "PERPETUAL", [second])
+    enriched, _ = analyze_universe([live], {"thresholds": {}})
+
+    delta = _snapshot_deltas(store, enriched, live_at, snapshot_saved=False)["BTCUSDT_PERP"]
+    assert delta["interval_hours"] == 0.5
+    assert round(delta["price_change_pct"], 2) == 18.81
+    assert round(delta["oi_change_pct"], 2) == 18.81
+    assert delta["price_x_oi_classification"].startswith("preliminary_overlapping_windows:")
+
+
+def test_unchanged_snapshot_delta_is_zero_and_explicitly_unavailable(tmp_path):
+    from datetime import datetime, timezone
+    from screener.service import _snapshot_deltas
+    from screener.storage import Store
+
+    timestamp = datetime(2026, 11, 10, 8, 0, tzinfo=timezone.utc)
+    row = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=100, oi_usd=100_000_000)
+    store = Store(tmp_path / "unchanged-delta-data")
+    store.add_snapshot(timestamp, "PERPETUAL", [row])
+    enriched, _ = analyze_universe([row], {"thresholds": {}})
+    delta = _snapshot_deltas(store, enriched, timestamp, unchanged=True)["BTCUSDT_PERP"]
+    assert delta["price_change_pct"] == 0.0
+    assert delta["oi_change_pct"] == 0.0
+    assert delta["price_x_oi_classification"] == "no_new_table_data"
+
+
+def test_market_summary_includes_all_assets_tied_at_quantile_boundary():
+    from datetime import datetime, timezone
+    from screener.telegram import format_market_summary
+
+    markets = []
+    for index in range(10):
+        markets.append(MarketRow(
+            symbol=f"TIE{index}USDT_PERP", name=f"TIE{index}", price=1.0,
+            chg24_pct=0.0, futures_imbalance_4h=10.0 if index < 3 else float(10 - index),
+            spot_imbalance_4h=10.0 if index < 3 else float(10 - index),
+        ))
+    enriched, stats = analyze_universe(markets, {"thresholds": {"strong_flow_quantile": 0.15}})
+    text = format_market_summary(enriched, stats, datetime.now(timezone.utc), "PERPETUAL")
+    top_line = next(line for line in text.splitlines() if line.startswith("F верхние 15%"))
+    assert "rank 2" in top_line
+    assert "фактически n=3" in top_line
+    assert all(f"TIE{index} " in top_line for index in range(3))
+
+
+def test_telegram_conclusion_blocks_long_when_latest_closed_1h_is_below_confirmed_invalidation():
+    from screener.telegram import format_alert
+
+    market = MarketRow(
+        symbol="ALTUSDT_PERP", name="ALT", price=10, chg24_pct=2,
+        oi_usd=100_000_000, futures_imbalance_4h=5, spot_imbalance_4h=5,
+    )
+    enriched, _ = analyze_universe([market], {"thresholds": {}})
+    result = ScenarioResult(
+        symbol=market.symbol, name=market.name, scenario="LONG A — Trend Continuation",
+        direction="LONG", checks=[Check("all", True, "ok", "rule")],
+        quality_flags=[], status="OBSERVATION",
+        technical={
+            "trend_retest_long": {"confirmed": True, "level": 10.0},
+            "last_closed_1h": {"close": 9.8},
+        },
+    )
+    message = format_alert(result, enriched[0])
+    assert "Последнее закрытие 1H находится ниже подтверждённой точки отмены" in message
+    assert "не входить" in message
+
+
+def test_invalidated_1h_setup_is_not_left_as_positive_observation():
+    from screener.service import _apply_1h_structure_invalidation
+
+    result = ScenarioResult(
+        symbol="ALTUSDT_PERP", name="ALT", scenario="LONG A — Trend Continuation",
+        direction="LONG", checks=[Check("all", True, "ok", "rule")],
+        quality_flags=[], status="OBSERVATION",
+        technical={"trend_retest_long": {"confirmed": False, "invalidated": True}},
+    )
+    _apply_1h_structure_invalidation(result)
+    assert result.status == "INVALIDATED_1H_STRUCTURE"
+
+
+def test_1h_invalidation_does_not_promote_a_not_met_scenario_to_an_alertable_state():
+    from screener.models import ScenarioResult
+    from screener.service import _apply_1h_structure_invalidation
+
+    result = ScenarioResult(
+        symbol="ALTUSDT_PERP", name="Alt", scenario="LONG A — Trend Continuation",
+        direction="LONG", checks=[Check("flow", False, "no", "yes")],
+        quality_flags=[], status="NOT_MET",
+        technical={"trend_retest_long": {"confirmed": False, "invalidated": True}},
+    )
+    _apply_1h_structure_invalidation(result)
+    assert result.status == "NOT_MET"
+
+
+def test_spot_sequence_is_unknown_when_current_poll_is_not_a_committed_snapshot():
+    from screener.service import _spot_sequence_for_current_poll
+
+    class StoreProbe:
+        calls = 0
+
+        def spot_sequence_status(self, *args, **kwargs):
+            self.calls += 1
+            return True
+
+    store = StoreProbe()
+    settings = type("Settings", (), {"p1": {"scenario": {
+        "spot_accumulation_required_snapshots": 3,
+        "snapshot_interval_hours": 4.0,
+        "snapshot_interval_tolerance_minutes": 10,
+    }}})()
+
+    assert _spot_sequence_for_current_poll(store, "ALTUSDT_PERP", settings, current_snapshot_available=False) is None
+    assert store.calls == 0
+    assert _spot_sequence_for_current_poll(store, "ALTUSDT_PERP", settings, current_snapshot_available=True) is True
+    assert store.calls == 1
+
+
+def test_market_summary_uses_the_configured_strong_flow_quantile():
+    from datetime import datetime, timezone
+    from screener.telegram import format_market_summary
+
+    markets = [
+        MarketRow(
+            symbol=f"Q{index}USDT_PERP", name=f"Q{index}", price=1.0, chg24_pct=0.0,
+            futures_imbalance_4h=float(10 - index), spot_imbalance_4h=float(10 - index),
+        )
+        for index in range(10)
+    ]
+    enriched, stats = analyze_universe(markets, {"thresholds": {"strong_flow_quantile": 0.30}})
+    text = format_market_summary(
+        enriched, stats, datetime.now(timezone.utc), "PERPETUAL", strong_flow_quantile=0.30
+    )
+    assert "F верхние 30% (n=3;" in text
+    assert "S нижние 30% (n=3;" in text
+
+
+def test_snapshot_delta_respects_late_poll_tolerance_consistently(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from screener.service import _snapshot_deltas
+    from screener.storage import Store
+
+    base = datetime(2026, 11, 10, 0, 0, tzinfo=timezone.utc)
+    store = Store(tmp_path / "snapshot-tolerance-data")
+    previous = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=100, oi_usd=100_000_000)
+    store.add_snapshot(base, "PERPETUAL", [previous])
+
+    within_tolerance = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=101, oi_usd=101_000_000)
+    enriched, _ = analyze_universe([within_tolerance], {"thresholds": {}})
+    delta = _snapshot_deltas(
+        store,
+        enriched,
+        base + timedelta(hours=4, minutes=5),
+        snapshot_interval_hours=4,
+        snapshot_interval_tolerance_minutes=10,
+    )["BTCUSDT_PERP"]
+    assert "в пределах допуска" in delta["window_note"]
+    assert delta["price_x_oi_classification"].startswith("comparable_late_interval_within_tolerance:")
+
+    outside_tolerance = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=102, oi_usd=102_000_000)
+    enriched, _ = analyze_universe([outside_tolerance], {"thresholds": {}})
+    delta = _snapshot_deltas(
+        store,
+        enriched,
+        base + timedelta(hours=4, minutes=11),
+        snapshot_interval_hours=4,
+        snapshot_interval_tolerance_minutes=10,
+    )["BTCUSDT_PERP"]
+    assert "несопоставимы" in delta["window_note"]
+    assert delta["price_x_oi_classification"].startswith("not_comparable_gap_outside_tolerance:")
+
+
+def test_long_d_telegram_conclusion_explicitly_waits_for_higher_low():
+    from screener.telegram import _conclusion
+
+    market = MarketRow(symbol="ALTUSDT_PERP", name="ALT", price=1.0, chg24_pct=-5.0)
+    enriched, _ = analyze_universe([market], {"thresholds": {}})
+    result = ScenarioResult(
+        symbol=market.symbol,
+        name=market.name,
+        scenario="LONG D — Post-Long-Flush Reversal",
+        direction="LONG",
+        checks=[Check("table pattern", True, "passed", "P1")],
+        quality_flags=[],
+        status="OBSERVATION",
+        reason="All table conditions met; LONG is not considered until a 1H higher low forms",
+        technical={"higher_low": {"confirmed": False, "reason": "No confirmed higher low"}},
+    )
+    conclusion = _conclusion(result, enriched[0], result.technical)
+    assert "Higher Low ещё не подтверждён" in conclusion
+    assert "не входить" in conclusion

@@ -90,7 +90,9 @@ def test_possible_long_liquidation_flush_blocks_short_even_when_flows_are_positi
     assert no_cascade.passed is False
 
 
-def test_short_e_requires_three_snapshots_and_actual_flow_turn_down():
+def test_short_e_requires_three_consecutive_four_hour_snapshots_and_actual_flow_turn_down():
+    from datetime import datetime, timedelta, timezone
+
     row = MarketRow(
         symbol="ALTUSDT_PERP", name="ALT", price=10, chg24_pct=-2,
         market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=100_000_000,
@@ -101,13 +103,16 @@ def test_short_e_requires_three_snapshots_and_actual_flow_turn_down():
         ls_ratio_1d=1.5, futures_imbalance_4h=-4, spot_imbalance_4h=-5,
     )
     enriched, stats = analyze_universe([row], {"thresholds": {}})
+    base = datetime(2026, 11, 9, 8, 0, tzinfo=timezone.utc)
     history = [
-        {"futures_imbalance_4h": 2, "spot_imbalance_4h": 3, "liq_long24_usd": 300_000,
-         "liq_short24_usd": 700_000, "oi_chg24_pct": -3},
-        {"futures_imbalance_4h": 1, "spot_imbalance_4h": 2, "liq_long24_usd": 500_000,
-         "liq_short24_usd": 500_000, "oi_chg24_pct": -1},
-        {"futures_imbalance_4h": -4, "spot_imbalance_4h": -5, "liq_long24_usd": 400_000,
-         "liq_short24_usd": 600_000, "oi_chg24_pct": -1},
+        {"snapshot_at": (base + timedelta(hours=4 * index)).isoformat(),
+         "futures_imbalance_4h": values[0], "spot_imbalance_4h": values[1],
+         "liq_long24_usd": values[2], "liq_short24_usd": values[3], "oi_chg24_pct": values[4]}
+        for index, values in enumerate([
+            (2, 3, 300_000, 700_000, -3),
+            (1, 2, 500_000, 500_000, -1),
+            (-4, -5, 400_000, 600_000, -1),
+        ])
     ]
     technical = {"failed_breakout_rejection": {"confirmed": True}}
     result = evaluate_scenarios(enriched[0], stats, {"thresholds": {}}, history=history, technical=technical)
@@ -194,3 +199,67 @@ def test_oi_growth_threshold_uses_exact_major_asset_codes_only():
     assert _oi_growth_min("ETHUSDT_PERP.A", thresholds) == 0.3
     for symbol in ("ETHFIUSDT_PERP.A", "ETHWUSDT_PERP.A", "BTCDOMUSDT_PERP.A", "STRKUSDT_PERP.A"):
         assert _oi_growth_min(symbol, thresholds) == 1.0
+
+
+def test_short_e_rejects_snapshot_gaps_and_unsaved_changed_polls():
+    from datetime import datetime, timedelta, timezone
+
+    row = MarketRow(
+        symbol="ALTUSDT_PERP", name="ALT", price=10, chg24_pct=-2,
+        market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=100_000_000,
+        oi_chg24_pct=-1, oi_chg24_usd=-1_000_000, oi_chg4h_pct=0.2, oi_chg4h_usd=200_000,
+        oi_vol_ratio=0.5, oi_mktcap_ratio=0.1, vol_mktcap_ratio=0.2,
+        fr_avg_pct=0.001, fr_oiw_pct=0.001, pfr_oiw_pct=0.001,
+        liq_total24_usd=1_000_000, liq_long24_usd=400_000, liq_short24_usd=600_000,
+        ls_ratio_1d=1.5, futures_imbalance_4h=-4, spot_imbalance_4h=-5,
+    )
+    enriched, stats = analyze_universe([row], {"thresholds": {}})
+    base = datetime(2026, 11, 9, 8, 0, tzinfo=timezone.utc)
+    values = [(2, 3, 300_000, 700_000, -3), (1, 2, 500_000, 500_000, -1), (-4, -5, 400_000, 600_000, -1)]
+    history = [
+        {"snapshot_at": (base + timedelta(hours=gap)).isoformat(),
+         "futures_imbalance_4h": v[0], "spot_imbalance_4h": v[1],
+         "liq_long24_usd": v[2], "liq_short24_usd": v[3], "oi_chg24_pct": v[4]}
+        for gap, v in zip((0, 4, 9), values)
+    ]
+    technical = {"failed_breakout_rejection": {"confirmed": True}}
+    results = evaluate_scenarios(enriched[0], stats, {"thresholds": {}}, history=history, technical=technical)
+    short_e = next(item for item in results if item.scenario.startswith("SHORT E"))
+    assert short_e.status == "NOT_MET"
+    assert short_e.checks[0].passed is False
+
+    results = evaluate_scenarios(
+        enriched[0], stats, {"thresholds": {}}, history=history,
+        technical=technical, current_snapshot_available=False,
+    )
+    short_e = next(item for item in results if item.scenario.startswith("SHORT E"))
+    assert short_e.status == "NOT_MET"
+    assert short_e.checks[0].passed is False
+
+
+def test_short_e_rejects_overlapping_four_hour_windows():
+    from datetime import datetime, timedelta, timezone
+
+    row = MarketRow(
+        symbol="ALTUSDT_PERP", name="ALT", price=10, chg24_pct=-2,
+        market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=100_000_000,
+        oi_chg24_pct=-1, oi_chg24_usd=-1_000_000, oi_chg4h_pct=0.2, oi_chg4h_usd=200_000,
+        oi_vol_ratio=0.5, oi_mktcap_ratio=0.1, vol_mktcap_ratio=0.2,
+        fr_avg_pct=0.001, fr_oiw_pct=0.001, pfr_oiw_pct=0.001,
+        liq_total24_usd=1_000_000, liq_long24_usd=400_000, liq_short24_usd=600_000,
+        ls_ratio_1d=1.5, futures_imbalance_4h=-4, spot_imbalance_4h=-5,
+    )
+    enriched, stats = analyze_universe([row], {"thresholds": {}})
+    base = datetime(2026, 11, 9, 8, 0, tzinfo=timezone.utc)
+    values = [(2, 3, 300_000, 700_000, -3), (1, 2, 500_000, 500_000, -1), (-4, -5, 400_000, 600_000, -1)]
+    history = [
+        {"snapshot_at": (base + timedelta(hours=gap)).isoformat(),
+         "futures_imbalance_4h": v[0], "spot_imbalance_4h": v[1],
+         "liq_long24_usd": v[2], "liq_short24_usd": v[3], "oi_chg24_pct": v[4]}
+        for gap, v in zip((0, 3.9, 7.8), values)
+    ]
+    technical = {"failed_breakout_rejection": {"confirmed": True}}
+    results = evaluate_scenarios(enriched[0], stats, {"thresholds": {}}, history=history, technical=technical)
+    short_e = next(item for item in results if item.scenario.startswith("SHORT E"))
+    assert short_e.status == "NOT_MET"
+    assert short_e.checks[0].passed is False
