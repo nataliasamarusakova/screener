@@ -159,20 +159,55 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
     return result
 
 
-def _preliminary_candidate_symbols(enriched: list[EnrichedRow], stats: Any, settings: Settings, store: Store) -> set[str]:
+def _spot_sequence_for_current_poll(
+    store: Store,
+    symbol: str,
+    settings: Settings,
+    *,
+    current_snapshot_available: bool,
+    contract_type: str | None = None,
+) -> bool | None:
+    """Only evaluate a P1 Spot sequence when the poll maps to a committed observation.
+
+    A changed but unsaved poll is useful for live diagnostics, but it cannot
+    replace the latest element of a multi-snapshot history sequence.
+    """
+    if not current_snapshot_available:
+        return None
+    scenario_cfg = settings.p1.get("scenario", {})
+    return store.spot_sequence_status(
+        symbol,
+        required=int(scenario_cfg.get("spot_accumulation_required_snapshots", 3)),
+        interval_hours=float(scenario_cfg.get("snapshot_interval_hours", 4.0)),
+        tolerance_minutes=int(scenario_cfg.get("snapshot_interval_tolerance_minutes", 10)),
+        contract_type=contract_type,
+    )
+
+
+def _preliminary_candidate_symbols(
+    enriched: list[EnrichedRow],
+    stats: Any,
+    settings: Settings,
+    store: Store,
+    *,
+    current_snapshot_available: bool = True,
+    contract_type: str | None = None,
+) -> set[str]:
     symbols: set[str] = set()
     for row in enriched:
-        history = store.recent_symbol_history(row.symbol, limit=100)
-        spot_sequence = store.spot_sequence_status(
+        history = store.recent_symbol_history(row.symbol, limit=100, contract_type=contract_type)
+        spot_sequence = _spot_sequence_for_current_poll(
+            store,
             row.symbol,
-            required=int(settings.p1.get("scenario", {}).get("spot_accumulation_required_snapshots", 3)),
-            interval_hours=float(settings.p1.get("scenario", {}).get("snapshot_interval_hours", 4.0)),
-            tolerance_minutes=int(settings.p1.get("scenario", {}).get("snapshot_interval_tolerance_minutes", 10)),
+            settings,
+            current_snapshot_available=current_snapshot_available,
+            contract_type=contract_type,
         )
         draft = evaluate_scenarios(
             row, stats, settings.p1,
             technical={"spot_sequence_ok": spot_sequence},
             history=history,
+            current_snapshot_available=current_snapshot_available,
         )
         if any(r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE"} for r in draft):
             symbols.add(row.symbol)
@@ -199,54 +234,99 @@ def _can_send_alerts(scrape: ScrapeResult, settings: Settings) -> tuple[bool, st
 
 
 def _snapshot_deltas(
-    store: Store, rows: list[EnrichedRow], fetched_at: datetime, unchanged: bool = False
+    store: Store,
+    rows: list[EnrichedRow],
+    fetched_at: datetime,
+    unchanged: bool = False,
+    snapshot_saved: bool = False,
+    snapshot_interval_hours: float = 4.0,
+    snapshot_interval_tolerance_minutes: int = 10,
+    contract_type: str | None = None,
 ) -> dict[str, dict[str, Any]]:
+    """Compare the current poll with the correct last committed observation.
+
+    When the poll was saved, compare the two newest committed snapshots. When it
+    was not saved, compare the live poll with the latest committed snapshot.
+    An unchanged poll is explicitly marked as no new data and produces zero
+    deltas rather than pretending the polling timestamp is a new observation.
+    """
     deltas: dict[str, dict[str, Any]] = {}
     for enriched in rows:
-        history = store.recent_symbol_history(enriched.symbol, limit=2)
+        history = store.recent_symbol_history(enriched.symbol, limit=2, contract_type=contract_type)
         if not history:
             continue
-        if unchanged:
-            previous = history[-1]
-            current = enriched.market.to_dict()
-            current["snapshot_at"] = fetched_at.isoformat()
-        else:
+        if snapshot_saved:
             if len(history) < 2:
                 continue
             previous, current = history[-2], history[-1]
+        elif unchanged:
+            previous = history[-1]
+            current = dict(previous)
+        else:
+            previous = history[-1]
+            current = enriched.market.to_dict()
+            current["snapshot_at"] = fetched_at.isoformat()
+
         try:
             previous_at = datetime.fromisoformat(previous["snapshot_at"])
             current_at = datetime.fromisoformat(current["snapshot_at"])
-            gap_hours = (current_at - previous_at).total_seconds() / 3600.0
+            if previous_at.tzinfo is None:
+                previous_at = previous_at.replace(tzinfo=timezone.utc)
+            if current_at.tzinfo is None:
+                current_at = current_at.replace(tzinfo=timezone.utc)
+            gap_hours = (current_at.astimezone(timezone.utc) - previous_at.astimezone(timezone.utc)).total_seconds() / 3600.0
         except (KeyError, TypeError, ValueError):
             continue
 
         def difference(key: str) -> float | None:
             old, new = previous.get(key), current.get(key)
-            return float(new) - float(old) if old is not None and new is not None else None
+            if old is None or new is None:
+                return None
+            try:
+                old_num, new_num = float(old), float(new)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not math.isfinite(old_num) or not math.isfinite(new_num):
+                return None
+            return new_num - old_num
 
         price_delta = None
         old_price, new_price = previous.get("price"), current.get("price")
-        if old_price is not None and new_price is not None and float(old_price) != 0:
-            price_delta = (float(new_price) / float(old_price) - 1.0) * 100.0
+        try:
+            old_price_num, new_price_num = float(old_price), float(new_price)
+            if old_price_num != 0 and math.isfinite(old_price_num) and math.isfinite(new_price_num):
+                price_delta = (new_price_num / old_price_num - 1.0) * 100.0
+        except (TypeError, ValueError, OverflowError):
+            pass
         oi_delta_usd = difference("oi_usd")
         oi_delta_pct = None
         old_oi, new_oi = previous.get("oi_usd"), current.get("oi_usd")
-        if old_oi is not None and new_oi is not None and float(old_oi) != 0:
-            oi_delta_pct = (float(new_oi) / float(old_oi) - 1.0) * 100.0
+        try:
+            old_oi_num, new_oi_num = float(old_oi), float(new_oi)
+            if old_oi_num != 0 and math.isfinite(old_oi_num) and math.isfinite(new_oi_num):
+                oi_delta_pct = (new_oi_num / old_oi_num - 1.0) * 100.0
+        except (TypeError, ValueError, OverflowError):
+            pass
+        expected_hours = max(0.0, float(snapshot_interval_hours))
+        tolerance_hours = max(0, int(snapshot_interval_tolerance_minutes)) / 60.0
         if unchanged:
-            note = "значения таблицы полностью совпадают с предыдущим снимком: новых данных Coinalyze нет"
-        elif gap_hours < 4.0:
-            note = "окна 4H перекрываются; только предварительное наблюдение, не независимые наблюдения"
-        elif gap_hours > 4.0:
-            note = "интервал >4h; окна уже несопоставимы как одно последовательное 4H наблюдение"
+            note = "значения таблицы полностью совпадают с последним снимком: новых данных Coinalyze нет"
+        elif gap_hours < 0:
+            note = "время текущего опроса раньше последнего снимка; последовательность несопоставима"
+        elif gap_hours < expected_hours:
+            note = f"окна {expected_hours:g}H перекрываются; только предварительное наблюдение, не независимые наблюдения"
+        elif gap_hours > expected_hours + tolerance_hours:
+            note = f"интервал больше {expected_hours:g}H с учётом допуска; окна несопоставимы как одно последовательное наблюдение"
+        elif gap_hours > expected_hours:
+            note = (
+                f"интервал {gap_hours:.2f}h: поздний опрос в пределах допуска "
+                f"{tolerance_hours * 60:g} мин; последовательность считается приблизительно сопоставимой"
+            )
         else:
-            note = "интервал ровно 4h; приблизительно сопоставимые последовательные окна"
+            note = f"интервал ровно {expected_hours:g}h; последовательные окна сопоставимы"
 
-        price_x_oi = "unknown"
-        if unchanged:
-            price_x_oi = "no_new_table_data"
-        elif price_delta is not None and oi_delta_pct is not None:
+        price_x_oi = "no_new_table_data" if unchanged else "unknown"
+        if not unchanged and price_delta is not None and oi_delta_pct is not None:
             if price_delta > 0 and oi_delta_pct > 0:
                 price_x_oi = "price_up_oi_up"
             elif price_delta < 0 and oi_delta_pct > 0:
@@ -257,12 +337,16 @@ def _snapshot_deltas(
                 price_x_oi = "price_down_oi_down_possible_long_closing"
             else:
                 price_x_oi = "mixed_or_flat"
-            if gap_hours < 4.0:
+            if gap_hours < 0:
+                price_x_oi = "not_comparable_timestamp_reversed:" + price_x_oi
+            elif gap_hours < expected_hours:
                 price_x_oi = "preliminary_overlapping_windows:" + price_x_oi
-            elif gap_hours > 4.0:
-                price_x_oi = "not_comparable_gap_over_4h:" + price_x_oi
+            elif gap_hours > expected_hours + tolerance_hours:
+                price_x_oi = "not_comparable_gap_outside_tolerance:" + price_x_oi
+            elif gap_hours > expected_hours:
+                price_x_oi = "comparable_late_interval_within_tolerance:" + price_x_oi
             else:
-                price_x_oi = "comparable_4h_interval:" + price_x_oi
+                price_x_oi = "comparable_target_interval:" + price_x_oi
         deltas[enriched.symbol] = {
             "interval_hours": round(gap_hours, 3),
             "window_note": note,
@@ -276,6 +360,41 @@ def _snapshot_deltas(
         }
     return deltas
 
+
+def _apply_1h_structure_invalidation(result: ScenarioResult) -> None:
+    """Prevent an already invalidated 1H setup from remaining a positive status."""
+    code = result.scenario.split(" — ", 1)[0].strip().upper()
+    technical = result.technical or {}
+    sources = {
+        "LONG A": "trend_retest_long",
+        "LONG B": "higher_low",
+        "LONG D": "higher_low",
+        "SHORT A": "trend_retest_short",
+        "SHORT D": "weak_bounce_rejection",
+    }
+    source_name = sources.get(code)
+    if not source_name:
+        return
+    active_statuses = {
+        "LONG A": {"OBSERVATION", "OBSERVATION_WITH_WARNING"},
+        "LONG B": {"WAITING_FOR_HISTORY_OR_HIGHER_LOW", "OBSERVATION", "OBSERVATION_WITH_WARNING"},
+        "LONG D": {"OBSERVATION", "OBSERVATION_WITH_WARNING"},
+        "SHORT A": {"OBSERVATION", "OBSERVATION_WITH_WARNING"},
+        "SHORT D": {"WAIT_BOUNCE", "OBSERVATION_AFTER_BOUNCE"},
+    }
+    if result.status not in active_statuses.get(code, set()):
+        return
+    state = technical.get(source_name)
+    if not isinstance(state, dict) or state.get("invalidated") is not True:
+        return
+    if code == "SHORT D":
+        # The liquidation-cascade context may still exist, but the rejection
+        # has failed: revert to waiting for a fresh bounce/rejection.
+        result.status = "WAIT_BOUNCE"
+        result.reason = "The prior 1H resistance rejection was invalidated by a later close above resistance; wait for a new bounce/rejection."
+    else:
+        result.status = "INVALIDATED_1H_STRUCTURE"
+        result.reason = f"The {source_name} 1H structure was invalidated by a later closed 1H candle; this setup is no longer active."
 
 def _fingerprint_number(value: Any) -> Any:
     if isinstance(value, float):
@@ -304,10 +423,10 @@ def _scenario_event_fingerprint(result: ScenarioResult) -> str:
         technical_state[key] = {
             field: _fingerprint_number(value.get(field))
             for field in (
-                "confirmed", "level", "latest_low", "latest_open_time_ms",
+                "confirmed", "invalidated", "level", "latest_low", "latest_open_time_ms",
                 "breakout_open_time_ms", "retest_open_time_ms", "resistance",
                 "candidate_resistance", "rejection_open_time_ms", "failed_level",
-                "last_close",
+                "last_close", "invalidation_open_time_ms", "invalidation_close",
             )
             if field in value
         }
@@ -455,10 +574,14 @@ def _collect_notifications(
         # One whole-market digest per P1 4H observation window; do not create a
         # new summary event for every five-minute table change.
         summary_key = _market_summary_event_key(contract_type, fetched_at)
-        summary = format_market_summary(rows, stats, fetched_at, contract_type, missing_columns)
+        strong_flow_quantile = float(settings.p1.get("thresholds", {}).get("strong_flow_quantile", 0.15))
+        summary = format_market_summary(
+            rows, stats, fetched_at, contract_type, missing_columns,
+            strong_flow_quantile=strong_flow_quantile,
+        )
         deliver(summary_key, summary, kind="market_summary")
 
-    eligible = {"OBSERVATION", "OBSERVATION_WITH_WARNING", "OBSERVATION_AFTER_BOUNCE", "TRIGGER"}
+    eligible = {"OBSERVATION", "OBSERVATION_WITH_WARNING", "OBSERVATION_AFTER_BOUNCE", "TRIGGER", "INVALIDATED_1H_STRUCTURE"}
     if settings.telegram_send_wait_states:
         eligible.update({
             "WAIT_BOUNCE",
@@ -515,7 +638,7 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         if not unchanged and store.snapshot_due(
             scrape.fetched_at,
             interval_hours=snapshot_interval_hours,
-            tolerance_minutes=snapshot_tolerance_minutes,
+            contract_type=scrape.contract_type,
         ):
             store.add_snapshot(scrape.fetched_at, scrape.contract_type, scrape.rows)
             snapshot_saved = True
@@ -534,7 +657,11 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             stats.warnings.append("Missing REQUIRED P1 columns: " + ", ".join(scrape.missing_required_columns))
         if scrape.contract_type == "UNKNOWN":
             stats.warnings.append("Perpetual vs All Contracts could not be verified")
-        candidate_symbols = _preliminary_candidate_symbols(enriched, stats, settings, store)
+        candidate_symbols = _preliminary_candidate_symbols(
+            enriched, stats, settings, store,
+            current_snapshot_available=(unchanged or snapshot_saved),
+            contract_type=scrape.contract_type,
+        )
         binance = BinanceClient(
             settings.binance_base_url,
             settings.binance_request_interval_sec,
@@ -550,24 +677,40 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         for row in enriched:
             # An identical table poll does not advance the saved observation time.
             # Keep the original timestamp so it cannot masquerade as a new snapshot.
-            history = store.recent_symbol_history(row.symbol, limit=100)
-            spot_sequence = store.spot_sequence_status(
+            history = store.recent_symbol_history(
+                row.symbol, limit=100, contract_type=scrape.contract_type
+            )
+            spot_sequence = _spot_sequence_for_current_poll(
+                store,
                 row.symbol,
-                required=int(settings.p1.get("scenario", {}).get("spot_accumulation_required_snapshots", 3)),
-                interval_hours=float(settings.p1.get("scenario", {}).get("snapshot_interval_hours", 4.0)),
-                tolerance_minutes=int(settings.p1.get("scenario", {}).get("snapshot_interval_tolerance_minutes", 10)),
+                settings,
+                current_snapshot_available=(unchanged or snapshot_saved),
+                contract_type=scrape.contract_type,
             )
             technical = {"spot_sequence_ok": spot_sequence, **technical_by_symbol.get(row.symbol, {})}
-            scenario_results = evaluate_scenarios(row, stats, settings.p1, technical=technical, history=history)
+            scenario_results = evaluate_scenarios(
+                row, stats, settings.p1, technical=technical, history=history,
+                current_snapshot_available=(unchanged or snapshot_saved),
+            )
             for scenario_result in scenario_results:
                 # Preserve both global diagnostics (order book/context) and scenario-specific predicates.
                 scenario_result.technical = {**technical, **scenario_result.technical}
+                _apply_1h_structure_invalidation(scenario_result)
             results.extend(scenario_results)
 
         allowed, guard_reason = _can_send_alerts(scrape, settings)
         if not allowed:
             log.warning("Telegram alert guard: %s", guard_reason)
-        deltas_by_symbol = _snapshot_deltas(store, enriched, scrape.fetched_at, unchanged=unchanged)
+        deltas_by_symbol = _snapshot_deltas(
+            store,
+            enriched,
+            scrape.fetched_at,
+            unchanged=unchanged,
+            snapshot_saved=snapshot_saved,
+            snapshot_interval_hours=snapshot_interval_hours,
+            snapshot_interval_tolerance_minutes=snapshot_tolerance_minutes,
+            contract_type=scrape.contract_type,
+        )
         notifications = _collect_notifications(
             results,
             enriched,

@@ -140,6 +140,7 @@ def _status_label(status: str) -> str:
         "WAITING_FOR_HISTORY_OR_HIGHER_LOW": "WAITING_HISTORY / HIGHER LOW",
         "WAITING_FOR_1H_STRUCTURE_BREAK": "WAITING_FOR_1H_BREAK",
         "BLOCKED_QUALITY": "BLOCKED_QUALITY",
+        "INVALIDATED_1H_STRUCTURE": "INVALIDATED · 1H STRUCTURE",
     }.get(str(status).upper(), str(status).upper())
 
 
@@ -172,7 +173,9 @@ def _technical_bullets(result: ScenarioResult, technical: dict[str, Any]) -> lis
             bullets.append("Higher Low подтверждён.")
         elif higher.get("confirmed") is False:
             reason = str(higher.get("reason") or "").lower()
-            if "unavailable" in reason or "insufficient candles" in reason:
+            if higher.get("invalidated") is True:
+                bullets.append("Higher Low отменён: последняя закрытая 1H-свеча закрылась ниже pivot.")
+            elif "unavailable" in reason or "insufficient candles" in reason:
                 bullets.append("Higher Low: свечных данных недостаточно.")
             elif "need at least two" in reason:
                 bullets.append("Higher Low не подтверждён: недостаточно подтверждённых минимумов.")
@@ -195,7 +198,9 @@ def _technical_bullets(result: ScenarioResult, technical: dict[str, Any]) -> lis
         key, label = check_map[code]
         state = technical.get(key)
         if isinstance(state, dict):
-            if state.get("confirmed") is True:
+            if state.get("invalidated") is True:
+                bullets.append(f"{label} был подтверждён, но затем отменён последующим закрытием 1H.")
+            elif state.get("confirmed") is True:
                 bullets.append(f"{label} подтверждён.")
             elif state.get("confirmed") is False:
                 reason = str(state.get("reason") or "").lower()
@@ -246,13 +251,12 @@ def _technical_bullets(result: ScenarioResult, technical: dict[str, Any]) -> lis
         else:
             invalidation_rule = "закрытие 1H выше уровня отменяет SHORT"
         source_labels = {
-            "latest confirmed 1H higher-low pivot": "последний подтверждённый минимум Higher Low 1H",
-            "1H breakout/retest level": "уровень пробоя и ретеста 1H",
-            "1H weak-bounce resistance": "сопротивление слабого 1H-отскока",
-            "failed 1H breakout level": "уровень неудавшегося пробоя 1H",
-            "1H bearish structure level": "уровень медвежьей структуры 1H",
-            "1H swing-low structure level": "уровень минимума структуры 1H",
-            "1H breakdown/retest level": "уровень пробоя и ретеста вниз 1H",
+            "confirmed 1H higher-low pivot": "последний подтверждённый минимум Higher Low 1H",
+            "confirmed 1H breakout/retest level": "уровень пробоя и ретеста 1H",
+            "confirmed 1H weak-bounce resistance": "сопротивление слабого 1H-отскока",
+            "confirmed failed 1H breakout level": "уровень неудавшегося пробоя 1H",
+            "confirmed 1H bearish structure level": "уровень медвежьей структуры 1H",
+            "confirmed 1H breakdown/retest level": "уровень пробоя и ретеста вниз 1H",
         }
         source_label = source_labels.get(str(invalidation.get("source")), str(invalidation.get("source") or "источник не определён"))
         bullets.append(
@@ -306,6 +310,21 @@ def _diagnostic_bullets(row: EnrichedRow) -> list[str]:
 def _conclusion(result: ScenarioResult, row: EnrichedRow, technical: dict[str, Any]) -> str:
     status = result.status.upper()
     code = _scenario_code(result.scenario)
+    if status == "INVALIDATED_1H_STRUCTURE":
+        return "Сценарий отменён: последующая закрытая 1H-свеча нарушила ранее подтверждённую структуру. Старое подтверждение больше не действует; ждать нового сетапа."
+
+    invalidation = scenario_invalidation(result.direction, result.scenario, technical)
+    last_1h = technical.get("last_closed_1h") or {}
+    close_1h = last_1h.get("close")
+    level_1h = invalidation.get("level")
+    if isinstance(close_1h, (int, float)) and isinstance(level_1h, (int, float)):
+        breached = close_1h < level_1h if result.direction.upper() == "LONG" else close_1h > level_1h
+        if breached:
+            side_word = "ниже" if result.direction.upper() == "LONG" else "выше"
+            return (
+                f"Последнее закрытие 1H находится {side_word} подтверждённой точки отмены "
+                f"({level_1h:g}). Структура нарушена; не входить и ждать нового подтверждения."
+            )
     if status == "WAIT_BOUNCE":
         coverage = row.liquidation_coverage_of_oi_drop_pct
         if coverage is not None and coverage < 10:
@@ -339,6 +358,10 @@ def _conclusion(result: ScenarioResult, row: EnrichedRow, technical: dict[str, A
             retest = technical.get("trend_retest_long")
             if not isinstance(retest, dict) or retest.get("confirmed") is not True:
                 return "Табличные условия выполнены, но LONG breakout/retest не подтверждён закрытыми свечами. Не входить до подтверждения."
+        if code == "LONG D":
+            higher = technical.get("higher_low")
+            if not isinstance(higher, dict) or higher.get("confirmed") is not True:
+                return "Табличные условия LONG D выполнены, но 1H Higher Low ещё не подтверждён. До его формирования LONG не рассматривать; ждать закрытых 1H-свечей и не входить."
         if isinstance(ema20, (int, float)) and isinstance(ema50, (int, float)) and ema20 < ema50:
             return "4H EMA20 ниже EMA50 — медвежий контекст против LONG. Даже при подтверждённом 1H Higher Low/retest это контртрендовая ситуация: только наблюдение, не входить автоматически."
         if result.status == "OBSERVATION":
@@ -463,7 +486,11 @@ def format_market_summary(
     fetched_at: datetime,
     contract_type: str,
     missing_columns: list[str] | None = None,
+    *,
+    strong_flow_quantile: float = 0.15,
 ) -> str:
+    quantile = min(max(float(strong_flow_quantile), 0.01), 0.49)
+    quantile_label = f"{quantile:.0%}"
     timestamp = fetched_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     markets = [item.market for item in rows]
     price_median_values = sorted(m.chg24_pct for m in markets if m.chg24_pct is not None)
@@ -496,27 +523,43 @@ def format_market_summary(
 
     valid_f = [item for item in rows if item.market.futures_imbalance_4h is not None]
     valid_s = [item for item in rows if item.market.spot_imbalance_4h is not None]
-    f_tail = _rank_tail_count(len(valid_f), 0.15)
-    s_tail = _rank_tail_count(len(valid_s), 0.15)
+    f_tail = _rank_tail_count(len(valid_f), quantile)
+    s_tail = _rank_tail_count(len(valid_s), quantile)
 
     def ranked_line(label: str, values: list[EnrichedRow], metric: str, adjusted: str, reverse: bool) -> None:
-        ordered = sorted(values, key=lambda item: getattr(item.market, metric), reverse=reverse)
-        selected = ordered[: (f_tail if metric == "futures_imbalance_4h" else s_tail)]
+        target_count = f_tail if metric == "futures_imbalance_4h" else s_tail
+        rank_attr = "f_rank_desc" if metric == "futures_imbalance_4h" else "s_rank_desc"
+        valid_count = len(values)
+        if reverse:
+            selected = [item for item in values if getattr(item, rank_attr) is not None and getattr(item, rank_attr) <= target_count]
+        else:
+            bottom_rank = valid_count - target_count + 1
+            selected = [item for item in values if getattr(item, rank_attr) is not None and getattr(item, rank_attr) >= bottom_rank]
+        selected.sort(
+            key=lambda item: (
+                -getattr(item.market, metric) if reverse else getattr(item.market, metric),
+                item.symbol,
+            )
+        )
         if not selected:
             return
         chunks = [
             f"{_base_symbol(item.symbol)} {_number(getattr(item.market, metric), 4, signed=True)} "
-            f"(adj {_number(getattr(item, adjusted), 4, signed=True)})"
+            f"(adj {_number(getattr(item, adjusted), 4, signed=True)}; rank {getattr(item, rank_attr):g})"
             for item in selected
         ]
-        lines.append(f"{label}: " + "; ".join(chunks))
+        tail_name = "верхние" if reverse else "нижние"
+        lines.append(
+            f"{label} (n={target_count}; ties included, фактически n={len(selected)}): "
+            + "; ".join(chunks)
+        )
 
     if valid_f:
-        ranked_line("F верхние 15% (n={})".format(f_tail), valid_f, "futures_imbalance_4h", "f_adj", True)
-        ranked_line("F нижние 15% (n={})".format(f_tail), valid_f, "futures_imbalance_4h", "f_adj", False)
+        ranked_line(f"F верхние {quantile_label}", valid_f, "futures_imbalance_4h", "f_adj", True)
+        ranked_line(f"F нижние {quantile_label}", valid_f, "futures_imbalance_4h", "f_adj", False)
     if valid_s:
-        ranked_line("S верхние 15% (n={})".format(s_tail), valid_s, "spot_imbalance_4h", "s_adj", True)
-        ranked_line("S нижние 15% (n={})".format(s_tail), valid_s, "spot_imbalance_4h", "s_adj", False)
+        ranked_line(f"S верхние {quantile_label}", valid_s, "spot_imbalance_4h", "s_adj", True)
+        ranked_line(f"S нижние {quantile_label}", valid_s, "spot_imbalance_4h", "s_adj", False)
 
     f_s_valid = [item for item in rows if item.market.futures_imbalance_4h is not None and item.market.spot_imbalance_4h is not None]
     price_spot_valid = [item for item in rows if item.market.chg24_pct is not None and item.market.spot_imbalance_4h is not None]

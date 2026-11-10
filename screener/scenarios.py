@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from .metrics import EnrichedRow
@@ -109,6 +110,7 @@ def evaluate_scenarios(
     *,
     technical: dict[str, Any] | None = None,
     history: list[dict[str, Any]] | None = None,
+    current_snapshot_available: bool = True,
 ) -> list[ScenarioResult]:
     m = row.market
     t = p1.get("thresholds", {})
@@ -293,11 +295,30 @@ def evaluate_scenarios(
         status, reason = "NOT_MET", ""
     out.append(_result(row, "SHORT D — Long Liquidation Cascade", "SHORT", checks, status, reason, {"weak_bounce_rejection": technical.get("weak_bounce_rejection"), "liq_coverage_of_oi_drop_pct": row.liquidation_coverage_of_oi_drop_pct}))
 
-    # SHORT E — Failed Short Squeeze. Three distinct saved table snapshots are
-    # required to avoid treating one isolated comparison as a sequence.
-    initial = history[-3] if len(history) >= 3 else None
-    previous = history[-2] if len(history) >= 2 else None
-    history_ready = len(history) >= 3
+    # SHORT E — Failed Short Squeeze. Use the latest three consecutive P1
+    # observations only; a changed but unsaved poll is not a new snapshot.
+    sequence_cfg = s
+    interval_seconds = max(0.0, float(sequence_cfg.get("snapshot_interval_hours", 4.0))) * 3600.0
+    tolerance_seconds = max(0, int(sequence_cfg.get("snapshot_interval_tolerance_minutes", 10))) * 60.0
+    latest_three = history[-3:] if len(history) >= 3 else []
+    sequence_times: list[datetime] = []
+    if current_snapshot_available and len(latest_three) == 3:
+        for item in latest_three:
+            try:
+                stamp = datetime.fromisoformat(str(item["snapshot_at"]))
+            except (KeyError, TypeError, ValueError):
+                sequence_times = []
+                break
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            sequence_times.append(stamp.astimezone(timezone.utc))
+    spacing_ok = len(sequence_times) == 3 and all(
+        interval_seconds <= (later - earlier).total_seconds() <= interval_seconds + tolerance_seconds
+        for earlier, later in zip(sequence_times, sequence_times[1:])
+    )
+    initial = latest_three[0] if spacing_ok else None
+    previous = latest_three[1] if spacing_ok else None
+    history_ready = bool(spacing_ok)
     initial_short_dominant = None
     initial_oi_falling = None
     prior_flow_not_down = None
@@ -315,7 +336,7 @@ def evaluate_scenarios(
     current_flow_down = None if m.futures_imbalance_4h is None or m.spot_imbalance_4h is None else (m.futures_imbalance_4h < 0 and m.spot_imbalance_4h < 0)
     flow_turned_down = None if prior_flow_not_down is None or current_flow_down is None else (prior_flow_not_down and current_flow_down)
     checks = [
-        _check("Three distinct snapshots available", history_ready, f"{len(history)} saved snapshots", ">= 3"),
+        _check("Three consecutive 4H snapshots available", history_ready, f"latest committed snapshots={len(latest_three)}; spacing valid={spacing_ok}", f"3 consecutive snapshots spaced {interval_seconds / 3600:g}h ± {tolerance_seconds / 60:g}m; current data must be saved/unchanged"),
         _check("Earlier short liquidations dominated", initial_short_dominant, str(initial_short_dominant), "Snapshot t−2: Short Liqs > Long Liqs"),
         _check("Earlier OI was falling", initial_oi_falling, str(initial_oi_falling), "Snapshot t−2: OI Chg 24H < 0"),
         _check("F/S turned down", flow_turned_down, f"previous F/S not both negative={prior_flow_not_down}; current F={m.futures_imbalance_4h}; S={m.spot_imbalance_4h}", "Snapshot t−1: F/S >= 0; current snapshot: F<0 and S<0"),
@@ -324,7 +345,8 @@ def evaluate_scenarios(
         _check("Quality flags", no_flags, ", ".join(row.quality_flags) or "none", "none"),
     ]
     status = "OBSERVATION" if all(c.passed is True for c in checks) and no_flags else "NOT_MET"
-    reason = "Three-snapshot history and 1H failed-breakout predicates align; manual chart/risk review required" if status == "OBSERVATION" else "Requires three distinct snapshots, earlier short liquidation/OI decline, F/S turn-down and 1H failed-breakout structure"
+    reason = "Three consecutive 4H observations and 1H failed-breakout predicates align; manual chart/risk review required" if status == "OBSERVATION" else "Requires three consecutive 4H snapshots with valid spacing, earlier short liquidation/OI decline, F/S turn-down and 1H failed-breakout structure"
+
     out.append(_result(row, "SHORT E — Failed Short Squeeze", "SHORT", checks, status, reason, {"failed_breakout_rejection": technical.get("failed_breakout_rejection")}))
 
     return out

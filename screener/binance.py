@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 import time
@@ -116,16 +117,33 @@ class BinanceClient:
         resolved = self.resolve_symbol(coinalyze_symbol)
         if not resolved:
             raise BinanceDataError(f"No active Binance USDT perpetual for Coinalyze symbol {coinalyze_symbol}")
-        allowed = {"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"}
-        if interval not in allowed:
+        interval_ms = {
+            "5m": 5 * 60_000,
+            "15m": 15 * 60_000,
+            "30m": 30 * 60_000,
+            "1h": 60 * 60_000,
+            "2h": 2 * 60 * 60_000,
+            "4h": 4 * 60 * 60_000,
+            "6h": 6 * 60 * 60_000,
+            "12h": 12 * 60 * 60_000,
+            "1d": 24 * 60 * 60_000,
+        }
+        if interval not in interval_ms:
             raise ValueError(f"Unsupported Binance candle interval: {interval}")
-        rows = self._get_json("/fapi/v1/klines", {"symbol": resolved, "interval": interval, "limit": min(max(int(limit), 100), 1500)})
+        duration = interval_ms[interval]
+        rows = self._get_json(
+            "/fapi/v1/klines",
+            {"symbol": resolved, "interval": interval, "limit": min(max(int(limit), 100), 1500)},
+        )
         if not isinstance(rows, list):
             raise BinanceDataError(f"Unexpected Binance klines response for {resolved}/{interval}")
+
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         candles: list[Candle] = []
+        malformed = 0
         for raw in rows:
             if not isinstance(raw, (list, tuple)) or len(raw) < 9:
+                malformed += 1
                 continue
             try:
                 candle = Candle(
@@ -139,17 +157,62 @@ class BinanceClient:
                     quote_volume=float(raw[7]),
                     trades=int(raw[8]),
                 )
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                malformed += 1
                 continue
-            # Critical: Binance's final array element may be a still-forming candle.
-            if candle.close_time_ms < now_ms and candle.low > 0 and candle.high >= candle.low:
+            numeric_values = (candle.open, candle.high, candle.low, candle.close, candle.volume, candle.quote_volume)
+            valid = (
+                all(math.isfinite(value) for value in numeric_values)
+                and candle.open > 0
+                and candle.high > 0
+                and candle.low > 0
+                and candle.close > 0
+                and candle.volume >= 0
+                and candle.quote_volume >= 0
+                and candle.trades >= 0
+                and candle.high >= max(candle.open, candle.close, candle.low)
+                and candle.low <= min(candle.open, candle.close, candle.high)
+                and candle.close_time_ms == candle.open_time_ms + duration - 1
+            )
+            if not valid:
+                malformed += 1
+                continue
+            # Binance's final array element may be a still-forming candle.
+            if candle.close_time_ms < now_ms:
                 candles.append(candle)
-        candles.sort(key=lambda c: c.open_time_ms)
-        # Deduplicate by open time and reject malformed/out-of-order sequences.
-        unique = {c.open_time_ms: c for c in candles}
-        result = [unique[k] for k in sorted(unique)]
+
+        candles.sort(key=lambda candle: candle.open_time_ms)
+        # De-duplicate by open time and keep deterministic ordering.
+        unique = {candle.open_time_ms: candle for candle in candles}
+        result = [unique[key] for key in sorted(unique)]
         if len(result) < 20:
-            raise BinanceDataError(f"Only {len(result)} closed {interval} candles for {resolved}; need at least 20")
+            raise BinanceDataError(
+                f"Only {len(result)} valid closed {interval} candles for {resolved}; need at least 20"
+            )
+
+        # The structure indicators assume adjacent bars are consecutive periods.
+        # Do not calculate pivots/ATR over a silently compressed series with gaps.
+        gaps = [
+            (previous.open_time_ms, current.open_time_ms)
+            for previous, current in zip(result, result[1:])
+            if current.open_time_ms - previous.open_time_ms != duration
+        ]
+        if gaps:
+            previous_open, current_open = gaps[0]
+            gap_periods = (current_open - previous_open) / duration
+            raise BinanceDataError(
+                f"Non-consecutive {interval} candles for {resolved}: gap spans {gap_periods:g} intervals; "
+                "1H/4H structure and ATR are not evaluated on discontinuous data"
+            )
+
+        latest_age_ms = now_ms - result[-1].close_time_ms
+        if latest_age_ms > duration + 120_000:
+            raise BinanceDataError(
+                f"Stale {interval} candles for {resolved}: latest closed candle is "
+                f"{latest_age_ms / 60_000:.1f} minutes old"
+            )
+        if malformed:
+            log.warning("Ignored %d malformed Binance %s candles for %s", malformed, interval, resolved)
         return result
 
     def fetch_orderbook_diagnostics(
@@ -160,6 +223,12 @@ class BinanceClient:
         if not resolved:
             raise BinanceDataError(f"No active Binance USDT perpetual for Coinalyze symbol {coinalyze_symbol}")
         safe_limit = min(max(int(limit), 5), 1000)
+        try:
+            requested_notional = float(notional_usd)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("notional_usd must be a finite non-negative number") from exc
+        if not math.isfinite(requested_notional) or requested_notional < 0:
+            raise ValueError("notional_usd must be a finite non-negative number")
         payload = self._get_json("/fapi/v1/depth", {"symbol": resolved, "limit": safe_limit})
         if not isinstance(payload, dict):
             raise BinanceDataError(f"Unexpected Binance depth response for {resolved}")
@@ -171,7 +240,7 @@ class BinanceClient:
                     price, qty = float(item[0]), float(item[1])
                 except (TypeError, ValueError, IndexError):
                     continue
-                if price > 0 and qty > 0:
+                if math.isfinite(price) and math.isfinite(qty) and price > 0 and qty > 0:
                     result.append((price, qty))
             return result
 
@@ -223,8 +292,8 @@ class BinanceClient:
                 "unfilled_usd": max(0.0, remaining),
             }
 
-        buy = estimate_vwap(asks, notional_usd)
-        sell = estimate_vwap(bids, notional_usd)
+        buy = estimate_vwap(asks, requested_notional)
+        sell = estimate_vwap(bids, requested_notional)
         return {
             "symbol": resolved,
             "fetched_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -236,7 +305,7 @@ class BinanceClient:
             "bid_depth_1pct_usd": bid_depth_1pct,
             "ask_depth_1pct_usd": ask_depth_1pct,
             "depth_imbalance_1pct": depth_imbalance,
-            "notional_usd": notional_usd if notional_usd > 0 else None,
+            "notional_usd": requested_notional if requested_notional > 0 else None,
             "market_buy_estimate": buy,
             "market_sell_estimate": sell,
             "estimated_only": True,
