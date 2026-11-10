@@ -22,7 +22,7 @@ def test_long_a_requires_all_six_conditions_and_no_flags():
     result = evaluate_scenarios(target, stats, {"thresholds": {"oi_4h_alt_pct": 1, "funding_hot_pct": 0.03, "ls_long_extreme": 2.5}}, technical={"trend_retest_long": {"confirmed": True}})
     long_a = next(item for item in result if item.scenario.startswith("LONG A"))
     assert long_a.complete
-    assert long_a.status == "OBSERVATION"
+    assert long_a.status == "CONFIRMED_SIGNAL"
 
 
 def test_missing_value_is_unknown_not_zero():
@@ -33,7 +33,7 @@ def test_missing_value_is_unknown_not_zero():
     assert long_a.checks[0].passed is None
 
 
-def test_long_a_observation_does_not_require_chart_retest():
+def test_long_a_waits_for_closed_1h_breakout_and_retest():
     rows = []
     for i in range(20):
         rows.append(MarketRow(
@@ -50,8 +50,8 @@ def test_long_a_observation_does_not_require_chart_retest():
     results = evaluate_scenarios(enriched[0], stats, {"thresholds": {"oi_4h_alt_pct": 1, "funding_hot_pct": 0.03, "ls_long_extreme": 2.5}})
     long_a = next(item for item in results if item.scenario.startswith("LONG A"))
     assert long_a.complete
-    assert long_a.status == "OBSERVATION"
-    assert "before any entry" in long_a.reason
+    assert long_a.status == "WAITING_FOR_1H_BREAKOUT_RETEST"
+    assert "not confirmed" in long_a.reason
 
 
 def test_long_c_preparation_reports_two_of_two_stage_checks():
@@ -117,7 +117,7 @@ def test_short_e_requires_three_consecutive_four_hour_snapshots_and_actual_flow_
     technical = {"failed_breakout_rejection": {"confirmed": True}}
     result = evaluate_scenarios(enriched[0], stats, {"thresholds": {}}, history=history, technical=technical)
     short_e = next(item for item in result if item.scenario.startswith("SHORT E"))
-    assert short_e.status == "OBSERVATION"
+    assert short_e.status == "CONFIRMED_SIGNAL"
     assert short_e.complete
 
     result_without_3 = evaluate_scenarios(enriched[0], stats, {"thresholds": {}}, history=history[-2:], technical=technical)
@@ -175,12 +175,15 @@ def test_grass_keeps_six_of_six_but_surfaces_funding_sign_reversal_warning():
         btc_corr7d=0.88,
     )
     enriched, stats = analyze_universe([row], DEFAULT_P1_CONFIG)
-    result = evaluate_scenarios(enriched[0], stats, DEFAULT_P1_CONFIG)
+    result = evaluate_scenarios(
+        enriched[0], stats, DEFAULT_P1_CONFIG,
+        technical={"trend_retest_long": {"confirmed": True}},
+    )
     long_a = next(item for item in result if item.scenario.startswith("LONG A"))
 
     assert long_a.passed_count == 6
     assert long_a.total_count == 6
-    assert long_a.status == "OBSERVATION_WITH_WARNING"
+    assert long_a.status == "CONFIRMED_SIGNAL_WITH_WARNING"
     assert "qualitative warning only" in long_a.reason
     assert any("changes sign versus current FR" in note for note in enriched[0].diagnostic_notes)
     assert "OI 4H change is small in USD" in enriched[0].diagnostic_notes
@@ -263,3 +266,46 @@ def test_short_e_rejects_overlapping_four_hour_windows():
     short_e = next(item for item in results if item.scenario.startswith("SHORT E"))
     assert short_e.status == "NOT_MET"
     assert short_e.checks[0].passed is False
+
+
+def test_short_d_is_not_confirmed_as_a_liquidation_cascade_when_oi_coverage_is_below_ten_percent():
+    row = MarketRow(
+        symbol="ALTUSDT_PERP", name="ALT", price=10, chg24_pct=-6,
+        market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=100_000_000,
+        oi_chg24_pct=-10, oi_chg24_usd=-10_000_000, oi_chg4h_pct=-2, oi_chg4h_usd=-2_000_000,
+        oi_vol_ratio=0.5, oi_mktcap_ratio=0.1, vol_mktcap_ratio=0.2,
+        fr_avg_pct=0.001, fr_oiw_pct=0.001, pfr_oiw_pct=0.001,
+        liq_total24_usd=500_000, liq_long24_usd=450_000, liq_short24_usd=50_000,
+        ls_ratio_1d=1.5, futures_imbalance_4h=-5, spot_imbalance_4h=-7,
+    )
+    enriched, stats = analyze_universe([row], {"thresholds": {}})
+    results = evaluate_scenarios(
+        enriched[0], stats, {"thresholds": {}},
+        technical={"weak_bounce_rejection": {"confirmed": True}},
+    )
+    short_d = next(item for item in results if item.scenario.startswith("SHORT D"))
+
+    assert short_d.status == "BLOCKED_CAUSALITY"
+    coverage_check = next(check for check in short_d.checks if check.name.startswith("Liquidations cover"))
+    assert coverage_check.passed is False
+
+
+def test_short_d_can_confirm_only_when_liquidation_coverage_and_rejection_are_confirmed():
+    row = MarketRow(
+        symbol="ALTUSDT_PERP", name="ALT", price=10, chg24_pct=-6,
+        market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=100_000_000,
+        oi_chg24_pct=-10, oi_chg24_usd=-10_000_000, oi_chg4h_pct=-2, oi_chg4h_usd=-2_000_000,
+        oi_vol_ratio=0.5, oi_mktcap_ratio=0.1, vol_mktcap_ratio=0.2,
+        fr_avg_pct=0.001, fr_oiw_pct=0.001, pfr_oiw_pct=0.001,
+        liq_total24_usd=2_000_000, liq_long24_usd=1_800_000, liq_short24_usd=200_000,
+        ls_ratio_1d=1.5, futures_imbalance_4h=-5, spot_imbalance_4h=-7,
+    )
+    enriched, stats = analyze_universe([row], {"thresholds": {}})
+    results = evaluate_scenarios(
+        enriched[0], stats, {"thresholds": {}},
+        technical={"weak_bounce_rejection": {"confirmed": True}},
+    )
+    short_d = next(item for item in results if item.scenario.startswith("SHORT D"))
+
+    assert short_d.status == "CONFIRMED_SIGNAL"
+    assert short_d.complete
