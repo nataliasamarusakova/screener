@@ -28,7 +28,6 @@ def test_settings_read_credentials_only_from_process_environment(tmp_path: Path,
     assert settings.telegram_bot_token == "telegram-token"
     assert settings.telegram_chat_ids == ["12345", "67890"]
     assert settings.data_dir == tmp_path / "data"
-    assert settings.output_dir == tmp_path / "reports"
 
 
 def test_settings_require_coinalyze_github_secrets(tmp_path: Path, monkeypatch):

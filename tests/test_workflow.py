@@ -35,3 +35,13 @@ def test_wireproxy_health_check_targets_binance_only_and_avoids_step_local_env_b
     assert 'echo "VPN_DIR=$vpn_dir" >> "$GITHUB_ENV"' not in workflow
     assert '--proxy "$BINANCE_HTTP_PROXY"' in workflow
     assert "Binance API connectivity through WireProxy: OK" in workflow
+
+
+def test_workflow_does_not_create_or_upload_markdown_csv_or_json_reports():
+    workflow = (Path(__file__).parents[1] / ".github/workflows/screener.yml").read_text()
+    assert "OUTPUT_DIR" not in workflow
+    assert "mkdir -p data reports" not in workflow
+    assert "actions/upload-artifact@v4" not in workflow
+    assert "screener_report.md" not in workflow
+    assert "candidates.csv" not in workflow
+    assert "analysis.json" not in workflow

@@ -47,3 +47,10 @@ def test_equal_flow_values_receive_shared_average_rank():
     assert all(item.f_strong_buy for item in enriched[:3])
     assert all(item.s_strong_buy for item in enriched[:3])
     assert not any(item.f_strong_buy for item in enriched[3:])
+
+
+def test_strong_inverse_btc_correlation_is_not_treated_as_independent():
+    row = mk("ALTUSDT_PERP", 5.0, 4.0, 1.0, 1.2, 1.0)
+    row.btc_corr7d = -0.82
+    enriched, _ = analyze_universe([row], {"thresholds": {}})
+    assert any("strong (inverse)" in note for note in enriched[0].diagnostic_notes)
