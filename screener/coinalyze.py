@@ -117,7 +117,7 @@ REQUIRED_FOR_P1 = {
     "oi_vol_ratio", "oi_mktcap_ratio", "vol_mktcap_ratio",
     "fr_avg_pct", "fr_oiw_pct", "pfr_oiw_pct", "liq_total24_usd",
     "liq_long24_usd", "liq_short24_usd", "ls_ratio_1h", "ls_ratio_1d",
-    "futures_imbalance_4h", "spot_imbalance_4h",
+    "futures_imbalance_4h", "spot_imbalance_4h", "btc_corr7d",
 }
 
 

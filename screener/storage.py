@@ -289,8 +289,8 @@ class Store:
         if chat_id is None:
             return records
         recipient = str(chat_id)
-        # Records written before recipient-scoped tracking represented a fully
-        # successful broadcast, so keep treating them as success for every chat.
+        # Pre-recipient records were only written after every configured recipient
+        # succeeded. Preserve them as successful broadcast records for all chats.
         return [
             item for item in records
             if item.get("chat_id") is None or str(item.get("chat_id")) == recipient
@@ -308,16 +308,27 @@ class Store:
         ]
         if not matching:
             return True
-        last_sent = datetime.fromisoformat(str(matching[-1]["sent_at"]))
-        if last_sent.tzinfo is None:
-            last_sent = last_sent.replace(tzinfo=timezone.utc)
+        last_sent: datetime | None = None
+        for item in matching:
+            try:
+                candidate = datetime.fromisoformat(str(item["sent_at"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if candidate.tzinfo is None:
+                candidate = candidate.replace(tzinfo=timezone.utc)
+            if last_sent is None or candidate > last_sent:
+                last_sent = candidate
+        if last_sent is None:
+            return True
         return datetime.now(timezone.utc) - last_sent >= timedelta(hours=cooldown_hours)
 
     def record_notification(
-        self, event_key: str, message_id: str | int | None = None,
+        self,
+        event_key: str,
+        message_id: str | int | None = None,
         chat_id: str | None = None,
     ) -> None:
-        record = {
+        record: dict[str, Any] = {
             "record_type": "notification",
             "event_key": event_key,
             "sent_at": datetime.now(timezone.utc).isoformat(),

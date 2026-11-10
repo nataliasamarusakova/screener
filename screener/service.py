@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import statistics
+from datetime import datetime, timezone
 from typing import Any
 
 from .binance import BinanceClient
@@ -20,7 +21,7 @@ from .structure import (
     weak_bounce_rejection,
     confirmed_pivots,
 )
-from .telegram import TelegramClient, format_alert
+from .telegram import TelegramClient, format_alert, format_market_summary
 
 log = logging.getLogger(__name__)
 
@@ -168,6 +169,85 @@ def _can_send_alerts(scrape: ScrapeResult, settings: Settings) -> tuple[bool, st
     return True, "OK"
 
 
+def _snapshot_deltas(
+    store: Store, rows: list[EnrichedRow], fetched_at: datetime, unchanged: bool = False
+) -> dict[str, dict[str, Any]]:
+    deltas: dict[str, dict[str, Any]] = {}
+    for enriched in rows:
+        history = store.recent_symbol_history(enriched.symbol, limit=2)
+        if not history:
+            continue
+        if unchanged:
+            previous = history[-1]
+            current = enriched.market.to_dict()
+            current["snapshot_at"] = fetched_at.isoformat()
+        else:
+            if len(history) < 2:
+                continue
+            previous, current = history[-2], history[-1]
+        try:
+            previous_at = datetime.fromisoformat(previous["snapshot_at"])
+            current_at = datetime.fromisoformat(current["snapshot_at"])
+            gap_hours = (current_at - previous_at).total_seconds() / 3600.0
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        def difference(key: str) -> float | None:
+            old, new = previous.get(key), current.get(key)
+            return float(new) - float(old) if old is not None and new is not None else None
+
+        price_delta = None
+        old_price, new_price = previous.get("price"), current.get("price")
+        if old_price is not None and new_price is not None and float(old_price) != 0:
+            price_delta = (float(new_price) / float(old_price) - 1.0) * 100.0
+        oi_delta_usd = difference("oi_usd")
+        oi_delta_pct = None
+        old_oi, new_oi = previous.get("oi_usd"), current.get("oi_usd")
+        if old_oi is not None and new_oi is not None and float(old_oi) != 0:
+            oi_delta_pct = (float(new_oi) / float(old_oi) - 1.0) * 100.0
+        if unchanged:
+            note = "значения таблицы полностью совпадают с предыдущим снимком: новых данных Coinalyze нет"
+        elif gap_hours < 4.0:
+            note = "окна 4H перекрываются; только предварительное наблюдение, не независимые наблюдения"
+        elif gap_hours > 4.0:
+            note = "интервал >4h; окна уже несопоставимы как одно последовательное 4H наблюдение"
+        else:
+            note = "интервал ровно 4h; приблизительно сопоставимые последовательные окна"
+
+        price_x_oi = "unknown"
+        if unchanged:
+            price_x_oi = "no_new_table_data"
+        elif price_delta is not None and oi_delta_pct is not None:
+            if price_delta > 0 and oi_delta_pct > 0:
+                price_x_oi = "price_up_oi_up"
+            elif price_delta < 0 and oi_delta_pct > 0:
+                price_x_oi = "price_down_oi_up"
+            elif price_delta > 0 and oi_delta_pct < 0:
+                price_x_oi = "price_up_oi_down_possible_short_closing"
+            elif price_delta < 0 and oi_delta_pct < 0:
+                price_x_oi = "price_down_oi_down_possible_long_closing"
+            else:
+                price_x_oi = "mixed_or_flat"
+            if gap_hours < 4.0:
+                price_x_oi = "preliminary_overlapping_windows:" + price_x_oi
+            elif gap_hours > 4.0:
+                price_x_oi = "not_comparable_gap_over_4h:" + price_x_oi
+            else:
+                price_x_oi = "comparable_4h_interval:" + price_x_oi
+        deltas[enriched.symbol] = {
+            "interval_hours": round(gap_hours, 3),
+            "window_note": note,
+            "price_change_pct": round(price_delta, 6) if price_delta is not None else None,
+            "oi_change_usd": round(oi_delta_usd, 2) if oi_delta_usd is not None else None,
+            "oi_change_pct": round(oi_delta_pct, 6) if oi_delta_pct is not None else None,
+            "price_x_oi_classification": price_x_oi,
+            "futures_imbalance_delta": round(difference("futures_imbalance_4h"), 6) if difference("futures_imbalance_4h") is not None else None,
+            "spot_imbalance_delta": round(difference("spot_imbalance_4h"), 6) if difference("spot_imbalance_4h") is not None else None,
+            "funding_oiw_delta_pp": round(difference("fr_oiw_pct"), 6) if difference("fr_oiw_pct") is not None else None,
+        }
+    return deltas
+
+
 def _collect_notifications(
     results: list[ScenarioResult],
     rows: list[EnrichedRow],
@@ -176,10 +256,69 @@ def _collect_notifications(
     contract_alerts_allowed: bool,
     dry_run: bool,
     no_new_data: bool = False,
+    *,
+    stats: Any | None = None,
+    fetched_at: datetime | None = None,
+    contract_type: str = "PERPETUAL",
+    snapshot_deltas: dict[str, dict[str, Any]] | None = None,
+    missing_columns: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     by_symbol = {row.symbol: row for row in rows}
     telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_ids)
-    eligible = {"OBSERVATION", "OBSERVATION_AFTER_BOUNCE", "TRIGGER"}
+    recipients = list(dict.fromkeys(str(chat_id) for chat_id in settings.telegram_chat_ids))
+    outcomes: list[dict[str, Any]] = []
+
+    if not contract_alerts_allowed:
+        log.warning("Notification delivery blocked by contract/schema guard")
+        return [{"sent": False, "reason": "contract/schema guard"}]
+    if not recipients:
+        log.warning("No Telegram recipients configured; analysis remains available in dry-run logs")
+
+    def deliver(event_key: str, message: str, *, kind: str, symbol: str | None = None) -> None:
+        if no_new_data:
+            pending = [chat_id for chat_id in recipients if not store.notification_exists(event_key, chat_id)]
+            already_sent_without_recipient_tracking = not recipients and store.notification_exists(event_key)
+            if already_sent_without_recipient_tracking:
+                return
+        else:
+            pending = [
+                chat_id for chat_id in recipients
+                if store.notification_due(event_key, settings.telegram_cooldown_hours, chat_id)
+            ]
+
+        if recipients and not pending:
+            return
+        if not recipients or dry_run or not telegram.configured:
+            reason = "dry-run" if dry_run else "telegram not configured"
+            plain = message.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "").replace("<i>", "").replace("</i>", "")
+            log.info("[%s / %s]\n%s", kind.upper(), reason.upper(), plain)
+            outcomes.append({"type": kind, "symbol": symbol, "sent": False, "reason": reason, "text": message})
+            return
+
+        delivery = telegram.send(message, chat_ids=pending)
+        successes = [item for item in delivery if item.get("sent")]
+        # Commit each confirmed delivery separately. A failure for another chat
+        # must not cause a duplicate to a recipient who already received the alert.
+        for item in successes:
+            store.record_notification(
+                event_key,
+                item.get("message_id"),
+                chat_id=str(item.get("chat_id")),
+            )
+        outcomes.append({
+            "type": kind,
+            "symbol": symbol,
+            "sent": bool(delivery) and len(successes) == len(delivery),
+            "delivery": delivery,
+        })
+
+    if stats is not None and fetched_at is not None and rows:
+        snapshot_hash = store._canonical_snapshot(contract_type, [item.market for item in rows])
+        summary_key = f"MARKET_SUMMARY|{contract_type}|{snapshot_hash}"
+        summary = format_market_summary(rows, stats, fetched_at, contract_type, missing_columns)
+        deliver(summary_key, summary, kind="market_summary")
+
+    eligible = {"OBSERVATION", "OBSERVATION_WITH_WARNING", "OBSERVATION_AFTER_BOUNCE", "TRIGGER"}
     if settings.telegram_send_wait_states:
         eligible.update({
             "WAIT_BOUNCE",
@@ -187,51 +326,23 @@ def _collect_notifications(
             "WAITING_FOR_HISTORY_OR_HIGHER_LOW",
             "WAITING_FOR_1H_STRUCTURE_BREAK",
         })
-    outcomes: list[dict[str, Any]] = []
+
     for result in results:
         if result.status not in eligible or result.quality_flags:
             continue
-        if not contract_alerts_allowed:
-            outcomes.append({"symbol": result.symbol, "scenario": result.scenario, "sent": False, "reason": "contract/schema guard"})
+        row = by_symbol.get(result.symbol)
+        if row is None:
+            log.error("Cannot format Telegram notification: market row missing for %s", result.symbol)
             continue
         key = f"{result.symbol}|{result.scenario}|{result.status}"
-        message = format_alert(result, by_symbol[result.symbol], result.technical)
-        if dry_run or not telegram.configured:
-            if no_new_data and store.notification_exists(key):
-                # Preserve the old broadcast-level behavior for legacy state and dry runs.
-                continue
-            if not store.notification_due(key, settings.telegram_cooldown_hours):
-                continue
-            log.info("[DRY RUN / NO TELEGRAM]\n%s", message.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", ""))
-            outcomes.append({"symbol": result.symbol, "scenario": result.scenario, "sent": False, "reason": "dry-run" if dry_run else "telegram not configured", "text": message})
-            continue
-
-        recipients = list(dict.fromkeys(str(chat_id) for chat_id in settings.telegram_chat_ids))
-        if no_new_data:
-            pending = [
-                chat_id for chat_id in recipients
-                if not store.notification_exists(key, chat_id)
-            ]
-        else:
-            pending = [
-                chat_id for chat_id in recipients
-                if store.notification_due(key, settings.telegram_cooldown_hours, chat_id)
-            ]
-        if not pending:
-            continue
-
-        delivery = telegram.send(message, chat_ids=pending)
-        successes = [item for item in delivery if item.get("sent")]
-        # Persist each recipient's confirmed success even when another recipient fails.
-        for item in successes:
-            store.record_notification(
-                key, item.get("message_id"), chat_id=str(item["chat_id"])
-            )
-        all_success = bool(delivery) and len(successes) == len(delivery)
-        outcomes.append({
-            "symbol": result.symbol, "scenario": result.scenario,
-            "sent": all_success, "delivery": delivery,
-        })
+        message = format_alert(
+            result,
+            row,
+            result.technical,
+            fetched_at=fetched_at,
+            snapshot_delta=(snapshot_deltas or {}).get(result.symbol),
+        )
+        deliver(key, message, kind="scenario", symbol=result.symbol)
     return outcomes
 
 
@@ -297,7 +408,21 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         allowed, guard_reason = _can_send_alerts(scrape, settings)
         if not allowed:
             log.warning("Telegram alert guard: %s", guard_reason)
-        notifications = _collect_notifications(results, enriched, settings, store, allowed, use_dry_run, no_new_data=unchanged)
+        deltas_by_symbol = _snapshot_deltas(store, enriched, scrape.fetched_at, unchanged=unchanged)
+        notifications = _collect_notifications(
+            results,
+            enriched,
+            settings,
+            store,
+            allowed,
+            use_dry_run,
+            no_new_data=unchanged,
+            stats=stats,
+            fetched_at=scrape.fetched_at,
+            contract_type=scrape.contract_type,
+            snapshot_deltas=deltas_by_symbol,
+            missing_columns=scrape.missing_columns,
+        )
         visible_results = [r for r in results if r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE", "OBSERVATION_AFTER_BOUNCE"}]
         store.finish_run(run_id, len(scrape.rows), len(visible_results), "OK")
         log.info("Scan complete: rows=%d near-scenarios=%d contract=%s", len(scrape.rows), len(visible_results), scrape.contract_type)

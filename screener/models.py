@@ -126,6 +126,8 @@ class MarketStats:
     median_s: float | None
     median_oi24_pct: float | None
     median_oi4h_pct: float | None
+    median_oi24_usd: float | None
+    median_oi4h_usd: float | None
     f_negative_count: int
     s_negative_count: int
     oi24_negative_count: int

@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-P1_PARAMETERS_VERSION = "P1"
 
 
 # P1 thresholds are kept with runtime code so GitHub Actions needs no external config file.

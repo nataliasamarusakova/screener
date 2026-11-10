@@ -44,6 +44,20 @@ def _oi_growth_min(symbol: str, thresholds: dict[str, Any]) -> float:
 
 
 def _result(row: EnrichedRow, scenario: str, direction: str, checks: list[Check], status: str = "NOT_MET", reason: str = "", technical: dict[str, Any] | None = None) -> ScenarioResult:
+    # A PFR OI_W sign reversal is explicitly qualitative in P1: there is no
+    # numeric threshold, so it must not change the k/N count or become a hard
+    # failed condition. It does, however, prevent an unqualified OBSERVATION.
+    market = row.market
+    funding_sign_reversal = (
+        market.fr_oiw_pct is not None
+        and market.pfr_oiw_pct is not None
+        and market.fr_oiw_pct * market.pfr_oiw_pct < 0
+    )
+    if status == "OBSERVATION" and funding_sign_reversal:
+        status = "OBSERVATION_WITH_WARNING"
+        warning = "PFR OI_W changes sign versus current FR OI_W; qualitative warning only (P1 has no numeric cutoff)."
+        reason = f"{reason}; {warning}" if reason else warning
+
     return ScenarioResult(
         symbol=row.market.symbol,
         name=row.market.name,

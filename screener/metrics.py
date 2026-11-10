@@ -60,6 +60,12 @@ def _rank_map(rows: list[MarketRow], attr: str) -> tuple[dict[str, float], int]:
     return ranks, len(values)
 
 
+def _rank_tail_count(valid_count: int, quantile: float) -> int:
+    if valid_count <= 0:
+        return 0
+    return max(1, int(math.floor(valid_count * quantile + 0.5)))
+
+
 def analyze_universe(rows: list[MarketRow], p1: dict[str, Any]) -> tuple[list[EnrichedRow], MarketStats]:
     if not rows:
         raise ValueError("Cannot analyze an empty Coinalyze universe")
@@ -71,10 +77,15 @@ def analyze_universe(rows: list[MarketRow], p1: dict[str, Any]) -> tuple[list[En
     median_s = _median([r.spot_imbalance_4h for r in rows])
     median_oi24 = _median([r.oi_chg24_pct for r in rows])
     median_oi4h = _median([r.oi_chg4h_pct for r in rows])
+    median_oi24_usd = _median([r.oi_chg24_usd for r in rows])
+    median_oi4h_usd = _median([r.oi_chg4h_usd for r in rows])
     f_rank, f_n = _rank_map(rows, "futures_imbalance_4h")
     s_rank, s_n = _rank_map(rows, "spot_imbalance_4h")
-    f_tail = max(1, math.ceil(f_n * quantile)) if f_n else 0
-    s_tail = max(1, math.ceil(s_n * quantile)) if s_n else 0
+    # P1's "top/bottom 15%" is rounded to the nearest whole row. For the
+    # reference universe this yields 11 of 75 Futures rows and 11 of 72
+    # non-null Spot rows; ceil() incorrectly admitted a 12th Futures row.
+    f_tail = _rank_tail_count(f_n, quantile)
+    s_tail = _rank_tail_count(s_n, quantile)
 
     btc = next((r for r in rows if r.symbol in {"BTC", "BTCUSDT", "BTCUSDT_PERP", "BTCUSDT_PERP.A"}), None)
     btc_change = btc.chg24_pct if btc else None
@@ -145,16 +156,36 @@ def analyze_universe(rows: list[MarketRow], p1: dict[str, Any]) -> tuple[list[En
         if s is None:
             flags.append("SPOT_IMBALANCE_NA")
         if delta_funding is not None:
-            notes.append("PFR-vs-FR divergence has no numeric P1 threshold; not auto-flagged")
+            if row.fr_oiw_pct is not None and row.pfr_oiw_pct is not None and row.fr_oiw_pct * row.pfr_oiw_pct < 0:
+                notes.append(
+                    "PFR OI_W changes sign versus current FR OI_W; P1 has no numeric divergence threshold, warning only"
+                )
+            else:
+                notes.append("PFR-vs-FR divergence has no numeric P1 threshold; not auto-flagged")
         base_symbol = row.symbol.upper().split(".", 1)[0].replace("_PERP", "").replace("-PERP", "")
         is_bitcoin = base_symbol in {"BTC", "BTCUSDT", "BTCUSDC", "BTCUSD"}
-        if not is_bitcoin and row.btc_corr7d is not None and abs(row.btc_corr7d) >= 0.7:
-            relation = "positive" if row.btc_corr7d > 0 else "inverse"
-            notes.append(f"BTC Correlation 7D is strong ({relation}); treat as BTC-linked exposure, not an independent position")
+        if not is_bitcoin and row.btc_corr7d is not None and row.btc_corr7d > 0.7:
+            notes.append("BTC Correlation 7D > 0.7: treat as BTC-correlated exposure, not an independent position")
         if row.oi_chg4h_usd is not None and abs(row.oi_chg4h_usd) < float(thresholds.get("oi_4h_small_usd", 2_000_000.0)):
             notes.append("OI 4H change is small in USD")
         if voluntary is True:
             notes.append("Liquidations explain <10% of absolute OI 24H decline; decline likely mostly voluntary")
+        # P1 explicitly asks to surface all three divergences: F vs S,
+        # price vs Spot, and price vs OI (same 24H window only).
+        if f is not None and s is not None and f * s < 0:
+            notes.append("Futures and Spot Imbalance have opposite signs; F/S divergence, no mutual flow confirmation")
+        if row.chg24_pct is not None and s is not None:
+            if row.chg24_pct > 0 and s < 0:
+                notes.append("Price 24H is positive while Spot Imbalance is negative; price/Spot divergence")
+            elif row.chg24_pct < 0 and s > 0:
+                notes.append("Price 24H is negative while Spot Imbalance is positive; price/Spot divergence")
+        if row.chg24_pct is not None and row.oi_chg24_pct is not None:
+            if row.chg24_pct > 0 and row.oi_chg24_pct < 0:
+                notes.append("Price 24H up while OI 24H down: possible short closing, not proof of a sustainable new LONG")
+            elif row.chg24_pct < 0 and row.oi_chg24_pct < 0:
+                notes.append("Price 24H down while OI 24H down: possible long closing, not proof of fresh SHORT opening")
+            elif row.chg24_pct < 0 and row.oi_chg24_pct > 0:
+                notes.append("Price 24H down while OI 24H up: positions are building during the decline; direction is not identified by OI alone")
         if (
             row.oi_chg4h_pct is not None
             and f is not None and s is not None
@@ -200,6 +231,8 @@ def analyze_universe(rows: list[MarketRow], p1: dict[str, Any]) -> tuple[list[En
         median_s=median_s,
         median_oi24_pct=median_oi24,
         median_oi4h_pct=median_oi4h,
+        median_oi24_usd=median_oi24_usd,
+        median_oi4h_usd=median_oi4h_usd,
         f_negative_count=sum(r.futures_imbalance_4h is not None and r.futures_imbalance_4h < 0 for r in rows),
         s_negative_count=sum(r.spot_imbalance_4h is not None and r.spot_imbalance_4h < 0 for r in rows),
         oi24_negative_count=sum(r.oi_chg24_pct is not None and r.oi_chg24_pct < 0 for r in rows),
