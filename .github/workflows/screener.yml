@@ -78,7 +78,6 @@ jobs:
         shell: bash
         env:
           WIREGUARD_CONF: ${{ secrets.WIREGUARD_CONF }}
-          VPN_EXPECTED_COUNTRY: NL
         run: |
           set -euo pipefail
           if [[ -z "${WIREGUARD_CONF:-}" ]]; then
@@ -86,7 +85,6 @@ jobs:
             exit 1
           fi
           vpn_dir="$(mktemp -d)"
-          echo "VPN_DIR=$vpn_dir" >> "$GITHUB_ENV"
           printf '%s\n' "$WIREGUARD_CONF" > "$vpn_dir/wg.conf"
           chmod 600 "$vpn_dir/wg.conf"
           # Validate key material without ever printing key values to Actions logs.
@@ -140,30 +138,28 @@ jobs:
           fi
           "$HOME/.local/bin/wireproxy" -c "$vpn_dir/wireproxy.conf" >"$vpn_dir/wireproxy.log" 2>&1 &
           echo $! > "$vpn_dir/wireproxy.pid"
+          # Probe the same Binance API that the application will use. Do not send
+          # readiness or diagnostics traffic to third-party IP-check services.
+          probe_ok=false
           for attempt in $(seq 1 30); do
             if curl --silent --show-error --fail --noproxy "" \
-              --proxy http://127.0.0.1:18080 --connect-timeout 3 --max-time 8 \
-              https://ipinfo.io/json -o "$vpn_dir/ipinfo.json"; then
+              --proxy "$BINANCE_HTTP_PROXY" --connect-timeout 3 --max-time 8 \
+              https://fapi.binance.com/fapi/v1/ping \
+              -o "$vpn_dir/binance-ping.json" 2>"$vpn_dir/binance-probe.log"; then
+              probe_ok=true
               break
             fi
             sleep 1
           done
-          if [[ ! -s "$vpn_dir/ipinfo.json" ]]; then
-            echo "::error::WireGuard proxy did not become ready."
+          if [[ "$probe_ok" != "true" || ! -s "$vpn_dir/binance-ping.json" ]]; then
+            echo "::error::Binance API is not reachable through the local WireProxy."
+            if [[ -s "$vpn_dir/binance-probe.log" ]]; then
+              cat "$vpn_dir/binance-probe.log"
+            fi
             cat "$vpn_dir/wireproxy.log" || true
             exit 1
           fi
-          python - <<'PY'
-          import json, os
-          from pathlib import Path
-          path = Path(os.environ["VPN_DIR"]) / "ipinfo.json"
-          data = json.loads(path.read_text())
-          actual = str(data.get("country", "")).upper()
-          expected = os.environ["VPN_EXPECTED_COUNTRY"]
-          print(f"Binance egress country: {actual or 'unknown'}")
-          if actual != expected:
-              raise SystemExit(f"WireGuard country mismatch: expected {expected}, got {actual}")
-          PY
+          echo "Binance API connectivity through WireProxy: OK"
 
       - name: Analyse Coinalyze table and notify Telegram
         shell: bash
