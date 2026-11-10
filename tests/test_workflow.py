@@ -24,3 +24,14 @@ def test_workflow_validates_wireguard_keys_without_logging_key_material():
     assert "must decode to 32 bytes" in workflow
     assert "Raw parser output is suppressed to protect keys." in workflow
     assert "--configtest -c" in workflow
+
+
+def test_wireproxy_health_check_targets_binance_only_and_avoids_step_local_env_bug():
+    workflow = (Path(__file__).parents[1] / ".github/workflows/screener.yml").read_text()
+    assert "https://fapi.binance.com/fapi/v1/ping" in workflow
+    assert "https://ipinfo.io/json" not in workflow
+    assert "VPN_EXPECTED_COUNTRY" not in workflow
+    assert 'os.environ["VPN_DIR"]' not in workflow
+    assert 'echo "VPN_DIR=$vpn_dir" >> "$GITHUB_ENV"' not in workflow
+    assert '--proxy "$BINANCE_HTTP_PROXY"' in workflow
+    assert "Binance API connectivity through WireProxy: OK" in workflow

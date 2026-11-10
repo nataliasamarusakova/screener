@@ -47,7 +47,7 @@ def test_report_writes_market_ranks_calculations_and_csv_limit(tmp_path):
     assert "версия_параметров" in csv_rows[0]
     assert {row["версия_параметров"] for row in csv_rows} == {"P1"}
     payload = json.loads(json_path.read_text(encoding="utf-8"))
-    assert payload["application_version"] == "1.0.1"
+    assert payload["application_version"] == "1.0.2"
     assert payload["parameter_version"] == "P1"
     assert payload["p1_backtested"] is False
     assert len(payload["universe_calculations"]) == len(markets)
