@@ -197,7 +197,7 @@ def failed_breakout_rejection(candles: list[Candle], left: int = 2, right: int =
         recent = candles[max(pivot_idx + 1, len(candles) - 8):]
         ran_above = any(c.high > level for c in recent)
         if ran_above and last.close < level:
-            return {"confirmed": True, "reason": "Price traded above a prior 1H swing high but the latest close is back below it", "failed_level": level, "last_close": last.close}
+            return {"confirmed": True, "reason": "Price traded above a prior 1H swing high but the latest close is back below it", "failed_level": level, "last_close": last.close, "failure_open_time_ms": last.open_time_ms}
     return {"confirmed": False, "reason": "No recent failed upside breakout detected"}
 
 
