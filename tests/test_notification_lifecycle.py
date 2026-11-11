@@ -10,9 +10,9 @@ from screener.storage import Store
 from screener.telegram import format_cancellation_message, format_reversal_message
 
 
-def _market():
+def _market(symbol: str = "FILUSDT_PERP.A", name: str = "Filecoin"):
     return MarketRow(
-        symbol="FILUSDT_PERP.A", name="Filecoin", price=0.765,
+        symbol=symbol, name=name, price=0.765,
         chg24_pct=-1.0, market_cap_usd=1_000_000_000,
         volume24_usd=250_000_000, oi_usd=100_000_000,
         oi_chg24_pct=-2.0, oi_chg24_usd=-2_000_000,
@@ -278,3 +278,52 @@ def test_old_event_is_cancelled_by_its_saved_level_not_a_new_pivot(tmp_path, mon
     assert _collect_notifications([still_active], rows, _settings(), store, True, False) == []
     assert FakeTelegram.sent == []
     assert len(store.active_notification_states(chat_ids=["chat-1"])) == 1
+
+
+
+def test_two_new_confirmed_scenarios_are_sent_as_two_separate_telegram_messages(tmp_path, monkeypatch):
+    import screener.service as service
+
+    FakeTelegram.sent = []
+    monkeypatch.setattr(service, "TelegramClient", FakeTelegram)
+    markets = [_market("FILUSDT_PERP.A", "Filecoin"), _market("ONDOUSDT_PERP.A", "Ondo")]
+    rows, _ = analyze_universe(markets, {"thresholds": {}})
+    by_symbol = {row.symbol: row for row in rows}
+    store = Store(tmp_path / "two-separate-messages")
+
+    short_d = _confirmed_result(
+        by_symbol["FILUSDT_PERP.A"], "SHORT", "SHORT D", level=0.7800, close=0.7650
+    )
+    long_a = _confirmed_result(
+        by_symbol["ONDOUSDT_PERP.A"], "LONG", "LONG A", level=0.7400, close=0.7650
+    )
+    # Give each signal its actual exchange contract; the helper defaults to FILUSDT.
+    long_a.technical["binance_symbol"] = "ONDOUSDT"
+
+    outcomes = _collect_notifications(
+        [short_d, long_a], rows, _settings(), store,
+        contract_alerts_allowed=True, dry_run=False,
+    )
+
+    # Exactly two sendMessage calls, each containing one complete signal card.
+    from screener import telegram as telegram_module
+    assert not hasattr(telegram_module, "format_alert_batch")
+    assert len(FakeTelegram.sent) == 2
+    assert len(outcomes) == 2
+    assert all(item["type"] == "confirmed_signal" and item["sent"] for item in outcomes)
+    messages = [message for message, recipients in FakeTelegram.sent]
+    assert all(recipients == ["chat-1"] for _, recipients in FakeTelegram.sent)
+    assert any("FILUSDT" in message and "SHORT D" in message for message in messages)
+    assert any("ONDOUSDT" in message and "LONG A" in message for message in messages)
+    assert all("НОВЫЕ ПОДТВЕРЖДЁННЫЕ СЦЕНАРИИ" not in message for message in messages)
+    assert all("────────────" not in message for message in messages)
+    assert all("P1 · НОВЫЕ СЦЕНАРИИ" not in message for message in messages)
+    assert len(store.active_notification_states(chat_ids=["chat-1"])) == 2
+
+    # A following cron run must not resend either of the two separately posted cards.
+    repeated = _collect_notifications(
+        [short_d, long_a], rows, _settings(), store,
+        contract_alerts_allowed=True, dry_run=False,
+    )
+    assert repeated == []
+    assert len(FakeTelegram.sent) == 2

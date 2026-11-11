@@ -47,22 +47,23 @@ def test_workflow_queues_pending_runs_and_does_not_commit_per_run_journal():
     assert "data/runs.jsonl" in gitignore
 
 
-def test_python311_ci_workflow_runs_tests_without_market_secrets():
+def test_dev_dependencies_keep_pytest_available_without_runtime_ci_workflow():
     root = Path(__file__).parents[1]
-    workflow = (root / ".github/workflows/tests.yml").read_text()
-    assert 'python-version: "3.11"' in workflow
-    assert "python -m pip install -r requirements.txt -r requirements-dev.txt" in workflow
-    assert "requirements-dev.txt" in workflow
-    assert "python -m pytest -q" in workflow
-    assert "repository_dispatch" not in workflow
-    assert "TG_BOT_TOKEN" not in workflow
+    runtime_requirements = (root / "requirements.txt").read_text()
+    dev_requirements = (root / "requirements-dev.txt").read_text()
+    workflow = (root / ".github/workflows/screener.yml").read_text()
+
+    assert "pytest" not in runtime_requirements.lower()
+    assert "-r requirements.txt" in dev_requirements
+    assert "pytest" in dev_requirements.lower()
+    assert "python -m pytest" not in workflow
+    assert "python -m pip install -r requirements.txt" in workflow
 
 
-def test_canonical_p1_reference_is_versioned_with_the_codebase():
+def test_repository_keeps_only_runtime_workflow_and_excludes_reference_docs():
     root = Path(__file__).parents[1]
-    prompt = root / "P1_REFERENCE.txt"
-    assert prompt.is_file()
-    text = prompt.read_text(encoding="utf-8")
-    assert "версия P1" in text
-    assert "15m для входа" in text
-    assert "не проходили backtest" in text
+    workflows = sorted((root / ".github/workflows").glob("*.yml"))
+    assert [path.name for path in workflows] == ["screener.yml"]
+    assert not (root / "P1_REFERENCE.txt").exists()
+    assert not (root / "OPERATIONS.md").exists()
+
