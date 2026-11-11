@@ -232,15 +232,6 @@ def format_alert(
     return _safe_telegram_truncate("\n".join(lines), limit=3900)
 
 
-def format_alert_batch(messages: list[str]) -> str:
-    clean = [message.strip() for message in messages if message and message.strip()]
-    if not clean:
-        return ""
-    if len(clean) == 1:
-        return clean[0]
-    return "<b>P1 · НОВЫЕ СЦЕНАРИИ</b>\n\n" + "\n\n────────────\n\n".join(clean)
-
-
 def format_cancellation_message(
     pair: str, direction: str, scenario_code: str, level: float,
 ) -> str:

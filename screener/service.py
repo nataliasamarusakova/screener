@@ -26,7 +26,7 @@ from .structure import (
     scenario_invalidation,
 )
 from .telegram import (
-    TelegramClient, format_alert, format_alert_batch,
+    TelegramClient, format_alert,
     format_cancellation_message, format_reversal_message,
 )
 
@@ -678,8 +678,9 @@ def _collect_notifications(
         if delivery.get("sent"):
             outcomes.append({"type": "cancellation", "symbol": symbol, "sent": True, "delivery": delivery})
 
-    # New confirmations are batched once per recipient. An already ACTIVE group
-    # is never repeated because its trigger timestamp/metrics changed.
+    # New confirmations are sent as separate Telegram posts, one signal per
+    # message and recipient. An already ACTIVE group is never repeated because
+    # its trigger timestamp/metrics changed.
     active_groups_by_chat = {
         (str(item.get("event_group") or ""), str(item.get("chat_id") or ""))
         for item in store.active_notification_states(chat_ids=recipients, contract_type=contract_type)
@@ -708,25 +709,18 @@ def _collect_notifications(
                 normal_by_chat[chat_id].append((result, row, identity))
 
     for chat_id, items in normal_by_chat.items():
-        if not items:
-            continue
-        messages: list[str] = []
-        formatted_items: list[tuple[ScenarioResult, EnrichedRow, tuple[str, str, str, float]]] = []
         for result, row, identity in items:
+            group, event_key, fingerprint, level = identity
             try:
-                messages.append(format_alert(result, row, result.technical, fetched_at=fetched_at))
-                formatted_items.append((result, row, identity))
+                message = format_alert(result, row, result.technical, fetched_at=fetched_at)
             except (TypeError, ValueError) as exc:
                 log.error("Cannot format confirmed signal %s %s: %s", result.symbol, result.scenario, exc)
-        if not messages:
-            continue
-        batch = "\n\n────────────\n\n".join(messages) if len(messages) > 1 else messages[0]
-        if len(messages) > 1:
-            batch = f"<b>P1 · НОВЫЕ ПОДТВЕРЖДЁННЫЕ СЦЕНАРИИ · {len(messages)}</b>\n\n" + batch
-        delivery = _send_one(telegram, batch, chat_id)
-        if delivery.get("sent") or delivery.get("delivery_unknown"):
-            for result, row, identity in formatted_items:
-                group, event_key, fingerprint, level = identity
+                continue
+
+            # One call to sendMessage per signal. Do not combine messages,
+            # prepend a batch heading, or place separator lines between signals.
+            delivery = _send_one(telegram, message, chat_id)
+            if delivery.get("sent") or delivery.get("delivery_unknown"):
                 store.record_notification(
                     event_key, delivery.get("message_id"), chat_id=chat_id,
                     event_group=group, fingerprint=fingerprint, event_state="ACTIVE",
@@ -736,7 +730,13 @@ def _collect_notifications(
                     delivery_status="SENT" if delivery.get("sent") else "UNKNOWN",
                     error=str(delivery.get("error") or "") or None,
                 )
-        outcomes.append({"type": "confirmed_batch", "sent": bool(delivery.get("sent")), "symbols": [item[0].symbol for item in formatted_items], "delivery": delivery})
+            outcomes.append({
+                "type": "confirmed_signal",
+                "sent": bool(delivery.get("sent")),
+                "symbol": result.symbol,
+                "scenario": result.scenario,
+                "delivery": delivery,
+            })
     return outcomes
 
 def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[str, Any]:
