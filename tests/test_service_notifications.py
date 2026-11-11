@@ -557,3 +557,69 @@ def test_telegram_pair_is_copyable_code_and_send_has_no_inline_keyboard(monkeypa
     assert posted[0]["parse_mode"] == "HTML"
     assert "<code>ZROUSDT</code>" in posted[0]["text"]
     assert "reply_markup" not in posted[0]
+
+
+
+def test_short_e_has_a_stable_notification_anchor_for_service_and_telegram():
+    from datetime import datetime, timezone
+    from screener.service import _confirmation_anchor, _has_required_confirmation, _notification_identity
+    from screener.telegram import _confirmation_anchor as telegram_confirmation_anchor
+
+    market = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=99.0, chg24_pct=-1.0)
+    enriched, _ = analyze_universe([market], {"thresholds": {}})
+    anchor = 1_790_000_000_000
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    close_time_ms = now_ms - 60_000
+    open_time_ms = close_time_ms - (60 * 60_000 - 1)
+    result = ScenarioResult(
+        symbol="BTCUSDT_PERP", name="Bitcoin", scenario="SHORT E — Failed Short Squeeze",
+        direction="SHORT", checks=[Check("failed breakout", True, "confirmed", "rule")],
+        quality_flags=[], status="CONFIRMED_SIGNAL",
+        technical={
+            "binance_symbol": "BTCUSDT",
+            "last_closed_1h": {
+                "open_time_ms": open_time_ms,
+                "close_time_ms": close_time_ms,
+                "close": 99.0,
+            },
+            "context_4h": {
+                "last_close": 99.0,
+                "last_close_time_ms": close_time_ms,
+                "last_confirmed_resistance": 110.0,
+            },
+            "failed_breakout_rejection": {
+                "confirmed": True,
+                "failed_level": 100.0,
+                "last_close": 99.0,
+                "failure_open_time_ms": anchor,
+            },
+        },
+    )
+
+    assert _confirmation_anchor(result) == anchor
+    assert telegram_confirmation_anchor(result) == anchor
+    assert _has_required_confirmation(result, enriched[0]) is True
+    identity = _notification_identity(result)
+    assert identity is not None
+    assert identity[1].endswith(f"|{anchor}")
+
+
+
+def test_telegram_request_errors_redact_bot_token_from_result_and_logs(monkeypatch, caplog):
+    import logging
+    import screener.telegram as telegram_module
+    from screener.telegram import TelegramClient
+
+    token = "123456:SECRET-BOT-TOKEN"
+
+    def failed_post(url, **_kwargs):
+        raise telegram_module.requests.ConnectionError(f"Connection failed for {url}: timed out")
+
+    monkeypatch.setattr(telegram_module.requests, "post", failed_post)
+    with caplog.at_level(logging.ERROR, logger="screener.telegram"):
+        result = TelegramClient(token, ["chat-1"]).send("test message")
+
+    assert result[0]["delivery_unknown"] is True
+    assert token not in str(result)
+    assert "[REDACTED]" in result[0]["error"]
+    assert token not in caplog.text

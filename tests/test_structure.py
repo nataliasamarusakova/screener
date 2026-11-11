@@ -1,5 +1,5 @@
 from screener.models import Candle
-from screener.structure import confirmed_pivots, higher_low
+from screener.structure import confirmed_pivots, failed_breakout_rejection, higher_low
 
 
 def candle(i: int, high: float, low: float, close: float | None = None) -> Candle:
@@ -37,3 +37,19 @@ def test_scenario_specific_invalidation_uses_the_correct_structure_level():
 
     absent = scenario_invalidation("LONG", "LONG A — Trend Continuation", {})
     assert absent["level"] is None
+
+
+
+def test_failed_breakout_rejection_returns_the_confirmation_candle_anchor():
+    values = [
+        candle(0, 9, 7, 8),
+        candle(1, 10, 8, 9),
+        candle(2, 12, 9, 11),
+        candle(3, 11, 8, 9),
+        candle(4, 11.5, 8.5, 10),
+        candle(5, 12.5, 9, 11.5),
+    ]
+    result = failed_breakout_rejection(values, left=1, right=1, lookback=30)
+
+    assert result["confirmed"] is True
+    assert result["failure_open_time_ms"] == values[-1].open_time_ms

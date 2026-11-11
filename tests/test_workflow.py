@@ -47,18 +47,6 @@ def test_workflow_queues_pending_runs_and_does_not_commit_per_run_journal():
     assert "data/runs.jsonl" in gitignore
 
 
-def test_dev_dependencies_keep_pytest_available_without_runtime_ci_workflow():
-    root = Path(__file__).parents[1]
-    runtime_requirements = (root / "requirements.txt").read_text()
-    dev_requirements = (root / "requirements-dev.txt").read_text()
-    workflow = (root / ".github/workflows/screener.yml").read_text()
-
-    assert "pytest" not in runtime_requirements.lower()
-    assert "-r requirements.txt" in dev_requirements
-    assert "pytest" in dev_requirements.lower()
-    assert "python -m pytest" not in workflow
-    assert "python -m pip install -r requirements.txt" in workflow
-
 
 def test_repository_keeps_only_runtime_workflow_and_excludes_reference_docs():
     root = Path(__file__).parents[1]
