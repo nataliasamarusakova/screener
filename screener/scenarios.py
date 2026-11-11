@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 from .metrics import EnrichedRow
@@ -59,8 +58,8 @@ def _oi_growth_min(symbol: str, thresholds: dict[str, Any]) -> float:
 
 
 def _result(row: EnrichedRow, scenario: str, direction: str, checks: list[Check], status: str = "NOT_MET", reason: str = "", technical: dict[str, Any] | None = None) -> ScenarioResult:
-    # A PFR OI_W sign reversal is qualitative in P1: it does not cancel an
-    # otherwise confirmed setup, but it must remain visible as a warning.
+    # A PFR OI_W sign reversal is qualitative in P1: retain it as a warning
+    # only after the scenario's numeric and chart confirmation are complete.
     market = row.market
     funding_sign_reversal = (
         market.fr_oiw_pct is not None
@@ -109,7 +108,6 @@ def evaluate_scenarios(
     *,
     technical: dict[str, Any] | None = None,
     history: list[dict[str, Any]] | None = None,
-    current_snapshot_available: bool = True,
 ) -> list[ScenarioResult]:
     m = row.market
     t = p1.get("thresholds", {})
@@ -136,11 +134,9 @@ def evaluate_scenarios(
     if all(c.passed is True for c in checks):
         retest = technical.get("trend_retest_long", {})
         if retest.get("confirmed") is True:
-            status = "CONFIRMED_SIGNAL"
-            reason = "All P1 table conditions and the closed 1H breakout/retest are confirmed; verify execution risk before entry"
+            status, reason = "CONFIRMED_SIGNAL", "All P1 table conditions and the closed 1H breakout/retest are confirmed"
         else:
-            status = "WAITING_FOR_1H_BREAKOUT_RETEST"
-            reason = "P1 table conditions are met, but the closed 1H breakout and retest are not confirmed"
+            status, reason = "WAITING_FOR_1H_BREAKOUT_RETEST", "P1 table conditions pass, but the closed 1H breakout/retest is not confirmed"
     out.append(_result(row, "LONG A — Trend Continuation", "LONG", checks, status, reason, {"trend_retest_long": technical.get("trend_retest_long")}))
 
     # LONG B — Spot Accumulation
@@ -157,7 +153,7 @@ def evaluate_scenarios(
     ]
     if all(c.passed is True for c in checks):
         if spot_seq is True and higher_low.get("confirmed") is True and no_flags:
-            status, reason = "CONFIRMED_SIGNAL", "Three separate positive Spot snapshots and the 1H higher low are confirmed; verify execution risk before entry"
+            status, reason = "CONFIRMED_SIGNAL", "Three separate positive Spot snapshots and the 1H higher low are confirmed"
         else:
             status, reason = "WAITING_FOR_HISTORY_OR_HIGHER_LOW", "Table conditions met; still need 3 positive Spot snapshots spaced about 4h apart and a 1H higher low"
     else:
@@ -180,7 +176,7 @@ def evaluate_scenarios(
         _check("Quality flags", no_flags, ", ".join(row.quality_flags) or "none", "none"),
     ]
     if all(c.passed is True for c in trigger_checks):
-        status, reason = "CONFIRMED_SIGNAL", "Both LONG C stages and the rising 1H trigger are confirmed; verify execution risk before entry"
+        status, reason = "TRIGGER", "Both LONG C stages passed; chart still required for entry"
         visible_checks = trigger_checks
     elif all(c.passed is True for c in prep_checks):
         status, reason = "PREPARATION", "Preparation stage passed (2/2); squeeze trigger is not confirmed"
@@ -209,9 +205,9 @@ def evaluate_scenarios(
         if not no_flags:
             status, reason = "BLOCKED_QUALITY", "Data pattern matches but market-quality flags exclude this market"
         elif higher_low.get("confirmed") is True:
-            status, reason = "CONFIRMED_SIGNAL", "All P1 table conditions and the 1H higher low are confirmed; verify execution risk before entry"
+            status, reason = "CONFIRMED_SIGNAL", "All P1 table conditions and the 1H higher low are confirmed"
         else:
-            status, reason = "WAITING_FOR_HIGHER_LOW", "P1 table conditions are met, but LONG D is not confirmed until a 1H higher low forms"
+            status, reason = "WAITING_FOR_HIGHER_LOW", "P1 table conditions pass, but LONG D is not confirmed until a 1H higher low forms"
     else:
         status, reason = "NOT_MET", ""
     out.append(_result(row, "LONG D — Post-Long-Flush Reversal", "LONG", checks, status, reason, {"higher_low": higher_low, "liq_coverage_of_oi_drop_pct": row.liquidation_coverage_of_oi_drop_pct}))
@@ -233,9 +229,9 @@ def evaluate_scenarios(
     if all(c.passed is True for c in checks):
         retest = technical.get("trend_retest_short", {})
         if retest.get("confirmed") is True:
-            status, reason = "CONFIRMED_SIGNAL", "All P1 table conditions and the closed 1H breakdown/retest are confirmed; verify execution risk before entry"
+            status, reason = "CONFIRMED_SIGNAL", "All P1 table conditions and the closed 1H breakdown/retest are confirmed"
         else:
-            status, reason = "WAITING_FOR_1H_BREAKDOWN_RETEST", "P1 table conditions are met, but the closed 1H breakdown and retest are not confirmed"
+            status, reason = "WAITING_FOR_1H_BREAKDOWN_RETEST", "P1 table conditions pass, but the closed 1H breakdown/retest is not confirmed"
     else:
         status, reason = "NOT_MET", ""
     out.append(_result(row, "SHORT A — Trend Continuation", "SHORT", checks, status, reason, {"trend_retest_short": technical.get("trend_retest_short"), "cascade": cascade}))
@@ -254,11 +250,9 @@ def evaluate_scenarios(
     if all(c.passed is True for c in checks):
         retest = technical.get("trend_retest_short", {})
         if retest.get("confirmed") is True:
-            status = "CONFIRMED_SIGNAL"
-            reason = "SHORT B Spot distribution conditions and the closed 1H breakdown/retest are confirmed; verify execution risk before entry"
+            status, reason = "CONFIRMED_SIGNAL", "SHORT B table conditions and the closed 1H breakdown/retest are confirmed"
         else:
-            status = "WAITING_FOR_1H_BREAKDOWN_RETEST"
-            reason = "SHORT B table conditions are met, but the closed 1H breakdown and retest are not confirmed"
+            status, reason = "WAITING_FOR_1H_BREAKDOWN_RETEST", "SHORT B table conditions pass, but the closed 1H breakdown/retest is not confirmed"
     else:
         status, reason = "NOT_MET", ""
     out.append(_result(row, "SHORT B — Spot Distribution", "SHORT", checks, status, reason, {"trend_retest_short": technical.get("trend_retest_short")}))
@@ -279,11 +273,9 @@ def evaluate_scenarios(
         structure = technical.get("bearish_structure_break", {})
         retest = technical.get("trend_retest_short", {})
         if structure.get("confirmed") is True and retest.get("confirmed") is True and no_flags:
-            status = "CONFIRMED_SIGNAL"
-            reason = "SHORT C table conditions, the closed 1H bearish structure break and successful breakdown retest are confirmed"
+            status, reason = "CONFIRMED_SIGNAL", "SHORT C table conditions, bearish 1H break and successful breakdown retest are confirmed"
         else:
-            status = "WAITING_FOR_1H_STRUCTURE_BREAK"
-            reason = "SHORT C table conditions are met, but the 1H breakdown and successful retest are not both confirmed"
+            status, reason = "WAITING_FOR_1H_STRUCTURE_BREAK", "SHORT C table conditions pass, but 1H break and successful retest are not both confirmed"
     else:
         status, reason = "NOT_MET", ""
     out.append(_result(row, "SHORT C — Long Squeeze / Reversal", "SHORT", checks, status, reason, {
@@ -292,55 +284,52 @@ def evaluate_scenarios(
     }))
 
     # SHORT D — Long Liquidation Cascade. Wait status only; never alert as an entry.
+    coverage = row.liquidation_coverage_of_oi_drop_pct
     checks = [
         _check("Long liquidation share", _ge(row.long_liq_share, 0.80), f"{row.long_liq_share:.2%}" if row.long_liq_share is not None else "n/a", ">= 80%"),
         _check("OI 24H negative", _lt(m.oi_chg24_pct), f"{m.oi_chg24_pct}%", "< 0%"),
         _check("OI 4H negative", _lt(m.oi_chg4h_pct), f"{m.oi_chg4h_pct}%", "< 0%"),
         _check("F negative", _lt(m.futures_imbalance_4h), str(m.futures_imbalance_4h), "< 0"),
         _check("S negative", _lt(m.spot_imbalance_4h), str(m.spot_imbalance_4h), "< 0"),
-        _check(
-            "Liquidations cover at least 10% of OI decline",
-            _ge(row.liquidation_coverage_of_oi_drop_pct, 10.0),
-            f"{row.liquidation_coverage_of_oi_drop_pct:.2f}%" if row.liquidation_coverage_of_oi_drop_pct is not None else "n/a",
-            ">= 10%; below 10% P1 attributes most OI decline to voluntary closing, not a liquidation cascade",
-        ),
+        _check("Liquidations cover OI decline", _ge(coverage, 10.0), f"{coverage:.2f}%" if coverage is not None else "n/a", ">= 10% per P1"),
         _check("Quality flags", no_flags, ", ".join(row.quality_flags) or "none", "none"),
     ]
-    cascade_inputs_pass = all(c.passed is True for c in checks[:5])
-    if cascade_inputs_pass and not no_flags:
-        status, reason = "BLOCKED_QUALITY", "Cascade inputs are present but quality flags exclude this market"
-    elif cascade_inputs_pass and checks[5].passed is not True:
-        status, reason = "BLOCKED_CAUSALITY", "Liquidations explain less than 10% of OI decline or coverage data is missing; P1 does not support calling this a liquidation cascade"
+    core_cascade = all(c.passed is True for c in checks[:5])
+    if core_cascade and checks[5].passed is not True:
+        status, reason = "BLOCKED_CAUSALITY", "Liquidations cover less than 10% of OI decline or coverage is unavailable; P1 does not support calling this a liquidation cascade"
+    elif core_cascade and not no_flags:
+        status, reason = "BLOCKED_QUALITY", "Cascade pattern present but quality flags exclude this market"
     elif all(c.passed is True for c in checks):
         rejection = technical.get("weak_bounce_rejection", {})
-        if rejection.get("confirmed"):
-            status, reason = "CONFIRMED_SIGNAL", "Liquidation-cascade filters, weak bounce and rejection at resistance are confirmed; verify execution risk before entry and never short the low"
+        if rejection.get("confirmed") is True:
+            status, reason = "CONFIRMED_SIGNAL", "Liquidation cascade, weak bounce and 1H rejection at resistance are confirmed; never short the low"
         else:
             status, reason = "WAIT_BOUNCE", "Cascade conditions present; SHORT is prohibited at the low. Wait for weak bounce and rejection at resistance."
     else:
         status, reason = "NOT_MET", ""
     out.append(_result(row, "SHORT D — Long Liquidation Cascade", "SHORT", checks, status, reason, {"weak_bounce_rejection": technical.get("weak_bounce_rejection"), "liq_coverage_of_oi_drop_pct": row.liquidation_coverage_of_oi_drop_pct}))
 
-    # SHORT E — Failed Short Squeeze. Use the latest three consecutive P1
-    # observations only; a changed but unsaved poll is not a new snapshot.
-    sequence_cfg = s
-    interval_seconds = max(0.0, float(sequence_cfg.get("snapshot_interval_hours", 4.0))) * 3600.0
-    tolerance_seconds = max(0, int(sequence_cfg.get("snapshot_interval_tolerance_minutes", 10))) * 60.0
+    # SHORT E — Failed Short Squeeze. Three distinct saved table snapshots are
+    # required to avoid treating one isolated comparison as a sequence.
     latest_three = history[-3:] if len(history) >= 3 else []
-    sequence_times: list[datetime] = []
-    if current_snapshot_available and len(latest_three) == 3:
+    interval_hours = max(0.0, float(s.get("snapshot_interval_hours", 4.0)))
+    tolerance_seconds = max(0, int(s.get("snapshot_interval_tolerance_minutes", 10))) * 60.0
+    history_times = []
+    if len(latest_three) == 3:
+        from datetime import datetime, timezone
         for item in latest_three:
             try:
                 stamp = datetime.fromisoformat(str(item["snapshot_at"]))
             except (KeyError, TypeError, ValueError):
-                sequence_times = []
+                history_times = []
                 break
             if stamp.tzinfo is None:
                 stamp = stamp.replace(tzinfo=timezone.utc)
-            sequence_times.append(stamp.astimezone(timezone.utc))
-    spacing_ok = len(sequence_times) == 3 and all(
-        interval_seconds <= (later - earlier).total_seconds() <= interval_seconds + tolerance_seconds
-        for earlier, later in zip(sequence_times, sequence_times[1:])
+            history_times.append(stamp.astimezone(timezone.utc))
+    expected_seconds = interval_hours * 3600.0
+    spacing_ok = len(history_times) == 3 and all(
+        expected_seconds <= (later - earlier).total_seconds() <= expected_seconds + tolerance_seconds
+        for earlier, later in zip(history_times, history_times[1:])
     )
     initial = latest_three[0] if spacing_ok else None
     previous = latest_three[1] if spacing_ok else None
@@ -362,7 +351,7 @@ def evaluate_scenarios(
     current_flow_down = None if m.futures_imbalance_4h is None or m.spot_imbalance_4h is None else (m.futures_imbalance_4h < 0 and m.spot_imbalance_4h < 0)
     flow_turned_down = None if prior_flow_not_down is None or current_flow_down is None else (prior_flow_not_down and current_flow_down)
     checks = [
-        _check("Three consecutive 4H snapshots available", history_ready, f"latest committed snapshots={len(latest_three)}; spacing valid={spacing_ok}", f"3 consecutive snapshots spaced {interval_seconds / 3600:g}h ± {tolerance_seconds / 60:g}m; current data must be saved/unchanged"),
+        _check("Three comparable 4H snapshots available", history_ready, f"latest 3 spacing valid={spacing_ok}", "three observations spaced 4h to 4h + configured grace"),
         _check("Earlier short liquidations dominated", initial_short_dominant, str(initial_short_dominant), "Snapshot t−2: Short Liqs > Long Liqs"),
         _check("Earlier OI was falling", initial_oi_falling, str(initial_oi_falling), "Snapshot t−2: OI Chg 24H < 0"),
         _check("F/S turned down", flow_turned_down, f"previous F/S not both negative={prior_flow_not_down}; current F={m.futures_imbalance_4h}; S={m.spot_imbalance_4h}", "Snapshot t−1: F/S >= 0; current snapshot: F<0 and S<0"),
@@ -371,8 +360,7 @@ def evaluate_scenarios(
         _check("Quality flags", no_flags, ", ".join(row.quality_flags) or "none", "none"),
     ]
     status = "CONFIRMED_SIGNAL" if all(c.passed is True for c in checks) and no_flags else "NOT_MET"
-    reason = "Three consecutive 4H observations, the F/S turn-down and the 1H failed-breakout are confirmed; verify execution risk before entry" if status == "CONFIRMED_SIGNAL" else "Requires three consecutive 4H snapshots with valid spacing, earlier short liquidation/OI decline, F/S turn-down and 1H failed-breakout structure"
-
+    reason = "Three-snapshot history and 1H failed-breakout predicates align" if status == "CONFIRMED_SIGNAL" else "Requires three distinct snapshots, earlier short liquidation/OI decline, F/S turn-down and 1H failed-breakout structure"
     out.append(_result(row, "SHORT E — Failed Short Squeeze", "SHORT", checks, status, reason, {"failed_breakout_rejection": technical.get("failed_breakout_rejection")}))
 
     return out

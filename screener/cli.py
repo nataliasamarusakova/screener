@@ -10,7 +10,7 @@ from .service import run_scan_once
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="screener",
-        description="Analyze the Coinalyze Perpetual table and send only confirmed P1 scenario alerts.",
+        description="Analyze the saved Coinalyze Perpetual table and send Telegram observation alerts.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Analyze without sending Telegram messages")
     args = parser.parse_args()

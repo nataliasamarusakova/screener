@@ -186,10 +186,7 @@ class Store:
     def _history_index(self) -> dict[str, list[dict[str, Any]]]:
         if self._history_cache is None:
             committed = {
-                item["snapshot_id"]: {
-                    "fetched_at": item.get("fetched_at"),
-                    "contract_type": str(item.get("contract_type") or "UNKNOWN").upper(),
-                }
+                item["snapshot_id"]: item.get("fetched_at")
                 for item in self._snapshot_manifests() if item.get("snapshot_id")
             }
             index: dict[str, list[dict[str, Any]]] = {}
@@ -199,11 +196,9 @@ class Store:
                 data = item.get("data")
                 if snapshot_id not in committed or not symbol or not isinstance(data, dict):
                     continue
-                manifest = committed[snapshot_id]
                 index.setdefault(str(symbol), []).append({
                     **data,
-                    "snapshot_at": manifest["fetched_at"],
-                    "snapshot_contract_type": manifest["contract_type"],
+                    "snapshot_at": committed[snapshot_id],
                 })
             for records in index.values():
                 records.sort(key=lambda row: str(row.get("snapshot_at", "")))
@@ -224,23 +219,18 @@ class Store:
         fetched_at: datetime,
         *,
         interval_hours: float = 4.0,
-        contract_type: str | None = None,
+        tolerance_minutes: int = 10,
     ) -> bool:
-        """Persist changed market data no earlier than the P1 snapshot interval.
+        """Persist at most one changed market snapshot per approximate P1 4H window.
 
-        The scanner may poll more frequently, but a changed table is persisted only
-        after the configured observation interval has fully elapsed. Scheduler
-        tolerance is applied when comparing saved observations, never to save early.
+        The polling interval may be five minutes, but P1 explicitly says snapshots
+        closer than four hours are overlapping and are not independent observations.
+        The tolerance allows the first poll after the expected four-hour boundary.
         """
         manifests = self._snapshot_manifests()
         if not manifests:
             return True
-        previous = manifests[-1]
-        previous_type = str(previous.get("contract_type") or "UNKNOWN").upper()
-        if contract_type is not None and previous_type != str(contract_type).upper():
-            # A different contracts universe starts a separate history series.
-            return True
-        previous_value = previous.get("fetched_at")
+        previous_value = manifests[-1].get("fetched_at")
         try:
             previous_at = datetime.fromisoformat(str(previous_value))
         except (TypeError, ValueError):
@@ -251,10 +241,10 @@ class Store:
         if previous_at.tzinfo is None:
             previous_at = previous_at.replace(tzinfo=timezone.utc)
         elapsed_seconds = (current_at.astimezone(timezone.utc) - previous_at.astimezone(timezone.utc)).total_seconds()
-        # Never persist an early snapshot: that would make rolling 4H windows
-        # overlap and then risk treating dependent observations as a sequence.
-        # The tolerance is for a late scheduled poll, not permission to sample early.
-        required_seconds = max(0.0, float(interval_hours)) * 3600.0
+        required_seconds = max(
+            0.0,
+            max(0.0, float(interval_hours)) * 3600.0 - max(0, int(tolerance_minutes)) * 60.0,
+        )
         return elapsed_seconds >= required_seconds
 
     def add_snapshot(self, fetched_at: datetime, contract_type: str, rows: list[MarketRow]) -> str:
@@ -284,68 +274,45 @@ class Store:
         self._history_cache = None
         return snapshot_id
 
-    def recent_symbol_history(
-        self, symbol: str, limit: int = 24, *, contract_type: str | None = None
-    ) -> list[dict[str, Any]]:
+    def recent_symbol_history(self, symbol: str, limit: int = 24) -> list[dict[str, Any]]:
         records = self._history_index().get(symbol, [])
-        if contract_type is not None:
-            expected = str(contract_type).upper()
-            records = [item for item in records if item.get("snapshot_contract_type") == expected]
         return records[-max(1, limit):]
 
     def spot_sequence_status(
-        self,
-        symbol: str,
-        required: int = 3,
-        interval_hours: float = 4.0,
-        tolerance_minutes: int = 10,
-        *,
-        contract_type: str | None = None,
+        self, symbol: str, required: int = 3, interval_hours: float = 4.0, tolerance_minutes: int = 10
     ) -> bool | None:
-        """Evaluate the latest consecutive committed Spot snapshots at the P1 cadence.
-
-        Do not search backwards for a convenient subset: doing so could skip a
-        negative or irregular observation and falsely manufacture an accumulation
-        sequence that the actual consecutive snapshots do not show.
-        """
-        required = max(1, int(required))
-        history = self.recent_symbol_history(
-            symbol, limit=max(required, 1), contract_type=contract_type
-        )
+        """Find positive Spot readings spaced by distinct, committed 4H snapshots."""
+        history = self.recent_symbol_history(symbol, limit=max(100, required * 12))
         if len(history) < required:
             return None
-
-        latest = history[-required:]
-        parsed: list[tuple[datetime, float | None]] = []
-        for item in latest:
+        target = timedelta(hours=interval_hours)
+        tolerance = timedelta(minutes=tolerance_minutes)
+        times: list[tuple[datetime, float | None]] = []
+        for item in history:
             try:
-                timestamp = datetime.fromisoformat(str(item["snapshot_at"]))
+                ts = datetime.fromisoformat(item["snapshot_at"])
             except (KeyError, TypeError, ValueError):
-                return None
-            if timestamp.tzinfo is None:
-                timestamp = timestamp.replace(tzinfo=timezone.utc)
-            value = item.get("spot_imbalance_4h")
-            try:
-                numeric = float(value) if value is not None else None
-            except (TypeError, ValueError, OverflowError):
-                numeric = None
-            if numeric is not None and not math.isfinite(numeric):
-                numeric = None
-            parsed.append((timestamp.astimezone(timezone.utc), numeric))
-
-        expected = max(0.0, float(interval_hours)) * 3600.0
-        tolerance = max(0, int(tolerance_minutes)) * 60.0
-        for (previous_at, _), (current_at, _) in zip(parsed, parsed[1:]):
-            gap = (current_at - previous_at).total_seconds()
-            # Four-hour rolling windows must not overlap. Allow only bounded
-            # lateness caused by polling cadence; an early snapshot is never valid.
-            if gap < expected or gap > expected + tolerance:
-                return None
-
-        values = [value for _, value in parsed]
-        if any(value is None for value in values):
+                continue
+            times.append((ts, item.get("spot_imbalance_4h")))
+        if len(times) < required:
             return None
-        return all(value > 0 for value in values if value is not None)
+        for end in range(len(times) - 1, required - 2, -1):
+            selected = [times[end]]
+            cursor = end
+            while len(selected) < required:
+                target_time = selected[-1][0] - target
+                options = [
+                    (idx, item) for idx, item in enumerate(times[:cursor])
+                    if abs(item[0] - target_time) <= tolerance
+                ]
+                if not options:
+                    break
+                idx, item = min(options, key=lambda pair: abs(pair[1][0] - target_time))
+                selected.append(item)
+                cursor = idx
+            if len(selected) == required:
+                return all(value is not None and value > 0 for _, value in selected)
+        return None
 
     def _notification_records(self, event_key: str, chat_id: str | None = None) -> list[dict[str, Any]]:
         records = [
@@ -407,12 +374,27 @@ class Store:
         *,
         event_group: str | None = None,
         fingerprint: str | None = None,
+        event_state: str | None = None,
+        direction: str | None = None,
+        invalidation_level: float | None = None,
+        pair: str | None = None,
+        scenario_code: str | None = None,
+        contract_type: str | None = None,
+        delivery_status: str = "SENT",
+        error: str | None = None,
     ) -> None:
+        """Append a delivery and optional lifecycle-state record.
+
+        A notification record is also the durable state transition. Cancellation
+        and reversal records therefore update the latest state for the original
+        scenario group without mutating older JSONL entries.
+        """
         record: dict[str, Any] = {
             "record_type": "notification",
             "event_key": event_key,
             "sent_at": datetime.now(timezone.utc).isoformat(),
             "telegram_message_id": str(message_id) if message_id is not None else None,
+            "delivery_status": str(delivery_status).upper(),
         }
         if chat_id is not None:
             record["chat_id"] = str(chat_id)
@@ -420,7 +402,61 @@ class Store:
             record["event_group"] = str(event_group)
         if fingerprint is not None:
             record["fingerprint"] = str(fingerprint)
+        if event_state is not None:
+            record["event_state"] = str(event_state).upper()
+        if direction is not None:
+            record["direction"] = str(direction).upper()
+        if invalidation_level is not None and math.isfinite(float(invalidation_level)):
+            record["invalidation_level"] = float(invalidation_level)
+        if pair is not None:
+            record["pair"] = str(pair).upper()
+        if scenario_code is not None:
+            record["scenario_code"] = str(scenario_code).upper()
+        if contract_type is not None:
+            record["contract_type"] = str(contract_type).upper()
+        if error:
+            record["error"] = str(error)[:500]
         self._append_jsonl(self.notifications_path, record)
+
+    def active_notification_states(
+        self,
+        *,
+        chat_ids: list[str] | None = None,
+        contract_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return the latest active alert per scenario group and recipient.
+
+        Rows written by older releases did not persist event_state. A legacy row
+        with an event_group and fingerprint is treated as ACTIVE so deployment
+        does not replay old alerts. Such rows may lack invalidation metadata; the
+        service will backfill it only from a currently available chart structure.
+        """
+        allowed_chats = {str(value) for value in chat_ids} if chat_ids is not None else None
+        expected_contract = str(contract_type).upper() if contract_type else None
+        latest_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in self._read_jsonl(self.notifications_path):
+            group = str(item.get("event_group") or "")
+            if not group or not item.get("fingerprint"):
+                continue
+            raw_chat = item.get("chat_id")
+            target_chats = sorted(allowed_chats) if allowed_chats is not None and raw_chat is None else [str(raw_chat or "")]
+            if allowed_chats is not None and raw_chat is not None and str(raw_chat) not in allowed_chats:
+                continue
+            stored_contract = item.get("contract_type")
+            if expected_contract and stored_contract and str(stored_contract).upper() != expected_contract:
+                continue
+            for chat_id in target_chats:
+                # Expand legacy broadcast records into recipient-scoped copies;
+                # lifecycle delivery needs the concrete chat_id for cancellation/reversal.
+                latest_by_key[(group, chat_id)] = {**item, "chat_id": chat_id}
+
+        active: list[dict[str, Any]] = []
+        for item in latest_by_key.values():
+            state = str(item.get("event_state") or "ACTIVE").upper()
+            delivery = str(item.get("delivery_status") or "SENT").upper()
+            if state == "ACTIVE" and delivery in {"SENT", "UNKNOWN"}:
+                active.append(dict(item))
+        return active
 
     def start_run(self) -> str:
         run_id = uuid.uuid4().hex

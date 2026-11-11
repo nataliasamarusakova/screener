@@ -25,7 +25,10 @@ from .structure import (
     confirmed_pivots,
     scenario_invalidation,
 )
-from .telegram import TelegramClient, format_alert
+from .telegram import (
+    TelegramClient, format_alert, format_alert_batch,
+    format_cancellation_message, format_reversal_message,
+)
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +62,8 @@ def _context_4h(
         "ema20": ema20,
         "ema50": ema50,
         "last_close": closes[-1] if closes else None,
+        "last_open_time_ms": candles[-1].open_time_ms if candles else None,
+        "last_close_time_ms": candles[-1].close_time_ms if candles else None,
         "last_confirmed_resistance": highs[-1][1] if highs else None,
         "last_confirmed_support": lows[-1][1] if lows else None,
     }
@@ -74,12 +79,23 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
 
     result: dict[str, Any] = {}
     try:
-        candles4h = client.fetch_candles(symbol, "4h", settings.binance_kline_limit)
+        result["binance_symbol"] = client.resolve_symbol(symbol)
+    except Exception as exc:
+        result["binance_symbol"] = None
+        result["binance_symbol_error"] = str(exc)
+    if not result.get("binance_symbol"):
+        result["chart_error"] = result.get("binance_symbol_error", "No active Binance USDT perpetual contract")
+        return result
+    # Use the exact tradable pair resolved through Binance exchangeInfo for every
+    # market-data request; Coinalyze's contract labels are not Binance symbols.
+    fetch_symbol = str(result["binance_symbol"]).upper()
+    try:
+        candles4h = client.fetch_candles(fetch_symbol, "4h", settings.binance_kline_limit)
         result["context_4h"] = _context_4h(candles4h, left=left, right=right, lookback=lookback)
     except Exception as exc:
         result["context_4h"] = {"trend": f"unavailable: {exc}"}
     try:
-        candles1h = client.fetch_candles(symbol, "1h", settings.binance_kline_limit)
+        candles1h = client.fetch_candles(fetch_symbol, "1h", settings.binance_kline_limit)
         result["higher_low"] = higher_low(candles1h, left, right, lookback)
         result["trend_retest_long"] = breakout_and_retest(
             candles1h, "LONG", left=left, right=right, lookback=lookback,
@@ -130,7 +146,7 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
     if settings.binance_fetch_orderbook:
         try:
             result["orderbook"] = client.fetch_orderbook_diagnostics(
-                symbol,
+                fetch_symbol,
                 limit=settings.binance_orderbook_limit,
                 notional_usd=settings.execution_notional_usd,
             )
@@ -139,7 +155,7 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
     result["execution_cost_assumptions"] = {"taker_fee_bps_per_side": settings.trading_fee_bps_per_side}
     if bool(settings.p1.get("scanner", {}).get("fetch_15m_context", True)):
         try:
-            candles15m = client.fetch_candles(symbol, "15m", settings.binance_kline_limit)
+            candles15m = client.fetch_candles(fetch_symbol, "15m", settings.binance_kline_limit)
             latest = candles15m[-1]
             candle_change = ((latest.close / latest.open) - 1.0) * 100.0 if latest.open else None
             result["context_15m"] = {
@@ -159,64 +175,48 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
     return result
 
 
-def _spot_sequence_for_current_poll(
-    store: Store,
-    symbol: str,
-    settings: Settings,
-    *,
-    current_snapshot_available: bool,
-    contract_type: str | None = None,
-) -> bool | None:
-    """Only evaluate a P1 Spot sequence when the poll maps to a committed observation.
-
-    A changed but unsaved poll is useful for live diagnostics, but it cannot
-    replace the latest element of a multi-snapshot history sequence.
-    """
-    if not current_snapshot_available:
-        return None
-    scenario_cfg = settings.p1.get("scenario", {})
-    return store.spot_sequence_status(
-        symbol,
-        required=int(scenario_cfg.get("spot_accumulation_required_snapshots", 3)),
-        interval_hours=float(scenario_cfg.get("snapshot_interval_hours", 4.0)),
-        tolerance_minutes=int(scenario_cfg.get("snapshot_interval_tolerance_minutes", 10)),
-        contract_type=contract_type,
-    )
-
-
 def _preliminary_candidate_symbols(
-    enriched: list[EnrichedRow],
-    stats: Any,
-    settings: Settings,
-    store: Store,
-    *,
-    current_snapshot_available: bool = True,
-    contract_type: str | None = None,
+    enriched: list[EnrichedRow], stats: Any, settings: Settings, store: Store,
+    *, contract_type: str | None = None,
 ) -> set[str]:
     symbols: set[str] = set()
+    # Continue monitoring 1H invalidation for every previously delivered active
+    # setup, even after its Coinalyze table filters stop passing.
+    active_symbols = {
+        str(item.get("event_group") or "").split("|", 1)[0]
+        for item in store.active_notification_states(
+            chat_ids=settings.telegram_chat_ids, contract_type=contract_type
+        )
+        if str(item.get("event_group") or "").split("|", 1)[0]
+    }
     for row in enriched:
-        history = store.recent_symbol_history(row.symbol, limit=100, contract_type=contract_type)
-        spot_sequence = _spot_sequence_for_current_poll(
-            store,
+        if row.symbol in active_symbols:
+            symbols.add(row.symbol)
+        history = store.recent_symbol_history(row.symbol, limit=100)
+        spot_sequence = store.spot_sequence_status(
             row.symbol,
-            settings,
-            current_snapshot_available=current_snapshot_available,
-            contract_type=contract_type,
+            required=int(settings.p1.get("scenario", {}).get("spot_accumulation_required_snapshots", 3)),
+            interval_hours=float(settings.p1.get("scenario", {}).get("snapshot_interval_hours", 4.0)),
+            tolerance_minutes=int(settings.p1.get("scenario", {}).get("snapshot_interval_tolerance_minutes", 10)),
         )
         draft = evaluate_scenarios(
             row, stats, settings.p1,
             technical={"spot_sequence_ok": spot_sequence},
             history=history,
-            current_snapshot_available=current_snapshot_available,
         )
         if any(r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE"} for r in draft):
             symbols.add(row.symbol)
     max_candidates = int(settings.p1.get("scanner", {}).get("max_chart_candidates", 40))
     if len(symbols) > max_candidates:
-        log.warning("Chart candidates capped: %d -> %d", len(symbols), max_candidates)
-        # Stable deterministic cut: most relevant by OI USD descending.
+        # Active positions/events must stay monitored; only draft candidates are
+        # subject to the cap.
+        active_present = symbols & active_symbols
+        remaining = symbols - active_present
         oi_by_symbol = {r.symbol: (r.market.oi_usd or 0.0) for r in enriched}
-        symbols = set(sorted(symbols, key=lambda s: oi_by_symbol.get(s, 0.0), reverse=True)[:max_candidates])
+        room = max(0, max_candidates - len(active_present))
+        selected = set(sorted(remaining, key=lambda s: oi_by_symbol.get(s, 0.0), reverse=True)[:room])
+        symbols = active_present | selected
+        log.warning("Chart candidates capped: %d -> %d (active setups prioritized)", len(active_present | remaining), len(symbols))
     return symbols
 
 
@@ -234,99 +234,54 @@ def _can_send_alerts(scrape: ScrapeResult, settings: Settings) -> tuple[bool, st
 
 
 def _snapshot_deltas(
-    store: Store,
-    rows: list[EnrichedRow],
-    fetched_at: datetime,
-    unchanged: bool = False,
-    snapshot_saved: bool = False,
-    snapshot_interval_hours: float = 4.0,
-    snapshot_interval_tolerance_minutes: int = 10,
-    contract_type: str | None = None,
+    store: Store, rows: list[EnrichedRow], fetched_at: datetime, unchanged: bool = False
 ) -> dict[str, dict[str, Any]]:
-    """Compare the current poll with the correct last committed observation.
-
-    When the poll was saved, compare the two newest committed snapshots. When it
-    was not saved, compare the live poll with the latest committed snapshot.
-    An unchanged poll is explicitly marked as no new data and produces zero
-    deltas rather than pretending the polling timestamp is a new observation.
-    """
     deltas: dict[str, dict[str, Any]] = {}
     for enriched in rows:
-        history = store.recent_symbol_history(enriched.symbol, limit=2, contract_type=contract_type)
+        history = store.recent_symbol_history(enriched.symbol, limit=2)
         if not history:
             continue
-        if snapshot_saved:
-            if len(history) < 2:
-                continue
-            previous, current = history[-2], history[-1]
-        elif unchanged:
-            previous = history[-1]
-            current = dict(previous)
-        else:
+        if unchanged:
             previous = history[-1]
             current = enriched.market.to_dict()
             current["snapshot_at"] = fetched_at.isoformat()
-
+        else:
+            if len(history) < 2:
+                continue
+            previous, current = history[-2], history[-1]
         try:
             previous_at = datetime.fromisoformat(previous["snapshot_at"])
             current_at = datetime.fromisoformat(current["snapshot_at"])
-            if previous_at.tzinfo is None:
-                previous_at = previous_at.replace(tzinfo=timezone.utc)
-            if current_at.tzinfo is None:
-                current_at = current_at.replace(tzinfo=timezone.utc)
-            gap_hours = (current_at.astimezone(timezone.utc) - previous_at.astimezone(timezone.utc)).total_seconds() / 3600.0
+            gap_hours = (current_at - previous_at).total_seconds() / 3600.0
         except (KeyError, TypeError, ValueError):
             continue
 
         def difference(key: str) -> float | None:
             old, new = previous.get(key), current.get(key)
-            if old is None or new is None:
-                return None
-            try:
-                old_num, new_num = float(old), float(new)
-            except (TypeError, ValueError, OverflowError):
-                return None
-            if not math.isfinite(old_num) or not math.isfinite(new_num):
-                return None
-            return new_num - old_num
+            return float(new) - float(old) if old is not None and new is not None else None
 
         price_delta = None
         old_price, new_price = previous.get("price"), current.get("price")
-        try:
-            old_price_num, new_price_num = float(old_price), float(new_price)
-            if old_price_num != 0 and math.isfinite(old_price_num) and math.isfinite(new_price_num):
-                price_delta = (new_price_num / old_price_num - 1.0) * 100.0
-        except (TypeError, ValueError, OverflowError):
-            pass
+        if old_price is not None and new_price is not None and float(old_price) != 0:
+            price_delta = (float(new_price) / float(old_price) - 1.0) * 100.0
         oi_delta_usd = difference("oi_usd")
         oi_delta_pct = None
         old_oi, new_oi = previous.get("oi_usd"), current.get("oi_usd")
-        try:
-            old_oi_num, new_oi_num = float(old_oi), float(new_oi)
-            if old_oi_num != 0 and math.isfinite(old_oi_num) and math.isfinite(new_oi_num):
-                oi_delta_pct = (new_oi_num / old_oi_num - 1.0) * 100.0
-        except (TypeError, ValueError, OverflowError):
-            pass
-        expected_hours = max(0.0, float(snapshot_interval_hours))
-        tolerance_hours = max(0, int(snapshot_interval_tolerance_minutes)) / 60.0
+        if old_oi is not None and new_oi is not None and float(old_oi) != 0:
+            oi_delta_pct = (float(new_oi) / float(old_oi) - 1.0) * 100.0
         if unchanged:
-            note = "значения таблицы полностью совпадают с последним снимком: новых данных Coinalyze нет"
-        elif gap_hours < 0:
-            note = "время текущего опроса раньше последнего снимка; последовательность несопоставима"
-        elif gap_hours < expected_hours:
-            note = f"окна {expected_hours:g}H перекрываются; только предварительное наблюдение, не независимые наблюдения"
-        elif gap_hours > expected_hours + tolerance_hours:
-            note = f"интервал больше {expected_hours:g}H с учётом допуска; окна несопоставимы как одно последовательное наблюдение"
-        elif gap_hours > expected_hours:
-            note = (
-                f"интервал {gap_hours:.2f}h: поздний опрос в пределах допуска "
-                f"{tolerance_hours * 60:g} мин; последовательность считается приблизительно сопоставимой"
-            )
+            note = "значения таблицы полностью совпадают с предыдущим снимком: новых данных Coinalyze нет"
+        elif gap_hours < 4.0:
+            note = "окна 4H перекрываются; только предварительное наблюдение, не независимые наблюдения"
+        elif gap_hours > 4.0:
+            note = "интервал >4h; окна уже несопоставимы как одно последовательное 4H наблюдение"
         else:
-            note = f"интервал ровно {expected_hours:g}h; последовательные окна сопоставимы"
+            note = "интервал ровно 4h; приблизительно сопоставимые последовательные окна"
 
-        price_x_oi = "no_new_table_data" if unchanged else "unknown"
-        if not unchanged and price_delta is not None and oi_delta_pct is not None:
+        price_x_oi = "unknown"
+        if unchanged:
+            price_x_oi = "no_new_table_data"
+        elif price_delta is not None and oi_delta_pct is not None:
             if price_delta > 0 and oi_delta_pct > 0:
                 price_x_oi = "price_up_oi_up"
             elif price_delta < 0 and oi_delta_pct > 0:
@@ -337,16 +292,12 @@ def _snapshot_deltas(
                 price_x_oi = "price_down_oi_down_possible_long_closing"
             else:
                 price_x_oi = "mixed_or_flat"
-            if gap_hours < 0:
-                price_x_oi = "not_comparable_timestamp_reversed:" + price_x_oi
-            elif gap_hours < expected_hours:
+            if gap_hours < 4.0:
                 price_x_oi = "preliminary_overlapping_windows:" + price_x_oi
-            elif gap_hours > expected_hours + tolerance_hours:
-                price_x_oi = "not_comparable_gap_outside_tolerance:" + price_x_oi
-            elif gap_hours > expected_hours:
-                price_x_oi = "comparable_late_interval_within_tolerance:" + price_x_oi
+            elif gap_hours > 4.0:
+                price_x_oi = "not_comparable_gap_over_4h:" + price_x_oi
             else:
-                price_x_oi = "comparable_target_interval:" + price_x_oi
+                price_x_oi = "comparable_4h_interval:" + price_x_oi
         deltas[enriched.symbol] = {
             "interval_hours": round(gap_hours, 3),
             "window_note": note,
@@ -361,159 +312,162 @@ def _snapshot_deltas(
     return deltas
 
 
-def _apply_1h_structure_invalidation(result: ScenarioResult) -> None:
-    """Prevent an already invalidated 1H setup from remaining a positive status."""
-    code = result.scenario.split(" — ", 1)[0].strip().upper()
+def _scenario_code(scenario: str) -> str:
+    return str(scenario or "").split(" — ", 1)[0].strip().upper()
+
+
+def _confirmation_anchor(result: ScenarioResult) -> int | None:
     technical = result.technical or {}
-    sources = {
-        "LONG A": "trend_retest_long",
-        "LONG B": "higher_low",
-        "LONG D": "higher_low",
-        "SHORT A": "trend_retest_short",
-        "SHORT B": "trend_retest_short",
-        "SHORT D": "weak_bounce_rejection",
-    }
-    source_name = sources.get(code)
-    if not source_name:
-        return
-    active_statuses = {
-        "LONG A": {"WAITING_FOR_1H_BREAKOUT_RETEST", "CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"},
-        "LONG B": {"WAITING_FOR_HISTORY_OR_HIGHER_LOW", "CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"},
-        "LONG D": {"WAITING_FOR_HIGHER_LOW", "CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"},
-        "SHORT A": {"WAITING_FOR_1H_BREAKDOWN_RETEST", "CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"},
-        "SHORT B": {"WAITING_FOR_1H_BREAKDOWN_RETEST", "CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"},
-        "SHORT D": {"WAIT_BOUNCE", "CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"},
-    }
-    if result.status not in active_statuses.get(code, set()):
-        return
-    state = technical.get(source_name)
-    if not isinstance(state, dict) or state.get("invalidated") is not True:
-        return
-    if code == "SHORT D":
-        # The liquidation-cascade context may still exist, but the rejection
-        # has failed: revert to waiting for a fresh bounce/rejection.
-        result.status = "WAIT_BOUNCE"
-        result.reason = "The prior 1H resistance rejection was invalidated by a later close above resistance; wait for a new bounce/rejection."
-    else:
-        result.status = "INVALIDATED_1H_STRUCTURE"
-        result.reason = f"The {source_name} 1H structure was invalidated by a later closed 1H candle; this setup is no longer active."
-
-def _fingerprint_number(value: Any) -> Any:
-    if isinstance(value, float):
-        return round(value, 8) if math.isfinite(value) else None
-    if isinstance(value, (str, int, bool)) or value is None:
-        return value
-    return None
+    code = _scenario_code(result.scenario)
+    fields = {
+        "LONG A": ("trend_retest_long", "retest_open_time_ms"),
+        "LONG B": ("higher_low", "latest_open_time_ms"),
+        "LONG D": ("higher_low", "latest_open_time_ms"),
+        "SHORT A": ("trend_retest_short", "retest_open_time_ms"),
+        "SHORT B": ("trend_retest_short", "retest_open_time_ms"),
+        "SHORT C": ("bearish_structure_break", "break_open_time_ms"),
+        "SHORT D": ("weak_bounce_rejection", "rejection_open_time_ms"),
+        "SHORT E": ("failed_breakout_rejection", "failure_open_time_ms"),
+    }.get(code)
+    if fields is None:
+        return None
+    value = (technical.get(fields[0]) or {}).get(fields[1])
+    return value if isinstance(value, int) and value > 0 else None
 
 
-def _scenario_event_fingerprint(result: ScenarioResult) -> str:
-    """Hash only meaningful scenario/structure state, not every market tick."""
-    technical = result.technical or {}
-    tracked = (
-        "higher_low",
-        "trend_retest_long",
-        "trend_retest_short",
-        "bearish_structure_break",
-        "weak_bounce_rejection",
-        "failed_breakout_rejection",
-    )
-    technical_state: dict[str, Any] = {}
-    for key in tracked:
-        value = technical.get(key)
-        if not isinstance(value, dict):
-            continue
-        technical_state[key] = {
-            field: _fingerprint_number(value.get(field))
-            for field in (
-                "confirmed", "invalidated", "level", "latest_low", "latest_open_time_ms",
-                "breakout_open_time_ms", "retest_open_time_ms", "resistance",
-                "candidate_resistance", "rejection_open_time_ms", "failed_level",
-                "last_close", "invalidation_open_time_ms", "invalidation_close",
-            )
-            if field in value
-        }
-    context_4h = technical.get("context_4h") or {}
-    if isinstance(context_4h, dict):
-        ema20, ema50 = context_4h.get("ema20"), context_4h.get("ema50")
-        technical_state["context_4h"] = {
-            "trend": context_4h.get("trend"),
-            "close_vs_support": (
-                "below" if isinstance(context_4h.get("last_close"), (int, float))
-                and isinstance(context_4h.get("last_confirmed_support"), (int, float))
-                and context_4h["last_close"] < context_4h["last_confirmed_support"]
-                else "above_or_unknown"
-            ),
-            "close_vs_resistance": (
-                "above" if isinstance(context_4h.get("last_close"), (int, float))
-                and isinstance(context_4h.get("last_confirmed_resistance"), (int, float))
-                and context_4h["last_close"] > context_4h["last_confirmed_resistance"]
-                else "below_or_unknown"
-            ),
-            "ema_relation": (
-                "bullish" if isinstance(ema20, (int, float)) and isinstance(ema50, (int, float)) and ema20 > ema50
-                else "bearish" if isinstance(ema20, (int, float)) and isinstance(ema50, (int, float)) and ema20 < ema50
-                else "unknown"
-            ),
-        }
-    context_15m = technical.get("context_15m") or {}
-    if isinstance(context_15m, dict):
-        # Directional change is meaningful for timing; candle timestamp is not
-        # included, avoiding one repeated alert for every new 15m candle.
-        technical_state["context_15m"] = {"direction": context_15m.get("direction")}
-    invalidation = scenario_invalidation(result.direction, result.scenario, technical)
-    payload = {
-        "status": result.status,
-        "checks": [(check.name, check.passed) for check in result.checks],
-        "technical": technical_state,
-        "invalidation": {
-            "level": _fingerprint_number(invalidation.get("level")),
-            "rule": invalidation.get("rule"),
-            "source": invalidation.get("source"),
-        },
-    }
-    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
-
-
-
-def _has_required_confirmation(result: ScenarioResult) -> bool:
-    """Fail closed: only fully evaluated scenarios with their chart/history gate may be sent."""
+def _has_required_confirmation(result: ScenarioResult, row: EnrichedRow) -> bool:
+    """Fail closed: P1 checks, a specific chart trigger and an invalidation level are mandatory."""
     if result.status not in {"CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"}:
         return False
-    if result.quality_flags or not result.complete:
+    if not result.complete or result.quality_flags:
+        return False
+    technical = result.technical or {}
+    pair = str(technical.get("binance_symbol") or "").upper()
+    if not pair.endswith("USDT") or not pair[:-4].isalnum():
+        return False
+    last = technical.get("last_closed_1h") or {}
+    close = last.get("close")
+    open_ms = last.get("open_time_ms")
+    close_ms = last.get("close_time_ms")
+    if not isinstance(close, (int, float)) or not math.isfinite(float(close)):
+        return False
+    if not isinstance(open_ms, int) or not isinstance(close_ms, int) or close_ms < open_ms:
+        return False
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if close_ms > now_ms + 5_000 or now_ms - close_ms > 75 * 60_000:
+        return False
+    if close_ms - open_ms != 60 * 60_000 - 1:
         return False
 
-    technical = result.technical or {}
-    code = str(result.scenario or "").split(" — ", 1)[0].strip().upper()
-    if code == "LONG A":
-        return (technical.get("trend_retest_long") or {}).get("confirmed") is True
-    if code == "LONG B":
-        return (
-            technical.get("spot_sequence_ok") is True
-            and (technical.get("higher_low") or {}).get("confirmed") is True
-        )
-    if code == "LONG C":
-        trigger_checks = technical.get("trigger_checks")
-        return (
-            technical.get("rising_1h") is True
-            and isinstance(trigger_checks, list)
-            and bool(trigger_checks)
-            and all(isinstance(item, dict) and item.get("passed") is True for item in trigger_checks)
-        )
-    if code == "LONG D":
-        return (technical.get("higher_low") or {}).get("confirmed") is True
-    if code in {"SHORT A", "SHORT B"}:
-        return (technical.get("trend_retest_short") or {}).get("confirmed") is True
-    if code == "SHORT C":
-        return (
-            (technical.get("bearish_structure_break") or {}).get("confirmed") is True
-            and (technical.get("trend_retest_short") or {}).get("confirmed") is True
-        )
+    code = _scenario_code(result.scenario)
+    gates = {
+        "LONG A": ("trend_retest_long", "confirmed"),
+        "LONG B": ("higher_low", "confirmed"),
+        "LONG D": ("higher_low", "confirmed"),
+        "SHORT A": ("trend_retest_short", "confirmed"),
+        "SHORT B": ("trend_retest_short", "confirmed"),
+        "SHORT C": ("bearish_structure_break", "confirmed"),
+        "SHORT D": ("weak_bounce_rejection", "confirmed"),
+        "SHORT E": ("failed_breakout_rejection", "confirmed"),
+    }
+    gate = gates.get(code)
+    if gate is None:  # LONG C has an undefined "significant short liquidation" threshold in P1.
+        return False
+    state = technical.get(gate[0]) or {}
+    if state.get(gate[1]) is not True:
+        return False
+    if _confirmation_anchor(result) is None:
+        return False
+    if code == "LONG B" and technical.get("spot_sequence_ok") is not True:
+        return False
+    if code == "SHORT C" and (technical.get("trend_retest_short") or {}).get("confirmed") is not True:
+        return False
     if code == "SHORT D":
-        return (technical.get("weak_bounce_rejection") or {}).get("confirmed") is True
-    if code == "SHORT E":
-        return (technical.get("failed_breakout_rejection") or {}).get("confirmed") is True
-    return False
+        coverage = row.liquidation_coverage_of_oi_drop_pct
+        if coverage is None or coverage < 10.0:
+            return False
+
+    invalidation = scenario_invalidation(result.direction, result.scenario, technical)
+    level = invalidation.get("level")
+    if not isinstance(level, (int, float)) or isinstance(level, bool) or not math.isfinite(float(level)) or level <= 0:
+        return False
+    breached = close < level if result.direction.upper() == "LONG" else close > level
+    if breached:
+        return False
+
+    context = technical.get("context_4h") or {}
+    close_4h = context.get("last_close")
+    close_4h_ms = context.get("last_close_time_ms")
+    if not isinstance(close_4h, (int, float)) or not isinstance(close_4h_ms, int):
+        return False
+    if close_4h_ms > now_ms + 5_000 or now_ms - close_4h_ms > 4 * 60 * 60_000 + 15 * 60_000:
+        return False
+    if result.direction.upper() == "LONG":
+        support = context.get("last_confirmed_support")
+        if not isinstance(support, (int, float)) or close_4h < support:
+            return False
+    else:
+        resistance = context.get("last_confirmed_resistance")
+        if not isinstance(resistance, (int, float)) or close_4h > resistance:
+            return False
+    return True
+
+
+def _notification_group(result: ScenarioResult) -> str:
+    # Compatible with the old v1.0.9 group key so existing notification history
+    # remains active after deploying the lifecycle change.
+    return f"{result.symbol}|{result.scenario}"
+
+
+def _notification_identity(result: ScenarioResult) -> tuple[str, str, str, float] | None:
+    technical = result.technical or {}
+    pair = str(technical.get("binance_symbol") or "").upper()
+    anchor = _confirmation_anchor(result)
+    if not pair.endswith("USDT") or anchor is None:
+        return None
+    invalidation = scenario_invalidation(result.direction, result.scenario, technical)
+    level = invalidation.get("level")
+    if not isinstance(level, (int, float)) or not math.isfinite(float(level)) or float(level) <= 0:
+        return None
+    group = _notification_group(result)
+    event_key = f"{group}|{anchor}"
+    fingerprint = hashlib.sha256(event_key.encode("utf-8")).hexdigest()[:20]
+    return group, event_key, fingerprint, float(level)
+
+
+def _event_group_parts(event_group: str) -> tuple[str, str, str]:
+    parts = str(event_group or "").split("|", 1)
+    symbol = parts[0] if parts else ""
+    scenario = parts[1] if len(parts) > 1 else ""
+    code = _scenario_code(scenario)
+    direction = "LONG" if code.startswith("LONG") else "SHORT" if code.startswith("SHORT") else ""
+    return symbol, scenario, direction
+
+
+def _event_invalidated(last_closed_1h: dict[str, Any], active: dict[str, Any]) -> tuple[bool, float | None, float | None]:
+    level = active.get("invalidation_level")
+    direction = str(active.get("direction") or "").upper()
+    close = last_closed_1h.get("close")
+    open_ms = last_closed_1h.get("open_time_ms")
+    close_ms = last_closed_1h.get("close_time_ms")
+    if not isinstance(level, (int, float)) or isinstance(level, bool) or not math.isfinite(float(level)):
+        return False, None, float(close) if isinstance(close, (int, float)) else None
+    if direction not in {"LONG", "SHORT"} or not isinstance(close, (int, float)) or not math.isfinite(float(close)) or float(close) <= 0:
+        return False, float(level), None
+    if not isinstance(open_ms, int) or not isinstance(close_ms, int) or close_ms - open_ms != 60 * 60_000 - 1:
+        return False, float(level), float(close)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if close_ms > now_ms + 5_000 or now_ms - close_ms > 75 * 60_000:
+        return False, float(level), float(close)
+    crossed = close < level if direction == "LONG" else close > level
+    return bool(crossed), float(level), float(close)
+
+
+def _send_one(
+    telegram: TelegramClient, message: str, chat_id: str,
+) -> dict[str, Any]:
+    delivery = telegram.send(message, chat_ids=[chat_id])
+    return delivery[0] if delivery else {"chat_id": chat_id, "sent": False, "error": "No delivery response"}
 
 
 def _collect_notifications(
@@ -523,113 +477,267 @@ def _collect_notifications(
     store: Store,
     contract_alerts_allowed: bool,
     dry_run: bool,
-    no_new_data: bool = False,
     *,
     fetched_at: datetime | None = None,
-    snapshot_deltas: dict[str, dict[str, Any]] | None = None,
+    contract_type: str = "PERPETUAL",
 ) -> list[dict[str, Any]]:
+    """Deliver new confirmations in a batch; cancellations/reversals as standalone messages."""
     by_symbol = {row.symbol: row for row in rows}
     telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_ids)
-    recipients = list(dict.fromkeys(str(chat_id) for chat_id in settings.telegram_chat_ids))
-    outcomes: list[dict[str, Any]] = []
-
+    recipients = list(dict.fromkeys(str(item) for item in settings.telegram_chat_ids))
     if not contract_alerts_allowed:
         log.warning("Notification delivery blocked by contract/schema guard")
         return [{"sent": False, "reason": "contract/schema guard"}]
-    if not recipients:
-        log.warning("No Telegram recipients configured; analysis remains available in dry-run logs")
+    if not recipients or dry_run or not telegram.configured:
+        reason = "dry-run" if dry_run else "telegram not configured"
+        log.info("Telegram lifecycle notifications skipped: %s", reason)
+        return []
 
-    def deliver(
-        event_key: str,
-        message: str,
-        *,
-        kind: str,
-        symbol: str | None = None,
-        event_group: str | None = None,
-        fingerprint: str | None = None,
-    ) -> None:
-        if event_group is not None and fingerprint is not None:
-            pending = []
-            for chat_id in recipients:
-                last_state = store.latest_notification_state(event_group, chat_id)
-                if last_state is None or last_state.get("fingerprint") != fingerprint:
-                    # A new structural state is delivered immediately, even if
-                    # this exact fingerprint appeared before and the cooldown
-                    # has not elapsed (e.g. A -> B -> A).
-                    pending.append(chat_id)
-                elif not no_new_data and store.notification_due(
-                    event_key, settings.telegram_cooldown_hours, chat_id
-                ):
-                    pending.append(chat_id)
-            already_sent_without_recipient_tracking = not recipients and store.notification_exists(event_key)
-            if already_sent_without_recipient_tracking:
-                return
-        elif no_new_data:
-            pending = [chat_id for chat_id in recipients if not store.notification_exists(event_key, chat_id)]
-            already_sent_without_recipient_tracking = not recipients and store.notification_exists(event_key)
-            if already_sent_without_recipient_tracking:
-                return
-        else:
-            pending = [
-                chat_id for chat_id in recipients
-                if store.notification_due(event_key, settings.telegram_cooldown_hours, chat_id)
-            ]
-
-        if recipients and not pending:
-            return
-        if not recipients or dry_run or not telegram.configured:
-            reason = "dry-run" if dry_run else "telegram not configured"
-            plain = message.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "").replace("<i>", "").replace("</i>", "")
-            log.info("[%s / %s]\n%s", kind.upper(), reason.upper(), plain)
-            outcomes.append({"type": kind, "symbol": symbol, "sent": False, "reason": reason, "text": message})
-            return
-
-        delivery = telegram.send(message, chat_ids=pending)
-        successes = [item for item in delivery if item.get("sent")]
-        # Commit each confirmed delivery separately. A failure for another chat
-        # must not cause a duplicate to a recipient who already received the alert.
-        for item in successes:
-            store.record_notification(
-                event_key,
-                item.get("message_id"),
-                chat_id=str(item.get("chat_id")),
-                event_group=event_group,
-                fingerprint=fingerprint,
-            )
-        outcomes.append({
-            "type": kind,
-            "symbol": symbol,
-            "sent": bool(delivery) and len(successes) == len(delivery),
-            "delivery": delivery,
-        })
-
-    # Telegram is deliberately confirmed-scenario-only. WAIT/PREPARATION/OBSERVATION
-    # states remain available in scan diagnostics but are never delivered.
-    eligible = {"CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"}
-
+    results_by_group = {_notification_group(item): item for item in results}
+    confirmed: dict[str, list[tuple[ScenarioResult, EnrichedRow, tuple[str, str, str, float]]]] = {}
+    confirmed_opposite: dict[str, list[tuple[ScenarioResult, EnrichedRow, tuple[str, str, str, float]]]] = {}
     for result in results:
-        if result.status not in eligible or not _has_required_confirmation(result):
-            continue
         row = by_symbol.get(result.symbol)
-        if row is None:
-            log.error("Cannot format Telegram notification: market row missing for %s", result.symbol)
+        if row is None or not _has_required_confirmation(result, row):
             continue
-        fingerprint = _scenario_event_fingerprint(result)
-        key = f"{result.symbol}|{result.scenario}|{fingerprint}"
-        message = format_alert(
-            result,
-            row,
-            result.technical,
-            fetched_at=fetched_at,
-            snapshot_delta=(snapshot_deltas or {}).get(result.symbol),
-        )
-        event_group = f"{result.symbol}|{result.scenario}"
-        deliver(
-            key, message, kind="scenario", symbol=result.symbol,
-            event_group=event_group, fingerprint=fingerprint,
-        )
-    return outcomes
+        identity = _notification_identity(result)
+        if identity is None:
+            continue
+        confirmed.setdefault(result.symbol, []).append((result, row, identity))
+        confirmed_opposite.setdefault(result.symbol, []).append((result, row, identity))
 
+    active_states = store.active_notification_states(chat_ids=recipients, contract_type=contract_type)
+    # Legacy v1.0.9 records did not have a direction or invalidation_level. Derive
+    # those from the current scenario's chart only once, then persist the upgrade.
+    normalized_active: list[dict[str, Any]] = []
+    for active in active_states:
+        group = str(active.get("event_group") or "")
+        symbol, scenario, inferred_direction = _event_group_parts(group)
+        direction = str(active.get("direction") or inferred_direction).upper()
+        level = active.get("invalidation_level")
+        row = by_symbol.get(symbol)
+        current_result = results_by_group.get(group)
+        if (not isinstance(level, (int, float)) or not math.isfinite(float(level))) and current_result is not None:
+            inferred = scenario_invalidation(current_result.direction, current_result.scenario, current_result.technical or {}).get("level")
+            if isinstance(inferred, (int, float)) and math.isfinite(float(inferred)) and inferred > 0:
+                level = float(inferred)
+                migrated_key = f"MIGRATED|{active.get('event_key')}|{level:.12g}"
+                store.record_notification(
+                    migrated_key, active.get("telegram_message_id"), chat_id=str(active.get("chat_id")),
+                    event_group=group, fingerprint=str(active.get("fingerprint") or "legacy"),
+                    event_state="ACTIVE", direction=direction, invalidation_level=level,
+                    pair=str(active.get("pair") or (current_result.technical or {}).get("binance_symbol") or ""),
+                    scenario_code=_scenario_code(scenario), contract_type=contract_type,
+                )
+                active = {**active, "event_key": migrated_key, "invalidation_level": level, "direction": direction}
+        if not active.get("direction") and direction:
+            active["direction"] = direction
+        normalized_active.append(active)
+
+    # A confirmed opposite setup is a reversal. Aggregate all previously active
+    # same-side scenarios for the pair into one standalone reversal notification.
+    reversed_groups: set[tuple[str, str]] = set()
+    outcomes: list[dict[str, Any]] = []
+    active_by_pair_chat: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for active in normalized_active:
+        group = str(active.get("event_group") or "")
+        symbol, _, _ = _event_group_parts(group)
+        chat_id = str(active.get("chat_id") or "")
+        if symbol and chat_id:
+            active_by_pair_chat.setdefault((symbol, chat_id), []).append(active)
+
+    for (symbol, chat_id), pair_actives in active_by_pair_chat.items():
+        opposite_new = []
+        for candidate in confirmed_opposite.get(symbol, []):
+            new_direction = candidate[0].direction.upper()
+            old_side_actives = [
+                active for active in pair_actives
+                if str(active.get("direction") or _event_group_parts(str(active.get("event_group") or ""))[2]).upper() != new_direction
+            ]
+            if not old_side_actives:
+                continue
+            last_closed = (candidate[0].technical or {}).get("last_closed_1h") or {}
+            # A true reversal requires both: a fully confirmed opposite setup
+            # and the old setup's own persisted 1H invalidation level to be broken.
+            # This prevents contradictory LONG/SHORT alerts while the old setup
+            # is still structurally valid.
+            if all(_event_invalidated(last_closed, active)[0] for active in old_side_actives):
+                opposite_new.append(candidate)
+        if not opposite_new:
+            continue
+        new_result, new_row, new_identity = max(opposite_new, key=lambda item: item[2][1])
+        new_group, new_event_key, new_fingerprint, new_level = new_identity
+        new_direction = new_result.direction.upper()
+        old_actives = [
+            item for item in pair_actives
+            if str(item.get("direction") or _event_group_parts(str(item.get("event_group") or ""))[2]).upper() != new_direction
+        ]
+        old_codes = sorted({_scenario_code(_event_group_parts(str(item.get("event_group") or ""))[1]) for item in old_actives})
+        old_direction = old_actives[0].get("direction") or _event_group_parts(str(old_actives[0].get("event_group") or ""))[2]
+        reversal_key = f"REVERSAL|{symbol}|{old_direction}|{new_direction}|{new_event_key}"
+        if store.notification_exists(reversal_key, chat_id):
+            for old in old_actives:
+                old_group = str(old.get("event_group") or "")
+                latest_old = store.latest_notification_state(old_group, chat_id) or old
+                if str(latest_old.get("event_state") or "ACTIVE").upper() == "ACTIVE":
+                    store.record_notification(
+                        f"{reversal_key}|RECOVER_OLD_STATE|{old_group}",
+                        latest_old.get("telegram_message_id"),
+                        chat_id=chat_id, event_group=old_group,
+                        fingerprint=str(latest_old.get("fingerprint") or "legacy"),
+                        event_state="REVERSED",
+                        direction=str(latest_old.get("direction") or _event_group_parts(old_group)[2]),
+                        invalidation_level=(float(latest_old["invalidation_level"]) if isinstance(latest_old.get("invalidation_level"), (int, float)) else None),
+                        pair=str(latest_old.get("pair") or symbol),
+                        scenario_code=_scenario_code(_event_group_parts(old_group)[1]),
+                        contract_type=contract_type,
+                        delivery_status=str(latest_old.get("delivery_status") or "SENT"),
+                    )
+                reversed_groups.add((old_group, chat_id))
+            latest_new = store.latest_notification_state(new_group, chat_id)
+            if latest_new is None or str(latest_new.get("event_state") or "").upper() != "ACTIVE":
+                store.record_notification(
+                    new_event_key, None, chat_id=chat_id,
+                    event_group=new_group, fingerprint=new_fingerprint,
+                    event_state="ACTIVE", direction=new_direction,
+                    invalidation_level=new_level, pair=str((new_result.technical or {}).get("binance_symbol") or symbol),
+                    scenario_code=_scenario_code(new_result.scenario), contract_type=contract_type,
+                    delivery_status="UNKNOWN",
+                )
+            continue
+        if len(old_codes) > 1:
+            old_scenario_label = ", ".join(old_codes)
+        else:
+            old_scenario_label = old_codes[0] if old_codes else "предыдущий сценарий"
+        pair = str((new_result.technical or {}).get("binance_symbol") or old_actives[0].get("pair") or symbol)
+        message = format_reversal_message(
+            pair, str(old_direction), old_scenario_label, new_direction, _scenario_code(new_result.scenario)
+        )
+        delivery = _send_one(telegram, message, chat_id)
+        if delivery.get("sent") or delivery.get("delivery_unknown"):
+            delivery_status = "SENT" if delivery.get("sent") else "UNKNOWN"
+            store.record_notification(
+                reversal_key, delivery.get("message_id"), chat_id=chat_id,
+                event_group=f"REVERSAL|{symbol}|{old_direction}|{new_direction}",
+                fingerprint=new_fingerprint, event_state="SENT", direction=new_direction,
+                pair=pair, scenario_code=_scenario_code(new_result.scenario), contract_type=contract_type,
+                delivery_status=delivery_status, error=str(delivery.get("error") or "") or None,
+            )
+            for old in old_actives:
+                old_group = str(old.get("event_group") or "")
+                store.record_notification(
+                    f"{reversal_key}|OLD_STATE|{old_group}", delivery.get("message_id"), chat_id=chat_id,
+                    event_group=old_group, fingerprint=str(old.get("fingerprint") or "legacy"),
+                    event_state="REVERSED", direction=str(old_direction),
+                    invalidation_level=float(old["invalidation_level"]) if isinstance(old.get("invalidation_level"), (int, float)) else None,
+                    pair=str(old.get("pair") or pair), scenario_code=_event_group_parts(old_group)[1].split(" — ", 1)[0],
+                    contract_type=contract_type, delivery_status=delivery_status,
+                )
+                reversed_groups.add((old_group, chat_id))
+            store.record_notification(
+                new_event_key, delivery.get("message_id"), chat_id=chat_id,
+                event_group=new_group, fingerprint=new_fingerprint, event_state="ACTIVE",
+                direction=new_direction, invalidation_level=new_level, pair=pair,
+                scenario_code=_scenario_code(new_result.scenario), contract_type=contract_type,
+                delivery_status=delivery_status,
+            )
+            outcomes.append({"type": "reversal", "symbol": symbol, "sent": bool(delivery.get("sent")), "delivery": delivery})
+
+    # Invalidate remaining ACTIVE scenarios by the exact 1H level saved when
+    # their original message was sent. Each cancellation is its own Telegram post.
+    for active in normalized_active:
+        group = str(active.get("event_group") or "")
+        symbol, scenario, direction = _event_group_parts(group)
+        chat_id = str(active.get("chat_id") or "")
+        if not chat_id or (group, chat_id) in reversed_groups:
+            continue
+        current_result = results_by_group.get(group)
+        if current_result is None:
+            continue
+        last = (current_result.technical or {}).get("last_closed_1h") or {}
+        close_time = last.get("close_time_ms")
+        close_time = close_time if isinstance(close_time, int) else "unknown"
+        invalidated, level, _ = _event_invalidated(last, active)
+        if not invalidated or level is None:
+            continue
+        cancel_key = f"CANCEL|{active.get('event_key')}|{close_time}"
+        if store.notification_exists(cancel_key, chat_id):
+            continue
+        pair = str(active.get("pair") or (current_result.technical or {}).get("binance_symbol") or symbol)
+        message = format_cancellation_message(pair, direction, _scenario_code(scenario), level)
+        delivery = _send_one(telegram, message, chat_id)
+        if delivery.get("sent") or delivery.get("delivery_unknown"):
+            store.record_notification(
+                cancel_key, delivery.get("message_id"), chat_id=chat_id,
+                event_group=group, fingerprint=str(active.get("fingerprint") or "legacy"),
+                event_state="CANCELLED", direction=direction, invalidation_level=level,
+                pair=pair, scenario_code=_scenario_code(scenario), contract_type=contract_type,
+                delivery_status="SENT" if delivery.get("sent") else "UNKNOWN",
+                error=str(delivery.get("error") or "") or None,
+            )
+        if delivery.get("sent"):
+            outcomes.append({"type": "cancellation", "symbol": symbol, "sent": True, "delivery": delivery})
+
+    # New confirmations are batched once per recipient. An already ACTIVE group
+    # is never repeated because its trigger timestamp/metrics changed.
+    active_groups_by_chat = {
+        (str(item.get("event_group") or ""), str(item.get("chat_id") or ""))
+        for item in store.active_notification_states(chat_ids=recipients, contract_type=contract_type)
+    }
+    normal_by_chat: dict[str, list[tuple[ScenarioResult, EnrichedRow, tuple[str, str, str, float]]]] = {chat: [] for chat in recipients}
+    for symbol, items in confirmed.items():
+        for result, row, identity in items:
+            group, event_key, fingerprint, level = identity
+            for chat_id in recipients:
+                if store.notification_exists(event_key, chat_id):
+                    continue
+                if (group, chat_id) in active_groups_by_chat or (group, chat_id) in reversed_groups:
+                    continue
+                has_opposite_active = any(
+                    _event_group_parts(active_group)[0] == symbol
+                    and _event_group_parts(active_group)[2] != result.direction.upper()
+                    and active_chat == chat_id
+                    for active_group, active_chat in active_groups_by_chat
+                )
+                if has_opposite_active:
+                    continue
+                # A reversal message already carried this new scenario for this pair.
+                reversal_group = f"REVERSAL|{symbol}|"
+                if any(g.startswith(reversal_group) and c == chat_id for g, c in active_groups_by_chat):
+                    continue
+                normal_by_chat[chat_id].append((result, row, identity))
+
+    for chat_id, items in normal_by_chat.items():
+        if not items:
+            continue
+        messages: list[str] = []
+        formatted_items: list[tuple[ScenarioResult, EnrichedRow, tuple[str, str, str, float]]] = []
+        for result, row, identity in items:
+            try:
+                messages.append(format_alert(result, row, result.technical, fetched_at=fetched_at))
+                formatted_items.append((result, row, identity))
+            except (TypeError, ValueError) as exc:
+                log.error("Cannot format confirmed signal %s %s: %s", result.symbol, result.scenario, exc)
+        if not messages:
+            continue
+        batch = "\n\n────────────\n\n".join(messages) if len(messages) > 1 else messages[0]
+        if len(messages) > 1:
+            batch = f"<b>P1 · НОВЫЕ ПОДТВЕРЖДЁННЫЕ СЦЕНАРИИ · {len(messages)}</b>\n\n" + batch
+        delivery = _send_one(telegram, batch, chat_id)
+        if delivery.get("sent") or delivery.get("delivery_unknown"):
+            for result, row, identity in formatted_items:
+                group, event_key, fingerprint, level = identity
+                store.record_notification(
+                    event_key, delivery.get("message_id"), chat_id=chat_id,
+                    event_group=group, fingerprint=fingerprint, event_state="ACTIVE",
+                    direction=result.direction, invalidation_level=level,
+                    pair=str((result.technical or {}).get("binance_symbol") or row.symbol),
+                    scenario_code=_scenario_code(result.scenario), contract_type=contract_type,
+                    delivery_status="SENT" if delivery.get("sent") else "UNKNOWN",
+                    error=str(delivery.get("error") or "") or None,
+                )
+        outcomes.append({"type": "confirmed_batch", "sent": bool(delivery.get("sent")), "symbols": [item[0].symbol for item in formatted_items], "delivery": delivery})
+    return outcomes
 
 def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[str, Any]:
     store = Store(settings.data_dir)
@@ -655,7 +763,7 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         if not unchanged and store.snapshot_due(
             scrape.fetched_at,
             interval_hours=snapshot_interval_hours,
-            contract_type=scrape.contract_type,
+            tolerance_minutes=snapshot_tolerance_minutes,
         ):
             store.add_snapshot(scrape.fetched_at, scrape.contract_type, scrape.rows)
             snapshot_saved = True
@@ -675,9 +783,7 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         if scrape.contract_type == "UNKNOWN":
             stats.warnings.append("Perpetual vs All Contracts could not be verified")
         candidate_symbols = _preliminary_candidate_symbols(
-            enriched, stats, settings, store,
-            current_snapshot_available=(unchanged or snapshot_saved),
-            contract_type=scrape.contract_type,
+            enriched, stats, settings, store, contract_type=scrape.contract_type
         )
         binance = BinanceClient(
             settings.binance_base_url,
@@ -694,40 +800,23 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         for row in enriched:
             # An identical table poll does not advance the saved observation time.
             # Keep the original timestamp so it cannot masquerade as a new snapshot.
-            history = store.recent_symbol_history(
-                row.symbol, limit=100, contract_type=scrape.contract_type
-            )
-            spot_sequence = _spot_sequence_for_current_poll(
-                store,
+            history = store.recent_symbol_history(row.symbol, limit=100)
+            spot_sequence = store.spot_sequence_status(
                 row.symbol,
-                settings,
-                current_snapshot_available=(unchanged or snapshot_saved),
-                contract_type=scrape.contract_type,
+                required=int(settings.p1.get("scenario", {}).get("spot_accumulation_required_snapshots", 3)),
+                interval_hours=float(settings.p1.get("scenario", {}).get("snapshot_interval_hours", 4.0)),
+                tolerance_minutes=int(settings.p1.get("scenario", {}).get("snapshot_interval_tolerance_minutes", 10)),
             )
             technical = {"spot_sequence_ok": spot_sequence, **technical_by_symbol.get(row.symbol, {})}
-            scenario_results = evaluate_scenarios(
-                row, stats, settings.p1, technical=technical, history=history,
-                current_snapshot_available=(unchanged or snapshot_saved),
-            )
+            scenario_results = evaluate_scenarios(row, stats, settings.p1, technical=technical, history=history)
             for scenario_result in scenario_results:
                 # Preserve both global diagnostics (order book/context) and scenario-specific predicates.
                 scenario_result.technical = {**technical, **scenario_result.technical}
-                _apply_1h_structure_invalidation(scenario_result)
             results.extend(scenario_results)
 
         allowed, guard_reason = _can_send_alerts(scrape, settings)
         if not allowed:
             log.warning("Telegram alert guard: %s", guard_reason)
-        deltas_by_symbol = _snapshot_deltas(
-            store,
-            enriched,
-            scrape.fetched_at,
-            unchanged=unchanged,
-            snapshot_saved=snapshot_saved,
-            snapshot_interval_hours=snapshot_interval_hours,
-            snapshot_interval_tolerance_minutes=snapshot_tolerance_minutes,
-            contract_type=scrape.contract_type,
-        )
         notifications = _collect_notifications(
             results,
             enriched,
@@ -735,9 +824,8 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             store,
             allowed,
             use_dry_run,
-            no_new_data=unchanged,
             fetched_at=scrape.fetched_at,
-            snapshot_deltas=deltas_by_symbol,
+            contract_type=scrape.contract_type,
         )
         visible_results = [r for r in results if r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE", "OBSERVATION_AFTER_BOUNCE"}]
         store.finish_run(run_id, len(scrape.rows), len(visible_results), "OK")
