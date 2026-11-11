@@ -39,13 +39,23 @@ def test_workflow_queues_pending_runs_and_does_not_commit_per_run_journal():
     root = Path(__file__).parents[1]
     workflow = (root / ".github/workflows/screener.yml").read_text()
     gitignore = (root / ".gitignore").read_text()
-    assert "queue: max" in workflow
+    assert "queue: single" in workflow
     assert "cancel-in-progress: false" in workflow
     assert "git add data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl" in workflow
     assert "git add data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl data/runs.jsonl" not in workflow
     assert "git rm --cached -f data/runs.jsonl" in workflow
     assert "data/runs.jsonl" in gitignore
 
+
+def test_python311_ci_workflow_runs_tests_without_market_secrets():
+    root = Path(__file__).parents[1]
+    workflow = (root / ".github/workflows/tests.yml").read_text()
+    assert 'python-version: "3.11"' in workflow
+    assert "python -m pip install -r requirements.txt -r requirements-dev.txt" in workflow
+    assert "requirements-dev.txt" in workflow
+    assert "python -m pytest -q" in workflow
+    assert "repository_dispatch" not in workflow
+    assert "TG_BOT_TOKEN" not in workflow
 
 
 def test_canonical_p1_reference_is_versioned_with_the_codebase():

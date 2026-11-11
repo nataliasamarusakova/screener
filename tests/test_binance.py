@@ -61,21 +61,22 @@ def test_binance_vpn_mode_fails_closed_without_proxy():
         raise AssertionError("Expected missing explicit proxy to fail")
 
 
-def _valid_klines(count=21, interval="1h"):
+def _valid_closed_klines(interval="1h", count=21, *, latest_age_intervals=0):
     from datetime import datetime, timezone
 
-    duration = {"15m": 15 * 60_000, "1h": 60 * 60_000, "4h": 4 * 60 * 60_000}[interval]
+    durations = {"15m": 15 * 60_000, "1h": 60 * 60_000, "4h": 4 * 60 * 60_000}
+    duration = durations[interval]
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    boundary = now_ms // duration * duration
-    first = boundary - count * duration
-    rows = []
-    for index in range(count):
-        open_time = first + index * duration
-        rows.append([
-            open_time, "100", "102", "99", "101", "10", open_time + duration - 1,
-            "1010", 25, "0", "0", "0",
-        ])
-    return rows, duration
+    current_boundary = now_ms // duration * duration
+    last_open = current_boundary - (latest_age_intervals + 1) * duration
+    first_open = last_open - (count - 1) * duration
+    return [
+        [
+            first_open + index * duration, "100", "102", "99", "101", "10",
+            first_open + index * duration + duration - 1, "1010", 25, "0", "0", "0",
+        ]
+        for index in range(count)
+    ], duration
 
 
 def test_binance_candles_reject_non_consecutive_hourly_series(monkeypatch):
@@ -83,7 +84,7 @@ def test_binance_candles_reject_non_consecutive_hourly_series(monkeypatch):
 
     client = BinanceClient("https://fapi.binance.com", min_interval_sec=0)
     monkeypatch.setattr(client, "resolve_symbol", lambda _: "BTCUSDT")
-    rows, _ = _valid_klines()
+    rows, _ = _valid_closed_klines("1h")
     rows.pop(7)
     monkeypatch.setattr(client, "_get_json", lambda *_args, **_kwargs: rows)
     try:
@@ -94,17 +95,16 @@ def test_binance_candles_reject_non_consecutive_hourly_series(monkeypatch):
         raise AssertionError("Discontinuous candles must not feed ATR/pivot calculations")
 
 
-def test_binance_candles_ignore_non_finite_or_impossible_ohlc(monkeypatch):
+def test_binance_candles_reject_malformed_ohlc_and_stale_series(monkeypatch):
+    from screener.binance import BinanceDataError
+
     client = BinanceClient("https://fapi.binance.com", min_interval_sec=0)
     monkeypatch.setattr(client, "resolve_symbol", lambda _: "BTCUSDT")
-    rows, _ = _valid_klines(count=22)
+    rows, _ = _valid_closed_klines("1h", count=22)
     bad = list(rows[5])
     bad[2] = "NaN"
     rows[5] = bad
-    # The invalid row is discarded, so the resulting gap is rejected rather than
-    # letting a structurally discontinuous candle series pass as consecutive.
     monkeypatch.setattr(client, "_get_json", lambda *_args, **_kwargs: rows)
-    from screener.binance import BinanceDataError
     try:
         client.fetch_candles("BTCUSDT", "1h")
     except BinanceDataError as exc:
@@ -112,8 +112,17 @@ def test_binance_candles_ignore_non_finite_or_impossible_ohlc(monkeypatch):
     else:
         raise AssertionError("A malformed candle must not be silently compressed out of the series")
 
+    stale_rows, _ = _valid_closed_klines("1h", latest_age_intervals=2)
+    monkeypatch.setattr(client, "_get_json", lambda *_args, **_kwargs: stale_rows)
+    try:
+        client.fetch_candles("BTCUSDT", "1h")
+    except BinanceDataError as exc:
+        assert "Stale 1h candles" in str(exc)
+    else:
+        raise AssertionError("Stale chart data must fail closed")
 
-def test_orderbook_ignores_non_finite_levels_and_rejects_non_finite_notional(monkeypatch):
+
+def test_binance_orderbook_ignores_non_finite_levels(monkeypatch):
     from screener.binance import BinanceDataError
 
     client = BinanceClient("https://fapi.binance.com", min_interval_sec=0)
@@ -123,12 +132,13 @@ def test_orderbook_ignores_non_finite_levels_and_rejects_non_finite_notional(mon
         "asks": [["101", "10"], ["102", "inf"]],
     })
     result = client.fetch_orderbook_diagnostics("BTCUSDT", limit=5, notional_usd=100)
-    assert result["best_bid"] == 99
-    assert result["best_ask"] == 101
+    assert result["best_bid"] == 99.0
+    assert result["best_ask"] == 101.0
+    assert result["estimated_only"] is True
 
     try:
         client.fetch_orderbook_diagnostics("BTCUSDT", limit=5, notional_usd=float("inf"))
-    except ValueError as exc:
-        assert "finite non-negative" in str(exc)
+    except BinanceDataError as exc:
+        assert "finite non-negative USD" in str(exc)
     else:
-        raise AssertionError("Infinite orderbook notional must be rejected")
+        raise AssertionError("Infinite execution notional must be rejected")

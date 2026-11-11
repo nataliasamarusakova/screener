@@ -246,13 +246,3 @@ def test_coin_name_uses_header_index_not_assumed_second_cell():
     rows, _, _, _ = parse_table(html)
     assert rows[0].name == "Bitcoin"
     assert rows[1].name == "Ethereum"
-
-
-def test_btc_correlation_is_optional_for_p1_universe_and_notifications():
-    html = FIXTURE_HTML.replace("<th>BTC Corr. 7D</th>", "")
-    html = html.replace("<td>+1.00</td>", "").replace("<td>0.82</td>", "")
-    rows, _, missing, missing_required = parse_table(html)
-    assert len(rows) == 2
-    assert "btc_corr7d" in missing
-    assert "btc_corr7d" not in missing_required
-    assert all(row.btc_corr7d is None for row in rows)

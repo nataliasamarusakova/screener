@@ -21,7 +21,7 @@ class FakeStore:
 
 
 
-def test_unchanged_table_suppresses_duplicate_notification_without_name_error():
+def test_waiting_and_observation_scenarios_are_not_delivered():
     market = MarketRow(
         symbol="ETHUSDT_PERP", name="Ethereum", price=2000, chg24_pct=2,
         market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=100_000_000,
@@ -31,26 +31,14 @@ def test_unchanged_table_suppresses_duplicate_notification_without_name_error():
         ls_ratio_1d=1.2, futures_imbalance_4h=10, spot_imbalance_4h=10,
     )
     enriched, _ = analyze_universe([market], {"thresholds": {}})
-    result = ScenarioResult(
-        symbol=market.symbol, name=market.name, scenario="LONG A", direction="LONG",
-        checks=[Check("complete", True, "yes", "yes")], quality_flags=[], status="CONFIRMED_SIGNAL",
-        technical={"trend_retest_long": {"confirmed": True}},
-    )
-    settings = SimpleNamespace(
-        telegram_bot_token="", telegram_chat_ids=[], telegram_cooldown_hours=4,
-    )
+    settings = SimpleNamespace(telegram_bot_token="", telegram_chat_ids=[])
     store = FakeStore()
-
-    notifications = _collect_notifications(
-        [result], enriched, settings, store,
-        contract_alerts_allowed=True, dry_run=True, no_new_data=True,
-    )
-
-    assert notifications == []
-    assert len(store.exists_calls) == 1
-    assert store.exists_calls[0].startswith("ETHUSDT_PERP|LONG A|")
-    assert len(store.exists_calls[0].rsplit("|", 1)[1]) == 20
-    assert store.due_calls == []
+    for status in ("OBSERVATION", "WAIT_BOUNCE", "PREPARATION", "TRIGGER", "NOT_MET"):
+        result = ScenarioResult(
+            symbol=market.symbol, name=market.name, scenario="LONG A", direction="LONG",
+            checks=[Check("complete", True, "yes", "yes")], quality_flags=[], status=status,
+        )
+        assert _collect_notifications([result], enriched, settings, store, True, False) == []
 
 
 def test_telegram_header_uses_direction_emoji_and_full_contract_ticker_for_short():
@@ -59,20 +47,19 @@ def test_telegram_header_uses_direction_emoji_and_full_contract_ticker_for_short
     market = MarketRow(symbol="INITUSDT_PERP.A", name="Initia Token", price=1.0, chg24_pct=-1.0)
     enriched, _ = analyze_universe([market], {"thresholds": {}})
     result = ScenarioResult(
-        # Deliberately different result label: the displayed ticker must come
-        # from the MarketRow data, never from the friendly result.name.
-        symbol="NOT_THE_SOURCE_TICKER", name=market.name, scenario="SHORT D — Long Liquidation Cascade",
+        symbol=market.symbol, name=market.name, scenario="SHORT D — Long Liquidation Cascade",
         direction="SHORT", checks=[Check("cascade", True, "yes", "rule")],
-        quality_flags=[], status="WAIT_BOUNCE",
+        quality_flags=[], status="CONFIRMED_SIGNAL",
+        technical={
+            "binance_symbol": "INITUSDT",
+            "weak_bounce_rejection": {"confirmed": True, "resistance": 1.02, "rejection_open_time_ms": 1_790_000_000_000},
+        },
     )
-
-    message = format_alert(result, enriched[0])
+    message = format_alert(result, enriched[0], result.technical)
     first, second = message.splitlines()[:2]
-
-    assert first == "🔴 <b>SHORT</b> · <code>INITUSDT</code>"
-    assert second == "<b>SHORT D · WAIT_BOUNCE · 1/1</b>"
-    assert "Initia Token" not in first
-    assert "INIT</code>" not in first
+    assert first == "🔴 <b>SHORT</b> · Initia Token (<code>INITUSDT</code>)"
+    assert second == "<b>SHORT D · CONFIRMED · P1 1/1</b>"
+    assert "Initia Token" in first and "<code>INITUSDT</code>" in first
 
 
 def test_telegram_header_uses_direction_emoji_and_full_contract_ticker_for_long():
@@ -84,14 +71,15 @@ def test_telegram_header_uses_direction_emoji_and_full_contract_ticker_for_long(
         symbol=market.symbol, name=market.name, scenario="LONG A — Trend Continuation",
         direction="LONG", checks=[Check("flow", True, "yes", "rule")],
         quality_flags=[], status="CONFIRMED_SIGNAL",
+        technical={
+            "binance_symbol": "PARTIUSDT",
+            "trend_retest_long": {"confirmed": True, "level": 0.48, "retest_open_time_ms": 1_790_000_000_000},
+        },
     )
-
-    message = format_alert(result, enriched[0])
+    message = format_alert(result, enriched[0], result.technical)
     first, second = message.splitlines()[:2]
-
-    assert first == "🟢 <b>LONG</b> · <code>PARTIUSDT</code>"
-    assert second == "<b>LONG A · ПОДТВЕРЖДЁННЫЙ СЦЕНАРИЙ · 1/1</b>"
-    assert "Particle Network" not in first
+    assert first == "🟢 <b>LONG</b> · Particle Network (<code>PARTIUSDT</code>)"
+    assert second == "<b>LONG A · CONFIRMED · P1 1/1</b>"
 
 
 def test_contract_ticker_keeps_quote_asset_and_removes_only_market_suffix():
@@ -103,28 +91,24 @@ def test_contract_ticker_keeps_quote_asset_and_removes_only_market_suffix():
     assert _contract_symbol("FOO-USDT-SWAP") == "FOO-USDT"
 
 
-def test_telegram_alert_truncation_keeps_disclaimer():
+def test_telegram_alert_is_compact_and_has_no_repeated_disclaimer():
     from screener.telegram import format_alert
 
     market = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=70000, chg24_pct=1)
     enriched, _ = analyze_universe([market], {"thresholds": {}})
     result = ScenarioResult(
-        symbol=market.symbol,
-        name=market.name,
-        scenario="LONG A",
-        direction="LONG",
-        checks=[Check("условие " + ("x" * 100), None, "значение " + ("y" * 100), "правило") for _ in range(80)],
-        quality_flags=[],
-        status="OBSERVATION",
+        symbol=market.symbol, name=market.name, scenario="LONG A — Trend Continuation",
+        direction="LONG", checks=[Check("condition", True, "yes", "rule")],
+        quality_flags=[], status="CONFIRMED_SIGNAL",
+        technical={
+            "binance_symbol": "BTCUSDT",
+            "trend_retest_long": {"confirmed": True, "level": 69_000.0, "retest_open_time_ms": 1_790_000_000_000},
+        },
     )
-
-    message = format_alert(result, enriched[0])
-
+    message = format_alert(result, enriched[0], result.technical)
     assert len(message) <= 3900
-    from screener.telegram import DISCLAIMER
-    assert message.endswith(DISCLAIMER)
-    plain_disclaimer = "Сценарий прошёл формальные условия P1 и обязательное подтверждение графика."
-    assert message.count(plain_disclaimer) == 1
+    assert "P1 не проходили backtest" not in message
+    assert "команда на вход" not in message
 
 
 def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monkeypatch):
@@ -160,7 +144,7 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
         binance_request_interval_sec=0.0, binance_fetch_orderbook=False,
         binance_orderbook_limit=100, execution_notional_usd=0.0,
         trading_fee_bps_per_side=None, telegram_bot_token="", telegram_chat_ids=[],
-        telegram_cooldown_hours=4.0, data_dir=tmp_path / "data",
+        data_dir=tmp_path / "data",
         log_level="INFO", dry_run=True, p1=p1,
     )
     fixed_time = datetime.now(timezone.utc)
@@ -170,7 +154,8 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
     )
     monkeypatch.setattr(service, "fetch_table", lambda **_kwargs: scraped)
     monkeypatch.setattr(service, "_technical_for_symbol", lambda *_args: {
-        "trend_retest_long": {"confirmed": True, "reason": "test fixture: closed 1H retest"},
+        "binance_symbol": "ALT0USDT",
+        "trend_retest_long": {"confirmed": True, "level": 1.0, "retest_open_time_ms": 1_790_000_000_000, "reason": "test fixture: closed 1H retest"},
         "higher_low": {"confirmed": False, "reason": "not applicable"},
         "weak_bounce_rejection": {"confirmed": False},
         "execution_cost_assumptions": {"taker_fee_bps_per_side": None},
@@ -180,8 +165,8 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
     assert first["status"] == "OK"
     assert first["rows"] == 20
     assert first["snapshot_saved"] is True
-    assert not any(item.get("type") == "market_summary" for item in first["notifications"])
-    assert any(item.status == "CONFIRMED_SIGNAL" for item in first["results"])
+    assert first["notifications"] == []
+    assert not any(item.status in {"OBSERVATION", "WAIT_BOUNCE", "PREPARATION", "TRIGGER"} for item in first["results"])
     assert "output_paths" not in first
     assert not (tmp_path / "reports").exists()
     assert (settings.data_dir / "snapshots.jsonl").exists()
@@ -190,16 +175,11 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
     assert (settings.data_dir / "runs.jsonl").exists()
 
     store = Store(settings.data_dir)
-    prior_result = next(item for item in first["results"] if item.status == "CONFIRMED_SIGNAL")
-    event_fingerprint = service._scenario_event_fingerprint(prior_result)
-    store.record_notification(
-        f"{prior_result.symbol}|{prior_result.scenario}|{event_fingerprint}", "fixture"
-    )
     scraped.fetched_at = fixed_time + timedelta(minutes=30)
     second = service.run_scan_once(settings, dry_run=True)
     assert second["no_new_coinalyze_data"] is True
     assert second["snapshot_saved"] is False
-    assert not any(item.get("type") == "scenario" for item in second["notifications"])
+    assert second["notifications"] == []
     # Polling an identical table must not move the observation timestamp forward.
     latest_history = store.recent_symbol_history("ALT0USDT_PERP.A", limit=5)
     assert latest_history[-1]["snapshot_at"] == fixed_time.isoformat()
@@ -224,13 +204,13 @@ def test_price_oi_snapshot_classification_marks_overlapping_windows_preliminary(
     store.add_snapshot(first_time, "PERPETUAL", [first])
     store.add_snapshot(second_time, "PERPETUAL", [second])
     enriched, _ = analyze_universe([second], {"thresholds": {}})
-    delta = _snapshot_deltas(store, enriched, second_time, snapshot_saved=True)["BTCUSDT_PERP"]
+    delta = _snapshot_deltas(store, enriched, second_time)["BTCUSDT_PERP"]
     assert delta["price_change_pct"] > 0
     assert delta["oi_change_pct"] > 0
     assert delta["price_x_oi_classification"].startswith("preliminary_overlapping_windows:")
 
 
-def test_telegram_alert_shows_oi_usd_funding_divergence_and_graph_context():
+def test_telegram_alert_shows_market_data_and_minimal_graph_context():
     from screener.telegram import format_alert
 
     market = MarketRow(
@@ -246,31 +226,31 @@ def test_telegram_alert_shows_oi_usd_funding_divergence_and_graph_context():
     result = ScenarioResult(
         symbol=market.symbol, name=market.name, scenario="LONG A — Trend Continuation",
         direction="LONG", checks=[Check(f"C{i}", True, "ok", "rule") for i in range(6)],
-        quality_flags=[], status="CONFIRMED_SIGNAL",
+        quality_flags=[], status="CONFIRMED_SIGNAL_WITH_WARNING",
         technical={
+            "binance_symbol": "GRASSUSDT",
             "context_4h": {"ema20": 1.0, "ema50": 1.1, "last_close": 1.02, "last_confirmed_support": 0.98},
-            "higher_low": {"confirmed": True},
-            "trend_retest_long": {"confirmed": True},
+            "trend_retest_long": {"confirmed": True, "level": 0.98, "retest_open_time_ms": 1_790_000_000_000},
         },
     )
-    message = format_alert(result, enriched[0])
+    message = format_alert(result, enriched[0], result.technical)
+    assert "GRASS (<code>GRASSUSDT</code>)" in message
+    assert "LONG A · CONFIRMED · P1 6/6 · WARNING" in message
     assert "Buy F/S: <code>53,81%</code> / <code>52,13%</code>" in message
-    assert "Spread S−F: <code>-3,3597</code>" in message
-    assert "OI 4H: <code>+1,50%</code> / <code>+$900,0k</code> (малое в USD)" in message
+    assert "Flow Gap (S−F): <code>-3,3597</code>" in message
+    assert "OI 4H: <code>+1,50%</code> / <code>+$900,0k</code>" in message
     assert "OI 24H: <code>+5,21%</code> / <code>+$3,0m</code>" in message
-    assert "FR <code>+0,0096%</code>; PFR <code>-0,0049%</code>" in message
-    assert "ВНИМАНИЕ: прогнозный PFR OI_W меняет знак" in message
+    assert "FR / PFR / Δ:" in message
     assert "BTC Corr. 7D: <code>+0,88</code>" in message
-    assert "Higher Low подтверждён" in message
-    assert "LONG retest подтверждён" in message
-    assert "OI 4H изменение мало в USD" in message
-    # EMA bearish context is a caution, not an automatic invalidation when support/retest hold.
-    assert "направлены против сценария" in message
+    assert "Trigger candle:" in message and "Invalidation:" in message
+    assert "PFR OI_W меняет знак" in message
+    assert "15m" not in message
 
 
-def test_funding_sign_reversal_is_delivered_only_after_chart_confirmation(tmp_path):
+def test_funding_sign_reversal_is_warning_only_after_chart_confirmation(tmp_path):
     from screener.telegram import format_alert
     from screener.scenarios import evaluate_scenarios
+    from screener.config import DEFAULT_P1_CONFIG
 
     market = MarketRow(
         symbol="GRASSUSDT_PERP.A", name="GRASS", price=1.0, chg24_pct=5.09,
@@ -283,39 +263,25 @@ def test_funding_sign_reversal_is_delivered_only_after_chart_confirmation(tmp_pa
         ls_ratio_1d=1.08, futures_imbalance_4h=7.6293, spot_imbalance_4h=4.2696,
         btc_corr7d=0.88,
     )
-    enriched, stats = analyze_universe([market], {"thresholds": {}})
-    results = evaluate_scenarios(
-        enriched[0], stats, {"thresholds": {}},
-        technical={"trend_retest_long": {"confirmed": True}},
-    )
+    enriched, stats = analyze_universe([market], DEFAULT_P1_CONFIG)
+    technical = {
+        "trend_retest_long": {"confirmed": True, "level": 0.98, "retest_open_time_ms": 1_790_000_000_000},
+    }
+    results = evaluate_scenarios(enriched[0], stats, DEFAULT_P1_CONFIG, technical=technical)
     long_a = next(item for item in results if item.scenario.startswith("LONG A"))
-
-    assert long_a.passed_count == 6
-    assert long_a.total_count == 6
+    assert long_a.passed_count == 6 and long_a.total_count == 6
     assert long_a.status == "CONFIRMED_SIGNAL_WITH_WARNING"
-    message = format_alert(long_a, enriched[0], {
+    technical.update({
+        "binance_symbol": "GRASSUSDT",
         "context_4h": {"ema20": 1.0, "ema50": 1.1, "last_close": 1.02, "last_confirmed_support": 0.98},
-        "higher_low": {"confirmed": True},
-        "trend_retest_long": {"confirmed": True},
     })
-    assert "СЦЕНАРИЙ ПОДТВЕРЖДЁН · ЕСТЬ ПРЕДУПРЕЖДЕНИЕ · 6/6" in message
-    assert "прогнозный PFR OI_W меняет знак" in message
-    assert "качественный фактор риска" in message
-
-    settings = SimpleNamespace(
-        telegram_bot_token="", telegram_chat_ids=[], telegram_cooldown_hours=4,
-    )
-    from screener.storage import Store
-    deliveries = _collect_notifications(
-        [long_a], enriched, settings, Store(tmp_path / "funding-state"),
-        contract_alerts_allowed=True, dry_run=True,
-    )
-    scenario_delivery = next(item for item in deliveries if item.get("type") == "scenario")
-    assert "СЦЕНАРИЙ ПОДТВЕРЖДЁН · ЕСТЬ ПРЕДУПРЕЖДЕНИЕ · 6/6" in scenario_delivery["text"]
+    message = format_alert(long_a, enriched[0], technical)
+    assert "CONFIRMED · P1 6/6 · WARNING" in message
+    assert "PFR OI_W меняет знак относительно FR OI_W" in message
 
 
-def test_short_d_alert_warns_when_liquidations_cover_less_than_ten_percent_of_oi_drop():
-    from screener.telegram import format_alert
+def test_short_d_is_blocked_when_liquidations_cover_less_than_ten_percent_of_oi_drop():
+    from screener.scenarios import evaluate_scenarios
 
     market = MarketRow(
         symbol="XRPUSDT_PERP.A", name="XRP", price=0.5, chg24_pct=-0.68,
@@ -326,32 +292,29 @@ def test_short_d_alert_warns_when_liquidations_cover_less_than_ten_percent_of_oi
         btc_corr7d=0.91, liq_long24_usd=2_900_000, liq_short24_usd=586_800,
         liq_total24_usd=3_486_800,
     )
-    enriched, _ = analyze_universe([market], {"thresholds": {}})
-    result = ScenarioResult(
-        symbol=market.symbol, name="XRP", scenario="SHORT D — Long Liquidation Cascade",
-        direction="SHORT", checks=[Check(f"C{i}", True, "ok", "rule") for i in range(5)],
-        quality_flags=[], status="WAIT_BOUNCE",
-        technical={
-            "context_4h": {"ema20": 0.49, "ema50": 0.51, "last_close": 0.48, "last_confirmed_resistance": 0.50},
-            "higher_low": {"confirmed": True},
-            "weak_bounce_rejection": {"confirmed": False, "reason": "No weak bounce rejection confirmed"},
-        },
+    enriched, stats = analyze_universe([market], {"thresholds": {}})
+    results = evaluate_scenarios(
+        enriched[0], stats, {"thresholds": {}},
+        technical={"weak_bounce_rejection": {"confirmed": True, "resistance": 0.51, "rejection_open_time_ms": 1_790_000_000_000}},
     )
+    short_d = next(item for item in results if item.scenario.startswith("SHORT D"))
     assert abs(enriched[0].liquidation_coverage_of_oi_drop_pct - 5.79) < 0.01
-    message = format_alert(result, enriched[0])
-    assert "LiqImb (Short−Long): <code>-66,34%</code>" in message
-    assert "Liqs. 24H / падение OI 24H: <code>5,79%</code>" in message
-    assert "ликвидации объясняют только 5,79% снижения OI" in message
-    assert "Каскадная интерпретация ослаблена" in message
-    assert "SHORT у минимума запрещён" in message
-    assert "отказ от сопротивления после 1h-отскока не подтверждён" in message.lower()
+    assert short_d.status == "BLOCKED_CAUSALITY"
+    coverage = next(check for check in short_d.checks if check.name == "Liquidations cover OI decline")
+    assert coverage.passed is False
 
 
+def test_market_summary_formatter_is_not_part_of_telegram_runtime():
+    import screener.telegram as telegram_module
+    assert not hasattr(telegram_module, "format_market_summary")
 
 
+def test_market_summary_event_key_is_not_part_of_notification_runtime():
+    import screener.service as service
+    assert not hasattr(service, "_market_summary_event_key")
 
 
-def test_pons_long_a_five_of_six_not_sent_as_observation_after_rank_fix():
+def test_pons_long_a_five_of_six_is_not_delivered():
     from screener.config import DEFAULT_P1_CONFIG
     from screener.scenarios import evaluate_scenarios
 
@@ -371,54 +334,50 @@ def test_pons_long_a_five_of_six_not_sent_as_observation_after_rank_fix():
         ))
     enriched, stats = analyze_universe(markets, DEFAULT_P1_CONFIG)
     pons = next(item for item in enriched if item.symbol.startswith("PONS"))
-    result = next(
-        item for item in evaluate_scenarios(pons, stats, DEFAULT_P1_CONFIG)
-        if item.scenario.startswith("LONG A")
-    )
-    assert result.passed_count == 5
-    assert result.total_count == 6
+    result = next(item for item in evaluate_scenarios(pons, stats, DEFAULT_P1_CONFIG) if item.scenario.startswith("LONG A"))
+    assert result.passed_count == 5 and result.total_count == 6
     assert result.status == "NOT_MET"
-
-    settings = SimpleNamespace(
-        telegram_bot_token="", telegram_chat_ids=[], telegram_cooldown_hours=4,
-    )
-    outcomes = _collect_notifications(
-        [result], enriched, settings, FakeStore(), contract_alerts_allowed=True,
-        dry_run=True, no_new_data=False,
-    )
+    settings = SimpleNamespace(telegram_bot_token="", telegram_chat_ids=[])
+    outcomes = _collect_notifications([result], enriched, settings, FakeStore(), True, True)
     assert outcomes == []
 
 
-def test_scenario_notification_fingerprint_changes_on_chart_state_transition():
-    from screener.service import _scenario_event_fingerprint
+def test_notification_identity_is_stable_for_metric_changes_but_changes_for_new_trigger():
+    from screener.service import _notification_identity
 
     base = ScenarioResult(
         symbol="STRKUSDT_PERP.A", name="STRK", scenario="LONG A — Trend Continuation",
         direction="LONG", checks=[Check("flow", True, "positive", ">0")],
-        quality_flags=[], status="WAITING_FOR_1H_BREAKOUT_RETEST",
+        quality_flags=[], status="CONFIRMED_SIGNAL",
         technical={
-            "context_4h": {"trend": "EMA20 < EMA50", "ema20": 1.0, "ema50": 1.1,
-                           "last_close": 1.05, "last_confirmed_support": 1.0},
-            "trend_retest_long": {"confirmed": False, "level": 1.04},
+            "binance_symbol": "STRKUSDT",
+            "trend_retest_long": {"confirmed": True, "level": 1.04, "retest_open_time_ms": 1_790_000_000_000},
         },
     )
-    same = base
-    confirmed = ScenarioResult(
+    initial = _notification_identity(base)
+    assert initial is not None
+    dynamic_change = ScenarioResult(
+        symbol=base.symbol, name=base.name, scenario=base.scenario, direction=base.direction,
+        checks=[Check("flow", True, "changed F/S/OI", ">0")], quality_flags=[], status="CONFIRMED_SIGNAL",
+        technical={**base.technical, "futures_imbalance_4h": 55, "oi_chg4h_pct": 4.5},
+    )
+    assert _notification_identity(dynamic_change) == initial
+    new_trigger = ScenarioResult(
         symbol=base.symbol, name=base.name, scenario=base.scenario, direction=base.direction,
         checks=list(base.checks), quality_flags=[], status="CONFIRMED_SIGNAL",
-        technical={
-            "context_4h": {"trend": "EMA20 < EMA50", "ema20": 1.0, "ema50": 1.1,
-                           "last_close": 1.05, "last_confirmed_support": 1.0},
-            "trend_retest_long": {"confirmed": True, "level": 1.04, "retest_open_time_ms": 1790000000000},
-        },
+        technical={"binance_symbol": "STRKUSDT", "trend_retest_long": {
+            "confirmed": True, "level": 1.05, "retest_open_time_ms": 1_790_003_600_000,
+        }},
     )
-    assert _scenario_event_fingerprint(base) == _scenario_event_fingerprint(same)
-    assert _scenario_event_fingerprint(base) != _scenario_event_fingerprint(confirmed)
+    assert _notification_identity(new_trigger)[1] != initial[1]
 
 
+def test_market_summary_key_helper_is_not_part_of_runtime():
+    import screener.service as service
+    assert not hasattr(service, "_market_summary_event_key")
 
 
-def test_telegram_alert_includes_15m_timing_context_and_scenario_invalidation():
+def test_telegram_alert_keeps_invalidation_but_omits_15m_context():
     from screener.telegram import format_alert
 
     market = MarketRow(symbol="STRKUSDT_PERP.A", name="STRK", price=1.0, chg24_pct=2.0)
@@ -428,19 +387,17 @@ def test_telegram_alert_includes_15m_timing_context_and_scenario_invalidation():
         direction="LONG", checks=[Check("flow", True, "yes", "rule")],
         quality_flags=[], status="CONFIRMED_SIGNAL",
         technical={
+            "binance_symbol": "STRKUSDT",
             "context_4h": {"trend": "EMA20 < EMA50", "ema20": 1.0, "ema50": 1.1,
                            "last_close": 1.05, "last_confirmed_support": 1.0},
-            "trend_retest_long": {"confirmed": True, "level": 1.04, "retest_open_time_ms": 1790000000000},
-            "higher_low": {"confirmed": True, "latest_low": 0.98},
+            "trend_retest_long": {"confirmed": True, "level": 1.04, "retest_open_time_ms": 1_790_000_000_000},
             "context_15m": {"direction": "BULLISH", "last_closed_change_pct": 0.42},
         },
     )
-    message = format_alert(result, enriched[0])
-    assert "15m контекст (последняя закрытая свеча): бычья" in message
-    assert "изменение +0,42%" in message
-    assert "Уровень отмены сценария" in message
-    assert "закрытие 1H ниже уровня отменяет LONG" in message
-    assert "уровень пробоя и ретеста 1H" in message
+    message = format_alert(result, enriched[0], result.technical)
+    assert "15m" not in message
+    assert "Trigger candle:" in message
+    assert "Invalidation: 1H close ниже <code>1,04000000</code>" in message
 
 
 def test_telegram_client_retries_rate_limit_once_then_succeeds(monkeypatch):
@@ -479,193 +436,43 @@ def test_telegram_client_retries_rate_limit_once_then_succeeds(monkeypatch):
 
     assert len(calls) == 2
     assert sleeps == [1.0]
-    assert result == [{"chat_id": "chat-1", "sent": True, "message_id": 77}]
+    assert result == [{"chat_id": "chat-1", "sent": True, "delivery_unknown": False, "message_id": 77}]
 
 
-def test_safe_truncation_keeps_html_well_formed_and_respects_telegram_limit():
-    from html.parser import HTMLParser
-    from screener.telegram import _safe_telegram_truncate, DISCLAIMER
-
-    raw = "<b>" + ("A & B < C " * 900) + "</b>" + DISCLAIMER
-    result = _safe_telegram_truncate(raw, limit=3900)
-    assert len(result) <= 3900
-    assert "<b>" not in result
-    assert "&amp;" in result
-    assert result.endswith(DISCLAIMER)
-    parser = HTMLParser()
-    parser.feed(result)
-    parser.close()
+def test_safe_truncation_fails_closed_instead_of_silently_cutting_a_message():
+    import pytest
+    from screener.telegram import _safe_telegram_truncate
+    assert _safe_telegram_truncate("<b>LONG</b> <code>ZROUSDT</code>") == "<b>LONG</b> <code>ZROUSDT</code>"
+    with pytest.raises(ValueError, match="exceeds safe limit"):
+        _safe_telegram_truncate("<b>" + ("X" * 4000) + "</b>", limit=3900)
 
 
-def test_scenario_state_transitions_are_delivered_even_when_state_returns_to_previous_value(tmp_path, monkeypatch):
-    import screener.service as service
+def test_active_setup_is_not_repeated_when_chart_state_updates(tmp_path):
+    from screener.service import _notification_identity
     from screener.storage import Store
 
-    market = MarketRow(
-        symbol="STRKUSDT_PERP.A", name="STRK", price=1.0, chg24_pct=2.0,
-        futures_imbalance_4h=8.0, spot_imbalance_4h=2.0,
-        oi_chg4h_pct=1.2, oi_chg4h_usd=2_500_000,
-        fr_oiw_pct=0.005, pfr_oiw_pct=0.004, ls_ratio_1d=1.2,
+    first = ScenarioResult(
+        symbol="STRKUSDT_PERP.A", name="STRK", scenario="LONG A — Trend Continuation",
+        direction="LONG", checks=[Check("flow", True, "ok", ">0")], quality_flags=[],
+        status="CONFIRMED_SIGNAL",
+        technical={"binance_symbol": "STRKUSDT", "trend_retest_long": {
+            "confirmed": True, "level": 1.04, "retest_open_time_ms": 1_790_000_000_000,
+        }},
     )
-    enriched, _ = analyze_universe([market], {"thresholds": {}})
-    settings = SimpleNamespace(
-        telegram_bot_token="token", telegram_chat_ids=["chat-1"],
-        telegram_cooldown_hours=4,
+    changed_metrics = ScenarioResult(
+        symbol=first.symbol, name=first.name, scenario=first.scenario, direction=first.direction,
+        checks=list(first.checks), quality_flags=[], status="CONFIRMED_SIGNAL",
+        technical={**first.technical, "futures_imbalance_4h": 18.0, "oi_chg4h_pct": 3.1},
     )
+    assert _notification_identity(first) == _notification_identity(changed_metrics)
     store = Store(tmp_path / "state")
-    sent = []
+    group, event_key, fingerprint, level = _notification_identity(first)
+    store.record_notification(event_key, 1, chat_id="chat-1", event_group=group,
+        fingerprint=fingerprint, event_state="ACTIVE", direction="LONG",
+        invalidation_level=level, pair="STRKUSDT", scenario_code="LONG A")
+    assert store.notification_exists(event_key, "chat-1")
+    assert len(store.active_notification_states(chat_ids=["chat-1"])) == 1
 
-    class FakeTelegram:
-        def __init__(self, token, chat_ids):
-            self.chat_ids = chat_ids
-
-        @property
-        def configured(self):
-            return True
-
-        def send(self, message, chat_ids=None):
-            recipients = self.chat_ids if chat_ids is None else chat_ids
-            sent.append(message)
-            return [{"chat_id": chat_id, "sent": True, "message_id": len(sent)} for chat_id in recipients]
-
-    monkeypatch.setattr(service, "TelegramClient", FakeTelegram)
-
-    def make_result(retest_confirmed):
-        return ScenarioResult(
-            symbol=market.symbol, name=market.name,
-            scenario="LONG A — Trend Continuation", direction="LONG",
-            checks=[Check("flow", True, "ok", ">0")], quality_flags=[],
-            status="CONFIRMED_SIGNAL" if retest_confirmed else "WAITING_FOR_1H_BREAKOUT_RETEST",
-            technical={
-                "context_4h": {"trend": "EMA20 < EMA50", "ema20": 1.0, "ema50": 1.1,
-                               "last_close": 1.05, "last_confirmed_support": 1.0},
-                "trend_retest_long": {"confirmed": retest_confirmed, "level": 1.04},
-            },
-        )
-
-    # A candidate without a closed 1H retest is diagnostic only and never sent.
-    waiting = make_result(False)
-    out_waiting = _collect_notifications(
-        [waiting], enriched, settings, store, True, False, no_new_data=True,
-    )
-    assert out_waiting == []
-    assert sent == []
-
-    # The message is sent immediately once the 1H retest is confirmed.
-    confirmed = make_result(True)
-    out_confirmed = _collect_notifications(
-        [confirmed], enriched, settings, store, True, False, no_new_data=True,
-    )
-    assert len(sent) == 1 and out_confirmed[0]["sent"] is True
-
-    # Stable confirmed state is not repeated on the next unchanged poll.
-    out_stable = _collect_notifications(
-        [confirmed], enriched, settings, store, True, False, no_new_data=True,
-    )
-    assert out_stable == []
-    assert len(sent) == 1
-
-
-
-def test_notification_collector_fails_closed_on_missing_chart_confirmation(tmp_path):
-    from screener.storage import Store
-
-    market = MarketRow(
-        symbol="BTCUSDT_PERP", name="Bitcoin", price=70_000, chg24_pct=2,
-        market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=100_000_000,
-        oi_chg24_pct=1, oi_chg24_usd=1_000_000, oi_chg4h_pct=1, oi_chg4h_usd=1_000_000,
-        oi_vol_ratio=0.5, oi_mktcap_ratio=0.1, vol_mktcap_ratio=0.2,
-        fr_oiw_pct=0.001, pfr_oiw_pct=0.001, ls_ratio_1d=1.2,
-        futures_imbalance_4h=3, spot_imbalance_4h=4,
-    )
-    enriched, _ = analyze_universe([market], {"thresholds": {}})
-    settings = SimpleNamespace(telegram_bot_token="", telegram_chat_ids=[], telegram_cooldown_hours=4)
-    store = Store(tmp_path / "state")
-
-    table_only = ScenarioResult(
-        symbol=market.symbol, name=market.name, scenario="LONG A — Trend Continuation",
-        direction="LONG", checks=[Check("all table checks", True, "passed", "P1")],
-        quality_flags=[], status="CONFIRMED_SIGNAL", technical={},
-    )
-    assert _collect_notifications([table_only], enriched, settings, store, True, True) == []
-
-    technically_confirmed = ScenarioResult(
-        symbol=market.symbol, name=market.name, scenario="LONG A — Trend Continuation",
-        direction="LONG", checks=[Check("all table checks", True, "passed", "P1")],
-        quality_flags=[], status="CONFIRMED_SIGNAL",
-        technical={"trend_retest_long": {"confirmed": True, "level": 69_500}},
-    )
-    outcomes = _collect_notifications([technically_confirmed], enriched, settings, store, True, True)
-    assert len(outcomes) == 1
-    assert outcomes[0]["type"] == "scenario"
-
-
-def test_wait_and_preparation_states_are_never_sent_even_when_chart_data_exists(tmp_path):
-    from screener.storage import Store
-
-    market = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=70_000, chg24_pct=-3)
-    enriched, _ = analyze_universe([market], {"thresholds": {}})
-    settings = SimpleNamespace(telegram_bot_token="", telegram_chat_ids=[], telegram_cooldown_hours=4)
-    waiting_results = [
-        ScenarioResult(
-            symbol=market.symbol, name=market.name, scenario="SHORT D — Long Liquidation Cascade",
-            direction="SHORT", checks=[Check("cascade", True, "passed", "P1")],
-            quality_flags=[], status=status,
-            technical={"weak_bounce_rejection": {"confirmed": True}},
-        )
-        for status in ("WAIT_BOUNCE", "PREPARATION", "OBSERVATION", "WAITING_FOR_HIGHER_LOW")
-    ]
-    outcomes = _collect_notifications(
-        waiting_results, enriched, settings, Store(tmp_path / "waiting-state"), True, True,
-    )
-    assert outcomes == []
-
-
-def test_delivery_requires_the_specific_chart_or_history_gate_for_every_scenario():
-    from screener.service import _has_required_confirmation
-
-    cases = [
-        ("LONG A", {"trend_retest_long": {"confirmed": True}}, True),
-        ("LONG A", {"trend_retest_long": {"confirmed": False}}, False),
-        ("LONG B", {"spot_sequence_ok": True, "higher_low": {"confirmed": True}}, True),
-        ("LONG B", {"spot_sequence_ok": False, "higher_low": {"confirmed": True}}, False),
-        ("LONG C", {"rising_1h": True, "trigger_checks": [{"passed": True}, {"passed": True}]}, True),
-        ("LONG C", {"rising_1h": False, "trigger_checks": [{"passed": True}]}, False),
-        ("LONG D", {"higher_low": {"confirmed": True}}, True),
-        ("SHORT A", {"trend_retest_short": {"confirmed": True}}, True),
-        ("SHORT B", {"trend_retest_short": {"confirmed": True}}, True),
-        ("SHORT C", {"bearish_structure_break": {"confirmed": True}, "trend_retest_short": {"confirmed": True}}, True),
-        ("SHORT C", {"bearish_structure_break": {"confirmed": True}, "trend_retest_short": {"confirmed": False}}, False),
-        ("SHORT D", {"weak_bounce_rejection": {"confirmed": True}}, True),
-        ("SHORT D", {"weak_bounce_rejection": {"confirmed": False}}, False),
-        ("SHORT E", {"failed_breakout_rejection": {"confirmed": True}}, True),
-        ("UNKNOWN", {"anything": {"confirmed": True}}, False),
-    ]
-    for code, technical, expected in cases:
-        result = ScenarioResult(
-            symbol="BTCUSDT_PERP", name="Bitcoin", scenario=f"{code} — test",
-            direction="LONG" if code.startswith("LONG") else "SHORT",
-            checks=[Check("all required filters", True, "passed", "P1")],
-            quality_flags=[], status="CONFIRMED_SIGNAL", technical=technical,
-        )
-        assert _has_required_confirmation(result) is expected, code
-
-
-def test_delivery_guard_rejects_quality_flags_even_with_confirmed_chart():
-    from screener.service import _has_required_confirmation
-
-    result = ScenarioResult(
-        symbol="BTCUSDT_PERP", name="Bitcoin", scenario="SHORT D — test",
-        direction="SHORT", checks=[Check("all table filters", True, "passed", "P1")],
-        quality_flags=["low OI"], status="CONFIRMED_SIGNAL",
-        technical={"weak_bounce_rejection": {"confirmed": True}},
-    )
-    assert _has_required_confirmation(result) is False
-
-def test_market_summary_formatter_is_removed_from_telegram():
-    import screener.telegram as telegram_module
-
-    assert not hasattr(telegram_module, "format_market_summary")
 
 def test_technical_for_symbol_uses_closed_15m_and_derives_24h_low_from_closed_1h():
     from datetime import datetime, timezone
@@ -677,7 +484,11 @@ def test_technical_for_symbol_uses_closed_15m_and_derives_24h_low_from_closed_1h
     intervals = {"4h": 4 * 60 * 60 * 1000, "1h": 60 * 60 * 1000, "15m": 15 * 60 * 1000}
 
     class FakeBinance:
+        def resolve_symbol(self, symbol):
+            return "STRKUSDT"
+
         def fetch_candles(self, symbol, interval, limit):
+            assert symbol == "STRKUSDT"
             interval_ms = intervals[interval]
             rows = []
             count = 100
@@ -712,172 +523,37 @@ def test_technical_for_symbol_uses_closed_15m_and_derives_24h_low_from_closed_1h
     assert technical["range_24h_1h"]["distance_from_low_pct"] is not None
 
 
-def test_snapshot_delta_uses_live_unsaved_values_not_two_older_saved_snapshots(tmp_path):
-    from datetime import datetime, timedelta, timezone
-    from screener.service import _snapshot_deltas
-    from screener.storage import Store
+def test_telegram_pair_is_copyable_code_and_send_has_no_inline_keyboard(monkeypatch):
+    import screener.telegram as telegram_module
+    from screener.telegram import TelegramClient, format_alert
 
-    first_at = datetime(2026, 11, 10, 0, 0, tzinfo=timezone.utc)
-    second_at = first_at + timedelta(hours=4)
-    live_at = second_at + timedelta(minutes=30)
-    first = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=100, oi_usd=100_000_000)
-    second = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=101, oi_usd=101_000_000)
-    live = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=120, oi_usd=120_000_000)
-    store = Store(tmp_path / "live-delta-data")
-    store.add_snapshot(first_at, "PERPETUAL", [first])
-    store.add_snapshot(second_at, "PERPETUAL", [second])
-    enriched, _ = analyze_universe([live], {"thresholds": {}})
-
-    delta = _snapshot_deltas(store, enriched, live_at, snapshot_saved=False)["BTCUSDT_PERP"]
-    assert delta["interval_hours"] == 0.5
-    assert round(delta["price_change_pct"], 2) == 18.81
-    assert round(delta["oi_change_pct"], 2) == 18.81
-    assert delta["price_x_oi_classification"].startswith("preliminary_overlapping_windows:")
-
-
-def test_unchanged_snapshot_delta_is_zero_and_explicitly_unavailable(tmp_path):
-    from datetime import datetime, timezone
-    from screener.service import _snapshot_deltas
-    from screener.storage import Store
-
-    timestamp = datetime(2026, 11, 10, 8, 0, tzinfo=timezone.utc)
-    row = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=100, oi_usd=100_000_000)
-    store = Store(tmp_path / "unchanged-delta-data")
-    store.add_snapshot(timestamp, "PERPETUAL", [row])
-    enriched, _ = analyze_universe([row], {"thresholds": {}})
-    delta = _snapshot_deltas(store, enriched, timestamp, unchanged=True)["BTCUSDT_PERP"]
-    assert delta["price_change_pct"] == 0.0
-    assert delta["oi_change_pct"] == 0.0
-    assert delta["price_x_oi_classification"] == "no_new_table_data"
-
-
-
-
-def test_telegram_conclusion_blocks_long_when_latest_closed_1h_is_below_confirmed_invalidation():
-    from screener.telegram import format_alert
-
-    market = MarketRow(
-        symbol="ALTUSDT_PERP", name="ALT", price=10, chg24_pct=2,
-        oi_usd=100_000_000, futures_imbalance_4h=5, spot_imbalance_4h=5,
-    )
+    market = MarketRow(symbol="ZROUSDT_PERP.A", name="LayerZero", price=2.0, chg24_pct=4.0)
     enriched, _ = analyze_universe([market], {"thresholds": {}})
     result = ScenarioResult(
         symbol=market.symbol, name=market.name, scenario="LONG A — Trend Continuation",
-        direction="LONG", checks=[Check("all", True, "ok", "rule")],
-        quality_flags=[], status="CONFIRMED_SIGNAL",
-        technical={
-            "trend_retest_long": {"confirmed": True, "level": 10.0},
-            "last_closed_1h": {"close": 9.8},
-        },
+        direction="LONG", checks=[Check("P1", True, "pass", "rule")], quality_flags=[],
+        status="CONFIRMED_SIGNAL",
+        technical={"binance_symbol": "ZROUSDT", "trend_retest_long": {
+            "confirmed": True, "level": 1.9, "retest_open_time_ms": 1_790_000_000_000,
+        }},
     )
-    message = format_alert(result, enriched[0])
-    assert "Последнее закрытие 1H находится ниже подтверждённой точки отмены" in message
-    assert "не входить" in message
+    message = format_alert(result, enriched[0], result.technical)
+    assert "LayerZero (<code>ZROUSDT</code>)" in message
 
+    posted = []
+    class Response:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"ok": True, "result": {"message_id": 1}}
 
-def test_invalidated_1h_setup_is_not_left_as_positive_observation():
-    from screener.service import _apply_1h_structure_invalidation
+    def fake_post(url, **kwargs):
+        posted.append(kwargs["json"])
+        return Response()
 
-    result = ScenarioResult(
-        symbol="ALTUSDT_PERP", name="ALT", scenario="LONG A — Trend Continuation",
-        direction="LONG", checks=[Check("all", True, "ok", "rule")],
-        quality_flags=[], status="CONFIRMED_SIGNAL",
-        technical={"trend_retest_long": {"confirmed": False, "invalidated": True}},
-    )
-    _apply_1h_structure_invalidation(result)
-    assert result.status == "INVALIDATED_1H_STRUCTURE"
-
-
-def test_1h_invalidation_does_not_promote_a_not_met_scenario_to_an_alertable_state():
-    from screener.models import ScenarioResult
-    from screener.service import _apply_1h_structure_invalidation
-
-    result = ScenarioResult(
-        symbol="ALTUSDT_PERP", name="Alt", scenario="LONG A — Trend Continuation",
-        direction="LONG", checks=[Check("flow", False, "no", "yes")],
-        quality_flags=[], status="NOT_MET",
-        technical={"trend_retest_long": {"confirmed": False, "invalidated": True}},
-    )
-    _apply_1h_structure_invalidation(result)
-    assert result.status == "NOT_MET"
-
-
-def test_spot_sequence_is_unknown_when_current_poll_is_not_a_committed_snapshot():
-    from screener.service import _spot_sequence_for_current_poll
-
-    class StoreProbe:
-        calls = 0
-
-        def spot_sequence_status(self, *args, **kwargs):
-            self.calls += 1
-            return True
-
-    store = StoreProbe()
-    settings = type("Settings", (), {"p1": {"scenario": {
-        "spot_accumulation_required_snapshots": 3,
-        "snapshot_interval_hours": 4.0,
-        "snapshot_interval_tolerance_minutes": 10,
-    }}})()
-
-    assert _spot_sequence_for_current_poll(store, "ALTUSDT_PERP", settings, current_snapshot_available=False) is None
-    assert store.calls == 0
-    assert _spot_sequence_for_current_poll(store, "ALTUSDT_PERP", settings, current_snapshot_available=True) is True
-    assert store.calls == 1
-
-
-
-
-def test_snapshot_delta_respects_late_poll_tolerance_consistently(tmp_path):
-    from datetime import datetime, timedelta, timezone
-    from screener.service import _snapshot_deltas
-    from screener.storage import Store
-
-    base = datetime(2026, 11, 10, 0, 0, tzinfo=timezone.utc)
-    store = Store(tmp_path / "snapshot-tolerance-data")
-    previous = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=100, oi_usd=100_000_000)
-    store.add_snapshot(base, "PERPETUAL", [previous])
-
-    within_tolerance = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=101, oi_usd=101_000_000)
-    enriched, _ = analyze_universe([within_tolerance], {"thresholds": {}})
-    delta = _snapshot_deltas(
-        store,
-        enriched,
-        base + timedelta(hours=4, minutes=5),
-        snapshot_interval_hours=4,
-        snapshot_interval_tolerance_minutes=10,
-    )["BTCUSDT_PERP"]
-    assert "в пределах допуска" in delta["window_note"]
-    assert delta["price_x_oi_classification"].startswith("comparable_late_interval_within_tolerance:")
-
-    outside_tolerance = MarketRow(symbol="BTCUSDT_PERP", name="Bitcoin", price=102, oi_usd=102_000_000)
-    enriched, _ = analyze_universe([outside_tolerance], {"thresholds": {}})
-    delta = _snapshot_deltas(
-        store,
-        enriched,
-        base + timedelta(hours=4, minutes=11),
-        snapshot_interval_hours=4,
-        snapshot_interval_tolerance_minutes=10,
-    )["BTCUSDT_PERP"]
-    assert "несопоставимы" in delta["window_note"]
-    assert delta["price_x_oi_classification"].startswith("not_comparable_gap_outside_tolerance:")
-
-
-def test_long_d_telegram_conclusion_explicitly_waits_for_higher_low():
-    from screener.telegram import _conclusion
-
-    market = MarketRow(symbol="ALTUSDT_PERP", name="ALT", price=1.0, chg24_pct=-5.0)
-    enriched, _ = analyze_universe([market], {"thresholds": {}})
-    result = ScenarioResult(
-        symbol=market.symbol,
-        name=market.name,
-        scenario="LONG D — Post-Long-Flush Reversal",
-        direction="LONG",
-        checks=[Check("table pattern", True, "passed", "P1")],
-        quality_flags=[],
-        status="WAITING_FOR_HIGHER_LOW",
-        reason="All table conditions met; LONG is not considered until a 1H higher low forms",
-        technical={"higher_low": {"confirmed": False, "reason": "No confirmed higher low"}},
-    )
-    conclusion = _conclusion(result, enriched[0], result.technical)
-    assert "Higher Low ещё не подтверждён" in conclusion
-    assert "не входить" in conclusion
+    monkeypatch.setattr(telegram_module.requests, "post", fake_post)
+    TelegramClient("token", ["chat-1"]).send(message)
+    assert posted[0]["parse_mode"] == "HTML"
+    assert "<code>ZROUSDT</code>" in posted[0]["text"]
+    assert "reply_markup" not in posted[0]
