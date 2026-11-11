@@ -45,7 +45,8 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: |
+            requirements.txt
 
       # Hosted runners are fresh. Cache pip downloads, the actual Chromium bundle,
       # and the checksum-pinned WireProxy archive between workflow executions.
@@ -67,11 +68,6 @@ jobs:
           python -m pip install -r requirements.txt
           mkdir -p data
 
-      # System libraries are runner-local, so validate/install them each time.
-      # The browser executable itself is downloaded only on a cache miss.
-      - name: Install Playwright system dependencies
-        run: python -m playwright install-deps chromium
-
       - name: Install Playwright Chromium on cache miss
         if: steps.cache-runtime.outputs.cache-hit != 'true'
         run: python -m playwright install chromium
@@ -79,6 +75,26 @@ jobs:
       - name: Reuse cached Playwright Chromium
         if: steps.cache-runtime.outputs.cache-hit == 'true'
         run: echo "Playwright Chromium cache hit; browser download skipped."
+
+      - name: Verify Playwright Chromium launch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(headless=True)
+              try:
+                  page = browser.new_page()
+                  page.set_content("<html><body><main>chromium-ready</main></body></html>")
+                  actual = page.locator("main").inner_text()
+                  if actual != "chromium-ready":
+                      raise RuntimeError(f"Unexpected Chromium smoke-test result: {actual!r}")
+              finally:
+                  browser.close()
+          print("Playwright Chromium launch and page-render smoke test: OK")
+          PY
 
       - name: Install checksum-pinned WireProxy
         shell: bash
