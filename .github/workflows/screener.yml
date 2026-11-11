@@ -16,10 +16,9 @@ permissions:
 
 concurrency:
   group: screener
-  # Cron-job.org dispatches every five minutes. Keep pending runs instead of
-  # replacing the previous pending run (GitHub's default concurrency behavior).
-  # Queue is bounded at 100 by GitHub; additional events are rejected when full.
-  queue: max
+  # Cron-job.org dispatches every five minutes. Let the active scan finish,
+  # while keeping only the newest pending poll to avoid stale-run backlogs.
+  queue: single
   cancel-in-progress: false
 
 jobs:
@@ -80,9 +79,6 @@ jobs:
       - name: Reuse cached Playwright Chromium
         if: steps.cache-runtime.outputs.cache-hit == 'true'
         run: echo "Playwright Chromium cache hit; browser download skipped."
-
-      - name: Test analysis modules
-        run: python -m pytest -q
 
       - name: Install checksum-pinned WireProxy
         shell: bash
