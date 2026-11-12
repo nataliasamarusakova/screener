@@ -211,6 +211,7 @@ jobs:
           COINALYZE_CHAT_SID: ${{ secrets.COINALYZE_CHAT_SID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TELEGRAM_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
+          TELEGRAM_STORAGE_HASH_KEY: ${{ secrets.TELEGRAM_STORAGE_HASH_KEY }}
         run: |
           set -euo pipefail
           for secret_name in COINALYZE_URL COINALYZE_P_SID COINALYZE_CHAT_SID; do
