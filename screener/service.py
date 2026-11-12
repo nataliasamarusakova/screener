@@ -35,10 +35,10 @@ log = logging.getLogger(__name__)
 
 
 def _recipient_storage_key(chat_id: str, settings: Settings) -> str | None:
-    """Create a stable, one-way pseudonym for a Telegram recipient.
+    """Create the current stable, one-way pseudonym for a Telegram recipient.
 
-    Prefer a dedicated secret so rotating the bot token does not change the
-    storage identity. The bot token is a backward-compatible fallback.
+    A dedicated secret is preferred so rotating the bot token does not change
+    the storage identity; the bot token is the configured fallback.
     """
     secret = str(
         getattr(settings, "telegram_storage_hash_key", "")
@@ -49,34 +49,6 @@ def _recipient_storage_key(chat_id: str, settings: Settings) -> str | None:
         return None
     digest = hmac.new(secret.encode("utf-8"), str(chat_id).encode("utf-8"), hashlib.sha256).hexdigest()
     return f"hmac-sha256:{digest}"
-
-
-def _migrate_notification_recipients(store: Store, settings: Settings) -> int:
-    """Migrate raw legacy chat IDs before the notification store is queried."""
-    migrate = getattr(store, "migrate_notification_recipient_ids", None)
-    if not callable(migrate):
-        return 0
-    secret = str(
-        getattr(settings, "telegram_storage_hash_key", "")
-        or getattr(settings, "telegram_bot_token", "")
-        or ""
-    )
-    if not secret:
-        return 0
-    recipient_keys = [
-        key for chat_id in getattr(settings, "telegram_chat_ids", [])
-        if (key := _recipient_storage_key(str(chat_id), settings)) is not None
-    ]
-    migrated = migrate(lambda chat_id: _recipient_storage_key(chat_id, settings))
-    expanded = 0
-    expand_legacy = getattr(store, "migrate_redacted_broadcast_notifications", None)
-    if callable(expand_legacy):
-        expanded = expand_legacy(recipient_keys)
-    if migrated:
-        log.info("Migrated %d stored Telegram recipient identifier(s) to HMAC keys", migrated)
-    if expanded:
-        log.warning("Expanded %d redacted legacy notification state(s) across configured recipients", expanded)
-    return migrated + expanded
 
 
 def _ema(values: list[float], period: int) -> float | None:
@@ -537,6 +509,17 @@ def _send_one(
     return delivery[0] if delivery else {"chat_id": chat_id, "sent": False, "error": "No delivery response"}
 
 
+def _record_permanent_delivery_failure(
+    store: Store, event_key: str, recipient_key: str, contract_type: str, delivery: dict[str, Any],
+) -> None:
+    """Persist a definite Telegram rejection without altering an active lifecycle group."""
+    store.record_notification(
+        event_key, None, recipient_key=recipient_key,
+        event_state="FAILED", contract_type=contract_type,
+        delivery_status="FAILED", error=str(delivery.get("error") or "Permanent Telegram rejection"),
+    )
+
+
 def _collect_notifications(
     results: list[ScenarioResult],
     rows: list[EnrichedRow],
@@ -560,7 +543,6 @@ def _collect_notifications(
         if (key := _recipient_storage_key(chat_id, settings)) is not None
     }
     recipients = list(recipient_to_chat)
-    _migrate_notification_recipients(store, settings)
     if not contract_alerts_allowed:
         log.warning(
             "New confirmations and reversals blocked by contract/schema guard; "
@@ -585,62 +567,33 @@ def _collect_notifications(
         confirmed_opposite.setdefault(result.symbol, []).append((result, row, identity))
 
     active_states = store.active_notification_states(recipient_keys=recipients)
-    # Legacy v1.0.9 records did not have a direction or invalidation_level. Derive
-    # those from the current scenario's chart only once, then persist the upgrade.
-    normalized_active: list[dict[str, Any]] = []
-    for active in active_states:
-        group = str(active.get("event_group") or "")
-        symbol, scenario, inferred_direction = _event_group_parts(group)
-        direction = str(active.get("direction") or inferred_direction).upper()
-        level = active.get("invalidation_level")
-        current_result = results_by_group.get(group)
-        chart_technical = (
-            current_result.technical or {}
-            if current_result is not None
-            else technical_by_symbol.get(symbol, {})
-        )
-        if not isinstance(level, (int, float)) or not math.isfinite(float(level)):
-            invalidation_scenario = current_result.scenario if current_result is not None else scenario
-            invalidation_direction = current_result.direction if current_result is not None else direction
-            inferred = scenario_invalidation(
-                invalidation_direction, invalidation_scenario, chart_technical
-            ).get("level")
-            if isinstance(inferred, (int, float)) and math.isfinite(float(inferred)) and inferred > 0:
-                level = float(inferred)
-                migrated_key = f"MIGRATED|{active.get('event_key')}|{level:.12g}"
-                store.record_notification(
-                    migrated_key, active.get("telegram_message_id"),
-                    recipient_key=str(active.get("recipient_key") or active.get("chat_id")),
-                    event_group=group, fingerprint=str(active.get("fingerprint") or "legacy"),
-                    event_state="ACTIVE", direction=direction, invalidation_level=level,
-                    pair=str(active.get("pair") or chart_technical.get("binance_symbol") or symbol),
-                    scenario_code=_scenario_code(scenario),
-                    contract_type=str(active.get("contract_type") or contract_type),
-                )
-                active = {**active, "event_key": migrated_key, "invalidation_level": level, "direction": direction}
-        if not active.get("direction") and direction:
-            active["direction"] = direction
-        normalized_active.append(active)
+    normalized_active = active_states
+
+    current_contract = str(contract_type).upper()
+    contract_active_states = [
+        item for item in normalized_active
+        if str(item["contract_type"]).upper() == current_contract
+    ]
 
     # A confirmed opposite setup is a reversal. Aggregate all previously active
     # same-side scenarios for the pair into one standalone reversal notification.
     reversed_groups: set[tuple[str, str]] = set()
     outcomes: list[dict[str, Any]] = []
-    active_by_pair_chat: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for active in normalized_active:
-        group = str(active.get("event_group") or "")
+    active_by_pair_recipient: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for active in contract_active_states:
+        group = str(active["event_group"])
         symbol, _, _ = _event_group_parts(group)
-        chat_id = str(active.get("chat_id") or "")
-        if symbol and chat_id:
-            active_by_pair_chat.setdefault((symbol, chat_id), []).append(active)
+        recipient_key = str(active["recipient_key"])
+        if symbol and recipient_key:
+            active_by_pair_recipient.setdefault((symbol, recipient_key), []).append(active)
 
-    for (symbol, chat_id), pair_actives in active_by_pair_chat.items():
+    for (symbol, recipient_key), pair_actives in active_by_pair_recipient.items():
         opposite_new = []
         for candidate in confirmed_opposite.get(symbol, []):
             new_direction = candidate[0].direction.upper()
             old_side_actives = [
                 active for active in pair_actives
-                if str(active.get("direction") or _event_group_parts(str(active.get("event_group") or ""))[2]).upper() != new_direction
+                if str(active["direction"]).upper() != new_direction
             ]
             if not old_side_actives:
                 continue
@@ -658,34 +611,43 @@ def _collect_notifications(
         new_direction = new_result.direction.upper()
         old_actives = [
             item for item in pair_actives
-            if str(item.get("direction") or _event_group_parts(str(item.get("event_group") or ""))[2]).upper() != new_direction
+            if str(item["direction"]).upper() != new_direction
         ]
         old_codes = sorted({_scenario_code(_event_group_parts(str(item.get("event_group") or ""))[1]) for item in old_actives})
-        old_direction = old_actives[0].get("direction") or _event_group_parts(str(old_actives[0].get("event_group") or ""))[2]
+        old_direction = old_actives[0]["direction"]
         reversal_key = f"REVERSAL|{symbol}|{old_direction}|{new_direction}|{new_event_key}"
-        if store.notification_exists(reversal_key, chat_id):
+        reversal_failure_key = f"FAILED|{reversal_key}"
+        if store.notification_exists(
+            reversal_failure_key, recipient_key=recipient_key, contract_type=contract_type
+        ):
+            continue
+        if store.notification_exists(reversal_key, recipient_key=recipient_key, contract_type=contract_type):
             for old in old_actives:
                 old_group = str(old.get("event_group") or "")
-                latest_old = store.latest_notification_state(old_group, chat_id) or old
-                if str(latest_old.get("event_state") or "ACTIVE").upper() == "ACTIVE":
+                latest_old = store.latest_notification_state(
+                    old_group, recipient_key=recipient_key, contract_type=contract_type
+                ) or old
+                if str(latest_old["event_state"]).upper() == "ACTIVE":
                     store.record_notification(
                         f"{reversal_key}|RECOVER_OLD_STATE|{old_group}",
                         latest_old.get("telegram_message_id"),
-                        recipient_key=chat_id, event_group=old_group,
-                        fingerprint=str(latest_old.get("fingerprint") or "legacy"),
+                        recipient_key=recipient_key, event_group=old_group,
+                        fingerprint=str(latest_old["fingerprint"]),
                         event_state="REVERSED",
-                        direction=str(latest_old.get("direction") or _event_group_parts(old_group)[2]),
-                        invalidation_level=(float(latest_old["invalidation_level"]) if isinstance(latest_old.get("invalidation_level"), (int, float)) else None),
+                        direction=str(latest_old["direction"]),
+                        invalidation_level=float(latest_old["invalidation_level"]),
                         pair=str(latest_old.get("pair") or symbol),
                         scenario_code=_scenario_code(_event_group_parts(old_group)[1]),
                         contract_type=contract_type,
-                        delivery_status=str(latest_old.get("delivery_status") or "SENT"),
+                        delivery_status=str(latest_old["delivery_status"]),
                     )
-                reversed_groups.add((old_group, chat_id))
-            latest_new = store.latest_notification_state(new_group, chat_id)
-            if latest_new is None or str(latest_new.get("event_state") or "").upper() != "ACTIVE":
+                reversed_groups.add((old_group, recipient_key))
+            latest_new = store.latest_notification_state(
+                new_group, recipient_key=recipient_key, contract_type=contract_type
+            )
+            if latest_new is None or str(latest_new["event_state"]).upper() != "ACTIVE":
                 store.record_notification(
-                    new_event_key, None, recipient_key=chat_id,
+                    new_event_key, None, recipient_key=recipient_key,
                     event_group=new_group, fingerprint=new_fingerprint,
                     event_state="ACTIVE", direction=new_direction,
                     invalidation_level=new_level, pair=str((new_result.technical or {}).get("binance_symbol") or symbol),
@@ -701,11 +663,17 @@ def _collect_notifications(
         message = format_reversal_message(
             pair, str(old_direction), old_scenario_label, new_direction, _scenario_code(new_result.scenario)
         )
-        delivery = _send_one(telegram, message, recipient_to_chat[chat_id])
+        delivery = _send_one(telegram, message, recipient_to_chat[recipient_key])
+        if delivery.get("permanent_failure"):
+            _record_permanent_delivery_failure(
+                store, reversal_failure_key, recipient_key, contract_type, delivery
+            )
+            outcomes.append({"type": "reversal", "symbol": symbol, "sent": False, "delivery": delivery})
+            continue
         if delivery.get("sent") or delivery.get("delivery_unknown"):
             delivery_status = "SENT" if delivery.get("sent") else "UNKNOWN"
             store.record_notification(
-                reversal_key, delivery.get("message_id"), recipient_key=chat_id,
+                reversal_key, delivery.get("message_id"), recipient_key=recipient_key,
                 event_group=f"REVERSAL|{symbol}|{old_direction}|{new_direction}",
                 fingerprint=new_fingerprint, event_state="SENT", direction=new_direction,
                 pair=pair, scenario_code=_scenario_code(new_result.scenario), contract_type=contract_type,
@@ -714,16 +682,16 @@ def _collect_notifications(
             for old in old_actives:
                 old_group = str(old.get("event_group") or "")
                 store.record_notification(
-                    f"{reversal_key}|OLD_STATE|{old_group}", delivery.get("message_id"), recipient_key=chat_id,
-                    event_group=old_group, fingerprint=str(old.get("fingerprint") or "legacy"),
+                    f"{reversal_key}|OLD_STATE|{old_group}", delivery.get("message_id"), recipient_key=recipient_key,
+                    event_group=old_group, fingerprint=str(old["fingerprint"]),
                     event_state="REVERSED", direction=str(old_direction),
-                    invalidation_level=float(old["invalidation_level"]) if isinstance(old.get("invalidation_level"), (int, float)) else None,
+                    invalidation_level=float(old["invalidation_level"]),
                     pair=str(old.get("pair") or pair), scenario_code=_event_group_parts(old_group)[1].split(" — ", 1)[0],
                     contract_type=contract_type, delivery_status=delivery_status,
                 )
-                reversed_groups.add((old_group, chat_id))
+                reversed_groups.add((old_group, recipient_key))
             store.record_notification(
-                new_event_key, delivery.get("message_id"), recipient_key=chat_id,
+                new_event_key, delivery.get("message_id"), recipient_key=recipient_key,
                 event_group=new_group, fingerprint=new_fingerprint, event_state="ACTIVE",
                 direction=new_direction, invalidation_level=new_level, pair=pair,
                 scenario_code=_scenario_code(new_result.scenario), contract_type=contract_type,
@@ -736,8 +704,8 @@ def _collect_notifications(
     for active in normalized_active:
         group = str(active.get("event_group") or "")
         symbol, scenario, direction = _event_group_parts(group)
-        chat_id = str(active.get("chat_id") or "")
-        if not chat_id or (group, chat_id) in reversed_groups:
+        recipient_key = str(active["recipient_key"])
+        if (group, recipient_key) in reversed_groups:
             continue
         current_result = results_by_group.get(group)
         technical = (current_result.technical or {}) if current_result is not None else {}
@@ -754,16 +722,26 @@ def _collect_notifications(
         if not invalidated or level is None:
             continue
         cancel_key = f"CANCEL|{active.get('event_key')}|{close_time}"
-        if store.notification_exists(cancel_key, chat_id):
+        active_contract_type = str(active["contract_type"]).upper()
+        cancel_failure_key = f"FAILED|CANCEL|{active.get('event_key')}"
+        if store.notification_exists(
+            cancel_failure_key, recipient_key=recipient_key, contract_type=active_contract_type
+        ) or store.notification_exists(
+            cancel_key, recipient_key=recipient_key, contract_type=active_contract_type
+        ):
             continue
         pair = str(active.get("pair") or technical.get("binance_symbol") or symbol)
         message = format_cancellation_message(pair, direction, _scenario_code(scenario), level)
-        delivery = _send_one(telegram, message, recipient_to_chat[chat_id])
+        delivery = _send_one(telegram, message, recipient_to_chat[recipient_key])
+        if delivery.get("permanent_failure"):
+            _record_permanent_delivery_failure(
+                store, cancel_failure_key, recipient_key, active_contract_type, delivery
+            )
+            continue
         if delivery.get("sent") or delivery.get("delivery_unknown"):
-            active_contract_type = str(active.get("contract_type") or contract_type).upper()
             store.record_notification(
-                cancel_key, delivery.get("message_id"), recipient_key=chat_id,
-                event_group=group, fingerprint=str(active.get("fingerprint") or "legacy"),
+                cancel_key, delivery.get("message_id"), recipient_key=recipient_key,
+                event_group=group, fingerprint=str(active["fingerprint"]),
                 event_state="CANCELLED", direction=direction, invalidation_level=level,
                 pair=pair, scenario_code=_scenario_code(scenario), contract_type=active_contract_type,
                 delivery_status="SENT" if delivery.get("sent") else "UNKNOWN",
@@ -775,34 +753,38 @@ def _collect_notifications(
     # New confirmations are sent as separate Telegram posts, one signal per
     # message and recipient. An already ACTIVE group is never repeated because
     # its trigger timestamp/metrics changed.
-    active_groups_by_chat = {
-        (str(item.get("event_group") or ""), str(item.get("chat_id") or ""))
-        for item in store.active_notification_states(recipient_keys=recipients)
+    active_groups_by_recipient = {
+        (str(item["event_group"]), str(item["recipient_key"]))
+        for item in contract_active_states
     }
-    normal_by_chat: dict[str, list[tuple[ScenarioResult, EnrichedRow, tuple[str, str, str, float]]]] = {chat: [] for chat in recipients}
+    normal_by_recipient: dict[str, list[tuple[ScenarioResult, EnrichedRow, tuple[str, str, str, float]]]] = {
+        recipient: [] for recipient in recipients
+    }
     for symbol, items in confirmed.items():
         for result, row, identity in items:
             group, event_key, fingerprint, level = identity
-            for chat_id in recipients:
-                if store.notification_exists(event_key, chat_id):
+            for recipient_key in recipients:
+                if store.notification_exists(
+                    event_key, recipient_key=recipient_key, contract_type=contract_type
+                ):
                     continue
-                if (group, chat_id) in active_groups_by_chat or (group, chat_id) in reversed_groups:
+                if (group, recipient_key) in active_groups_by_recipient or (group, recipient_key) in reversed_groups:
                     continue
                 has_opposite_active = any(
                     _event_group_parts(active_group)[0] == symbol
                     and _event_group_parts(active_group)[2] != result.direction.upper()
-                    and active_chat == chat_id
-                    for active_group, active_chat in active_groups_by_chat
+                    and active_recipient == recipient_key
+                    for active_group, active_recipient in active_groups_by_recipient
                 )
                 if has_opposite_active:
                     continue
                 # A reversal message already carried this new scenario for this pair.
                 reversal_group = f"REVERSAL|{symbol}|"
-                if any(g.startswith(reversal_group) and c == chat_id for g, c in active_groups_by_chat):
+                if any(g.startswith(reversal_group) and c == recipient_key for g, c in active_groups_by_recipient):
                     continue
-                normal_by_chat[chat_id].append((result, row, identity))
+                normal_by_recipient[recipient_key].append((result, row, identity))
 
-    for chat_id, items in normal_by_chat.items():
+    for recipient_key, items in normal_by_recipient.items():
         for result, row, identity in items:
             group, event_key, fingerprint, level = identity
             try:
@@ -813,10 +795,14 @@ def _collect_notifications(
 
             # One call to sendMessage per signal. Do not combine messages,
             # prepend a batch heading, or place separator lines between signals.
-            delivery = _send_one(telegram, message, recipient_to_chat[chat_id])
-            if delivery.get("sent") or delivery.get("delivery_unknown"):
+            delivery = _send_one(telegram, message, recipient_to_chat[recipient_key])
+            if delivery.get("permanent_failure"):
+                _record_permanent_delivery_failure(
+                    store, event_key, recipient_key, contract_type, delivery
+                )
+            elif delivery.get("sent") or delivery.get("delivery_unknown"):
                 store.record_notification(
-                    event_key, delivery.get("message_id"), recipient_key=chat_id,
+                    event_key, delivery.get("message_id"), recipient_key=recipient_key,
                     event_group=group, fingerprint=fingerprint, event_state="ACTIVE",
                     direction=result.direction, invalidation_level=level,
                     pair=str((result.technical or {}).get("binance_symbol") or row.symbol),
@@ -835,7 +821,6 @@ def _collect_notifications(
 
 def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[str, Any]:
     store = Store(settings.data_dir)
-    _migrate_notification_recipients(store, settings)
     pruned = store.prune(snapshot_retention_days=30, run_retention_days=90, notification_retention_days=180)
     if any(pruned.values()):
         log.info("Persistent state pruned: %s", pruned)

@@ -61,13 +61,14 @@ class Store:
     def _read_jsonl(path: Path) -> Iterable[dict[str, Any]]:
         if not path.exists():
             return
-        with path.open("r", encoding="utf-8") as stream:
-            for line_number, line in enumerate(stream, start=1):
-                if not line.strip():
+        with path.open("rb") as stream:
+            for line_number, raw_line in enumerate(stream, start=1):
+                if not raw_line.strip():
                     continue
                 try:
+                    line = raw_line.decode("utf-8")
                     item = json.loads(line)
-                except json.JSONDecodeError:
+                except (UnicodeDecodeError, json.JSONDecodeError):
                     log.warning("Skipping malformed JSONL record: %s:%d", path.name, line_number)
                     continue
                 if isinstance(item, dict):
@@ -422,108 +423,88 @@ class Store:
             return None
         return all(value is not None and value > 0 for _, value in parsed)
 
-    def migrate_notification_recipient_ids(self, key_function: Any) -> int:
-        """Replace legacy raw Telegram chat IDs with one-way recipient keys."""
-        records = list(self._read_jsonl(self.notifications_path))
-        migrated = 0
-        for item in records:
-            raw_chat = item.get("chat_id")
-            if raw_chat is None or item.get("recipient_key"):
-                continue
-            item["recipient_key"] = str(key_function(str(raw_chat)))
-            item.pop("chat_id", None)
-            migrated += 1
-        if migrated:
-            self._rewrite_jsonl(self.notifications_path, records)
-        return migrated
+    @staticmethod
+    def _is_current_notification_record(item: dict[str, Any]) -> bool:
+        """Validate the current notification JSONL schema; no migration is performed."""
+        if item.get("record_type") != "notification":
+            return False
+        for field in ("event_key", "recipient_key", "contract_type", "sent_at"):
+            value = item.get(field)
+            if not isinstance(value, str) or not value.strip():
+                return False
+        if str(item.get("delivery_status") or "").upper() not in {"SENT", "UNKNOWN", "FAILED"}:
+            return False
+        try:
+            datetime.fromisoformat(str(item["sent_at"]))
+        except (TypeError, ValueError):
+            return False
+        lifecycle_state = str(item.get("event_state") or "").upper()
+        if lifecycle_state in {"ACTIVE", "CANCELLED", "CANCELED", "REVERSED"}:
+            if not isinstance(item.get("event_group"), str) or not item["event_group"].strip():
+                return False
+            if not isinstance(item.get("fingerprint"), str) or not item["fingerprint"].strip():
+                return False
+            if str(item.get("direction") or "").upper() not in {"LONG", "SHORT"}:
+                return False
+            level = item.get("invalidation_level")
+            if (
+                not isinstance(level, (int, float))
+                or isinstance(level, bool)
+                or not math.isfinite(float(level))
+                or float(level) <= 0
+            ):
+                return False
+        return True
 
-    def migrate_redacted_broadcast_notifications(self, recipient_keys: list[str]) -> int:
-        """Assign explicitly redacted legacy broadcast rows to current recipients.
-
-        The packaged legacy state may have its original recipient removed for
-        privacy. On the first configured run, materialize one recipient-scoped
-        copy per current recipient, then remove the broadcast marker.
-        """
-        keys = list(dict.fromkeys(str(value) for value in recipient_keys if str(value)))
-        if not keys:
-            return 0
-        if len(keys) != 1:
-            log.warning(
-                "Cannot safely assign redacted legacy notification state to %d recipients; "
-                "configure the original recipient alone for the migration run",
-                len(keys),
-            )
-            return 0
-        records = list(self._read_jsonl(self.notifications_path))
-        migrated: list[dict[str, Any]] = []
-        expanded = 0
-        changed = False
-        for item in records:
-            if item.get("recipient_scope") != "LEGACY_REDACTED_BROADCAST":
-                migrated.append(item)
-                continue
-            changed = True
-            base = dict(item)
-            base.pop("recipient_scope", None)
-            base.pop("chat_id", None)
-            # A Telegram message ID is scoped to one private chat. The redacted
-            # legacy row cannot tell us which recipient owns that ID.
-            base.pop("telegram_message_id", None)
-            for key in keys:
-                copy = dict(base)
-                copy["recipient_key"] = key
-                migrated.append(copy)
-                expanded += 1
-        if changed:
-            self._rewrite_jsonl(self.notifications_path, migrated)
-        return expanded
+    def _current_notification_records(self) -> list[dict[str, Any]]:
+        return [
+            item for item in self._read_jsonl(self.notifications_path)
+            if self._is_current_notification_record(item)
+        ]
 
     def _notification_records(
-        self, event_key: str, chat_id: str | None = None, *, recipient_key: str | None = None
+        self, event_key: str, *, recipient_key: str, contract_type: str,
     ) -> list[dict[str, Any]]:
-        records = [
-            item for item in self._read_jsonl(self.notifications_path)
-            if item.get("event_key") == event_key
-        ]
-        recipient = recipient_key if recipient_key is not None else chat_id
-        if recipient is None:
-            return records
-        recipient = str(recipient)
-        # Rows without a recipient key are legacy broadcast records.
+        expected_contract = str(contract_type).upper()
+        expected_recipient = str(recipient_key)
         return [
-            item for item in records
-            if (item.get("recipient_key") is None and item.get("chat_id") is None)
-            or str(item.get("recipient_key") or item.get("chat_id")) == recipient
+            item for item in self._current_notification_records()
+            if item.get("event_key") == event_key
+            and item.get("recipient_key") == expected_recipient
+            and str(item.get("contract_type")).upper() == expected_contract
         ]
 
     def notification_exists(
-        self, event_key: str, chat_id: str | None = None, *, recipient_key: str | None = None
+        self, event_key: str, *, recipient_key: str, contract_type: str,
     ) -> bool:
-        return bool(self._notification_records(event_key, chat_id, recipient_key=recipient_key))
+        return bool(self._notification_records(
+            event_key, recipient_key=recipient_key, contract_type=contract_type
+        ))
 
     def latest_notification_state(
-        self, event_group: str, chat_id: str | None = None, *, recipient_key: str | None = None
+        self, event_group: str, *, recipient_key: str, contract_type: str,
     ) -> dict[str, Any] | None:
-        """Return the latest state for one recipient key (or legacy broadcast)."""
-        recipient = recipient_key if recipient_key is not None else chat_id
+        """Return the latest current-schema state for one recipient and contract."""
+        expected_contract = str(contract_type).upper()
+        expected_recipient = str(recipient_key)
         matching = [
-            item for item in self._read_jsonl(self.notifications_path)
+            item for item in self._current_notification_records()
             if item.get("event_group") == event_group
             and item.get("fingerprint")
-            and (
-                recipient is None
-                or (item.get("recipient_key") is None and item.get("chat_id") is None)
-                or str(item.get("recipient_key") or item.get("chat_id")) == str(recipient)
-            )
+            and item.get("event_state")
+            and item.get("recipient_key") == expected_recipient
+            and str(item.get("contract_type")).upper() == expected_contract
         ]
         return matching[-1] if matching else None
 
     def notification_due(
-        self, event_key: str, cooldown_hours: float, chat_id: str | None = None,
-        *, recipient_key: str | None = None,
+        self, event_key: str, cooldown_hours: float, *,
+        recipient_key: str, contract_type: str,
     ) -> bool:
         matching = [
-            item for item in self._notification_records(event_key, chat_id, recipient_key=recipient_key)
+            item for item in self._notification_records(
+                event_key, recipient_key=recipient_key, contract_type=contract_type
+            )
             if item.get("sent_at")
         ]
         if not matching:
@@ -546,9 +527,9 @@ class Store:
         self,
         event_key: str,
         message_id: str | int | None = None,
-        chat_id: str | None = None,
         *,
-        recipient_key: str | None = None,
+        recipient_key: str,
+        contract_type: str,
         event_group: str | None = None,
         fingerprint: str | None = None,
         event_state: str | None = None,
@@ -556,32 +537,51 @@ class Store:
         invalidation_level: float | None = None,
         pair: str | None = None,
         scenario_code: str | None = None,
-        contract_type: str | None = None,
         delivery_status: str = "SENT",
         error: str | None = None,
     ) -> None:
-        """Append a delivery and optional lifecycle-state record.
+        """Append a notification using the current recipient/contract schema."""
+        if not str(event_key).strip():
+            raise ValueError("event_key must be non-empty")
+        if not str(recipient_key).strip():
+            raise ValueError("recipient_key must be non-empty")
+        if not str(contract_type).strip():
+            raise ValueError("contract_type must be non-empty")
+        normalized_status = str(delivery_status).upper()
+        if normalized_status not in {"SENT", "UNKNOWN", "FAILED"}:
+            raise ValueError(f"Unsupported delivery_status: {delivery_status}")
 
-        Production callers pass ``recipient_key`` (an HMAC pseudonym). ``chat_id``
-        remains only as a backwards-compatible input for old tests/migrations.
-        """
+        normalized_state = str(event_state).upper() if event_state is not None else None
+        if normalized_state in {"ACTIVE", "CANCELLED", "CANCELED", "REVERSED"}:
+            if not isinstance(event_group, str) or not event_group.strip():
+                raise ValueError(f"event_group is required for {normalized_state} notifications")
+            if not isinstance(fingerprint, str) or not fingerprint.strip():
+                raise ValueError(f"fingerprint is required for {normalized_state} notifications")
+            if str(direction or "").upper() not in {"LONG", "SHORT"}:
+                raise ValueError(f"direction must be LONG or SHORT for {normalized_state} notifications")
+            if (
+                not isinstance(invalidation_level, (int, float))
+                or isinstance(invalidation_level, bool)
+                or not math.isfinite(float(invalidation_level))
+                or float(invalidation_level) <= 0
+            ):
+                raise ValueError(f"invalidation_level must be positive and finite for {normalized_state} notifications")
+
         record: dict[str, Any] = {
             "record_type": "notification",
-            "event_key": event_key,
+            "event_key": str(event_key),
             "sent_at": datetime.now(timezone.utc).isoformat(),
             "telegram_message_id": str(message_id) if message_id is not None else None,
-            "delivery_status": str(delivery_status).upper(),
+            "delivery_status": normalized_status,
+            "recipient_key": str(recipient_key),
+            "contract_type": str(contract_type).upper(),
         }
-        if recipient_key is not None:
-            record["recipient_key"] = str(recipient_key)
-        elif chat_id is not None:
-            record["chat_id"] = str(chat_id)
         if event_group is not None:
             record["event_group"] = str(event_group)
         if fingerprint is not None:
             record["fingerprint"] = str(fingerprint)
         if event_state is not None:
-            record["event_state"] = str(event_state).upper()
+            record["event_state"] = normalized_state
         if direction is not None:
             record["direction"] = str(direction).upper()
         if invalidation_level is not None and math.isfinite(float(invalidation_level)):
@@ -590,8 +590,6 @@ class Store:
             record["pair"] = str(pair).upper()
         if scenario_code is not None:
             record["scenario_code"] = str(scenario_code).upper()
-        if contract_type is not None:
-            record["contract_type"] = str(contract_type).upper()
         if error:
             record["error"] = str(error)[:500]
         self._append_jsonl(self.notifications_path, record)
@@ -599,55 +597,47 @@ class Store:
     def active_notification_states(
         self,
         *,
-        chat_ids: list[str] | None = None,
-        recipient_keys: list[str] | None = None,
+        recipient_keys: list[str],
         contract_type: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return the latest active alert per scenario group and recipient key.
-
-        ``chat_ids`` is retained as a compatibility alias for stored recipient
-        keys. Legacy broadcast rows are expanded into the requested recipient set.
-        """
-        allowed = recipient_keys if recipient_keys is not None else chat_ids
-        allowed_recipients = {str(value) for value in allowed} if allowed is not None else None
+        """Return latest current-schema active alerts per scenario, recipient and contract."""
+        allowed_recipients = {str(value) for value in recipient_keys if str(value)}
+        if not allowed_recipients:
+            return []
         expected_contract = str(contract_type).upper() if contract_type else None
-        latest_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-        for item in self._read_jsonl(self.notifications_path):
+        latest_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for item in self._current_notification_records():
             group = str(item.get("event_group") or "")
-            if not group or not item.get("fingerprint"):
+            fingerprint = str(item.get("fingerprint") or "")
+            state = str(item.get("event_state") or "").upper()
+            recipient = str(item.get("recipient_key") or "")
+            stored_contract = str(item.get("contract_type") or "").upper()
+            if not group or not fingerprint or not state or not recipient or not stored_contract:
                 continue
-            stored_recipient = item.get("recipient_key") or item.get("chat_id")
-            if item.get("recipient_scope") == "LEGACY_REDACTED_BROADCAST" and stored_recipient is None:
-                # The original recipient was intentionally removed from the
-                # public archive. Never broadcast its lifecycle to unrelated
-                # recipients; the migration method assigns it only when one
-                # unambiguous configured recipient is available.
-                log.warning(
-                    "Skipping legacy notification %s: recipient is redacted and cannot be mapped safely",
-                    item.get("event_key"),
-                )
+            if allowed_recipients and recipient not in allowed_recipients:
                 continue
-            target_recipients = [str(stored_recipient or "")]
-            if allowed_recipients is not None and stored_recipient is not None and str(stored_recipient) not in allowed_recipients:
+            if expected_contract and stored_contract != expected_contract:
                 continue
-            stored_contract = item.get("contract_type")
-            if expected_contract and stored_contract and str(stored_contract).upper() != expected_contract:
-                continue
-            for recipient in target_recipients:
-                latest_by_key[(group, recipient)] = {
-                    **item,
-                    "recipient_key": recipient,
-                    # Kept in the returned in-memory shape for lifecycle compatibility;
-                    # this field is never written back by production code.
-                    "chat_id": recipient,
-                }
+            latest_by_key[(group, recipient, stored_contract)] = item
 
         active: list[dict[str, Any]] = []
         for item in latest_by_key.values():
-            state = str(item.get("event_state") or "ACTIVE").upper()
-            delivery = str(item.get("delivery_status") or "SENT").upper()
-            if state == "ACTIVE" and delivery in {"SENT", "UNKNOWN"}:
-                active.append(dict(item))
+            if str(item.get("event_state") or "").upper() != "ACTIVE":
+                continue
+            if str(item.get("delivery_status") or "").upper() not in {"SENT", "UNKNOWN"}:
+                continue
+            direction = str(item.get("direction") or "").upper()
+            level = item.get("invalidation_level")
+            if direction not in {"LONG", "SHORT"}:
+                continue
+            if (
+                not isinstance(level, (int, float))
+                or isinstance(level, bool)
+                or not math.isfinite(float(level))
+                or float(level) <= 0
+            ):
+                continue
+            active.append(dict(item))
         return active
 
     def start_run(self) -> str:
@@ -728,21 +718,33 @@ class Store:
         if deleted_runs:
             self._rewrite_jsonl(self.runs_path, kept_runs)
 
-        notifications = list(self._read_jsonl(self.notifications_path))
-        # Keep the latest ACTIVE/UNKNOWN-or-SENT lifecycle row for every
-        # scenario-recipient pair even after the ordinary notification retention
-        # period. Otherwise pruning would silently forget a still-active signal.
-        latest_state: dict[tuple[str, str], dict[str, Any]] = {}
+        raw_notifications = list(self._read_jsonl(self.notifications_path))
+        notifications = [
+            item for item in raw_notifications if self._is_current_notification_record(item)
+        ]
+
+        # Protect the newest active lifecycle record for every exact
+        # scenario-recipient-contract tuple. No inferred recipient or contract
+        # scope is accepted.
+        latest_state: dict[tuple[str, str, str], dict[str, Any]] = {}
         for item in notifications:
             group = str(item.get("event_group") or "")
-            if not group or not item.get("fingerprint"):
+            fingerprint = str(item.get("fingerprint") or "")
+            state = str(item.get("event_state") or "").upper()
+            recipient = str(item.get("recipient_key") or "")
+            contract_scope = str(item.get("contract_type") or "").upper()
+            if not group or not fingerprint or not state or not recipient or not contract_scope:
                 continue
-            recipient = str(item.get("recipient_key") or item.get("chat_id") or "")
-            latest_state[(group, recipient)] = item
+            latest_state[(group, recipient, contract_scope)] = item
         protected_ids = {
             id(item) for item in latest_state.values()
-            if str(item.get("event_state") or "ACTIVE").upper() == "ACTIVE"
-            and str(item.get("delivery_status") or "SENT").upper() in {"SENT", "UNKNOWN"}
+            if str(item.get("event_state") or "").upper() == "ACTIVE"
+            and str(item.get("delivery_status") or "").upper() in {"SENT", "UNKNOWN"}
+            and str(item.get("direction") or "").upper() in {"LONG", "SHORT"}
+            and isinstance(item.get("invalidation_level"), (int, float))
+            and not isinstance(item.get("invalidation_level"), bool)
+            and math.isfinite(float(item["invalidation_level"]))
+            and float(item["invalidation_level"]) > 0
         }
         kept_notifications: list[dict[str, Any]] = []
         for item in notifications:
@@ -754,7 +756,7 @@ class Store:
                 continue
             if timestamp >= notification_cutoff or id(item) in protected_ids:
                 kept_notifications.append(item)
-        deleted_notifications = len(notifications) - len(kept_notifications)
+        deleted_notifications = len(raw_notifications) - len(kept_notifications)
         if deleted_notifications:
             self._rewrite_jsonl(self.notifications_path, kept_notifications)
 

@@ -166,6 +166,27 @@ def _value(cells: list[Any], index: dict[str, int], field: str) -> float | None:
     return parse_number(_cell_text(cells, index.get(field)))
 
 
+def _validated_market_value(
+    cells: list[Any], index: dict[str, int], field: str,
+    *, minimum: float | None = None, maximum: float | None = None,
+    invalid_fields: list[str], symbol: str,
+) -> float | None:
+    """Return a market value only when it is inside its domain-specific range."""
+    value = _value(cells, index, field)
+    if value is None:
+        return None
+    if (minimum is not None and value < minimum) or (maximum is not None and value > maximum):
+        invalid_fields.append(field)
+        log.warning(
+            "%s: ignoring out-of-range Coinalyze field %s=%s (expected %s..%s)",
+            symbol, field, value,
+            minimum if minimum is not None else "-inf",
+            maximum if maximum is not None else "+inf",
+        )
+        return None
+    return value
+
+
 def _disambiguate_oi(cells: list[Any], indices: list[int]) -> tuple[float | None, float | None]:
     pct = usd = None
     for idx in indices:
@@ -221,6 +242,7 @@ def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[
         price_raw = _cell_text(cells, index.get("price"))
         parsed_price = _value(cells, index, "price")
         price_unavailable = parsed_price is not None and parsed_price <= 0
+        invalid_market_fields: list[str] = []
         row = MarketRow(
             symbol=symbol,
             source_symbol=symbol,
@@ -243,9 +265,18 @@ def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[
             pfr_avg_pct=_value(cells, index, "pfr_avg_pct"),
             fr_oiw_pct=_value(cells, index, "fr_oiw_pct"),
             pfr_oiw_pct=_value(cells, index, "pfr_oiw_pct"),
-            liq_total24_usd=_value(cells, index, "liq_total24_usd"),
-            liq_short24_usd=_value(cells, index, "liq_short24_usd"),
-            liq_long24_usd=_value(cells, index, "liq_long24_usd"),
+            liq_total24_usd=_validated_market_value(
+                cells, index, "liq_total24_usd", minimum=0.0,
+                invalid_fields=invalid_market_fields, symbol=symbol,
+            ),
+            liq_short24_usd=_validated_market_value(
+                cells, index, "liq_short24_usd", minimum=0.0,
+                invalid_fields=invalid_market_fields, symbol=symbol,
+            ),
+            liq_long24_usd=_validated_market_value(
+                cells, index, "liq_long24_usd", minimum=0.0,
+                invalid_fields=invalid_market_fields, symbol=symbol,
+            ),
             liq_vol_ratio=_value(cells, index, "liq_vol_ratio"),
             liq_oi_ratio=_value(cells, index, "liq_oi_ratio"),
             ls_ratio_1h=_value(cells, index, "ls_ratio_1h"),
@@ -254,10 +285,21 @@ def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[
             ls_ratio_1d=_value(cells, index, "ls_ratio_1d"),
             long_accounts_1d_pct=_value(cells, index, "long_accounts_1d_pct"),
             short_accounts_1d_pct=_value(cells, index, "short_accounts_1d_pct"),
-            futures_imbalance_4h=_value(cells, index, "futures_imbalance_4h"),
-            spot_imbalance_4h=_value(cells, index, "spot_imbalance_4h"),
+            futures_imbalance_4h=_validated_market_value(
+                cells, index, "futures_imbalance_4h", minimum=-100.0, maximum=100.0,
+                invalid_fields=invalid_market_fields, symbol=symbol,
+            ),
+            spot_imbalance_4h=_validated_market_value(
+                cells, index, "spot_imbalance_4h", minimum=-100.0, maximum=100.0,
+                invalid_fields=invalid_market_fields, symbol=symbol,
+            ),
             btc_corr7d=_value(cells, index, "btc_corr7d"),
-            raw={"row_number": row_idx, "price_raw": price_raw, "price_rounded_or_invalid_zero": price_unavailable},
+            raw={
+                "row_number": row_idx,
+                "price_raw": price_raw,
+                "price_rounded_or_invalid_zero": price_unavailable,
+                "invalid_market_fields": invalid_market_fields,
+            },
         )
         # Hard data integrity checks: malformed values do not silently enter ranks.
         if price_unavailable:

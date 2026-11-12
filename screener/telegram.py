@@ -322,25 +322,58 @@ class TelegramClient:
                     if attempts < 3:
                         time.sleep(min(max(retry_after, 1.0), 30.0))
                         continue
-                    results.append({"chat_id": chat_id, "sent": False, "delivery_unknown": False, "error": f"Telegram rate limit; retry_after={retry_after}s"})
+                    results.append({
+                        "chat_id": chat_id, "sent": False, "delivery_unknown": False,
+                        "error": f"Telegram rate limit; retry_after={retry_after}s",
+                    })
                     break
 
                 if response.status_code >= 500:
                     # A server-side error after a POST is treated as ambiguous;
                     # don't re-send an event which may already have been accepted.
-                    results.append({"chat_id": chat_id, "sent": False, "delivery_unknown": True, "error": f"Telegram server error {response.status_code}"})
+                    results.append({
+                        "chat_id": chat_id, "sent": False, "delivery_unknown": True,
+                        "error": f"Telegram server error {response.status_code}",
+                    })
                     break
 
                 try:
                     response.raise_for_status()
                     payload = response.json()
                 except (requests.RequestException, ValueError) as exc:
-                    results.append({"chat_id": chat_id, "sent": False, "delivery_unknown": response.status_code < 400, "error": _safe_telegram_error(exc, self.token, chat_id)})
+                    permanent_failure = (
+                        400 <= response.status_code < 500
+                        and response.status_code not in {408, 425, 429}
+                    )
+                    results.append({
+                        "chat_id": chat_id, "sent": False,
+                        "delivery_unknown": response.status_code < 400,
+                        "permanent_failure": permanent_failure,
+                        "error": _safe_telegram_error(exc, self.token, chat_id),
+                    })
                     break
                 if not payload.get("ok"):
-                    results.append({"chat_id": chat_id, "sent": False, "delivery_unknown": False, "error": _safe_telegram_error(payload.get("description", "Telegram API returned ok=false"), self.token, chat_id)})
+                    error_code = payload.get("error_code")
+                    try:
+                        error_status = int(error_code)
+                    except (TypeError, ValueError):
+                        error_status = None
+                    result = {
+                        "chat_id": chat_id, "sent": False, "delivery_unknown": False,
+                        "error": _safe_telegram_error(payload.get("description", "Telegram API returned ok=false"), self.token, chat_id),
+                    }
+                    if (
+                        error_status is not None
+                        and 400 <= error_status < 500
+                        and error_status not in {408, 425, 429}
+                    ):
+                        result["permanent_failure"] = True
+                    results.append(result)
                     break
-                results.append({"chat_id": chat_id, "sent": True, "delivery_unknown": False, "message_id": (payload.get("result") or {}).get("message_id")})
+                results.append({
+                    "chat_id": chat_id, "sent": True, "delivery_unknown": False,
+                    "message_id": (payload.get("result") or {}).get("message_id"),
+                })
                 break
         return results
 
