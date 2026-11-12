@@ -28,6 +28,11 @@ def _settings():
     return SimpleNamespace(telegram_bot_token="test-token", telegram_chat_ids=["chat-1"])
 
 
+def _recipient_key():
+    from screener.service import _recipient_storage_key
+    return _recipient_storage_key("chat-1", _settings())
+
+
 def _confirmed_result(row, direction: str, scenario_code: str, *, level: float, close: float):
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     hour_open = (now_ms // 3_600_000) * 3_600_000 - 3_600_000
@@ -155,7 +160,11 @@ def test_active_short_is_cancelled_once_and_not_repeated(tmp_path, monkeypatch):
         "SHORT D: закрытие 1H выше <code>0.76590000</code>."
     )
     assert first[0]["type"] == "cancellation"
-    assert store.active_notification_states(chat_ids=["chat-1"]) == []
+    assert store.active_notification_states(recipient_keys=[_recipient_key()]) == []
+    persisted = store.notifications_path.read_text(encoding="utf-8")
+    assert '"chat_id"' not in persisted
+    assert "chat-1" not in persisted
+    assert "hmac-sha256:" in persisted
 
     # The CANCELLED state is durable across the next GitHub Actions cron run.
     assert _collect_notifications([cancelled], rows, _settings(), store, True, False) == []
@@ -218,7 +227,7 @@ def test_confirmed_opposite_scenario_sends_one_reversal_post_not_a_second_signal
     assert "CONFIRMED" not in message
     assert outcomes[0]["type"] == "reversal"
 
-    active = store.active_notification_states(chat_ids=["chat-1"])
+    active = store.active_notification_states(recipient_keys=[_recipient_key()])
     assert len(active) == 1
     assert active[0]["event_group"] == f"{row.symbol}|LONG A — Trend Continuation"
     assert active[0]["direction"] == "LONG"
@@ -240,7 +249,7 @@ def test_opposite_candidate_does_not_cancel_or_reverse_before_old_level_breaks(t
     long_not_yet_reversed = _confirmed_result(row, "LONG", "LONG A", level=0.7400, close=0.7600)
     assert _collect_notifications([long_not_yet_reversed], rows, _settings(), store, True, False) == []
     assert FakeTelegram.sent == []
-    assert len(store.active_notification_states(chat_ids=["chat-1"])) == 1
+    assert len(store.active_notification_states(recipient_keys=[_recipient_key()])) == 1
 
 
 def test_unconfirmed_opposite_candidate_does_not_create_reversal(tmp_path, monkeypatch):
@@ -258,7 +267,7 @@ def test_unconfirmed_opposite_candidate_does_not_create_reversal(tmp_path, monke
     candidate.technical["trend_retest_long"]["confirmed"] = False
     assert _collect_notifications([candidate], rows, _settings(), store, True, False) == []
     assert FakeTelegram.sent == []
-    assert len(store.active_notification_states(chat_ids=["chat-1"])) == 1
+    assert len(store.active_notification_states(recipient_keys=[_recipient_key()])) == 1
 
 
 def test_old_event_is_cancelled_by_its_saved_level_not_a_new_pivot(tmp_path, monkeypatch):
@@ -277,7 +286,7 @@ def test_old_event_is_cancelled_by_its_saved_level_not_a_new_pivot(tmp_path, mon
     still_active.technical["weak_bounce_rejection"] = {"invalidated": True, "resistance": 0.7700}
     assert _collect_notifications([still_active], rows, _settings(), store, True, False) == []
     assert FakeTelegram.sent == []
-    assert len(store.active_notification_states(chat_ids=["chat-1"])) == 1
+    assert len(store.active_notification_states(recipient_keys=[_recipient_key()])) == 1
 
 
 
@@ -318,7 +327,7 @@ def test_two_new_confirmed_scenarios_are_sent_as_two_separate_telegram_messages(
     assert all("НОВЫЕ ПОДТВЕРЖДЁННЫЕ СЦЕНАРИИ" not in message for message in messages)
     assert all("────────────" not in message for message in messages)
     assert all("P1 · НОВЫЕ СЦЕНАРИИ" not in message for message in messages)
-    assert len(store.active_notification_states(chat_ids=["chat-1"])) == 2
+    assert len(store.active_notification_states(recipient_keys=[_recipient_key()])) == 2
 
     # A following cron run must not resend either of the two separately posted cards.
     repeated = _collect_notifications(
@@ -327,3 +336,140 @@ def test_two_new_confirmed_scenarios_are_sent_as_two_separate_telegram_messages(
     )
     assert repeated == []
     assert len(FakeTelegram.sent) == 2
+
+
+def test_active_signal_is_monitored_and_cancelled_when_symbol_disappears_from_coinalyze(tmp_path, monkeypatch):
+    import screener.service as service
+
+    FakeTelegram.sent = []
+    monkeypatch.setattr(service, "TelegramClient", FakeTelegram)
+    row = _enriched()[0]
+    store = Store(tmp_path / "missing-symbol")
+    _activate_short(store, row)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    hour_open = (now_ms // 3_600_000) * 3_600_000 - 3_600_000
+    technical = {
+        "binance_symbol": "FILUSDT",
+        "last_closed_1h": {
+            "open_time_ms": hour_open,
+            "close_time_ms": hour_open + 3_599_999,
+            "open": 0.7660, "high": 0.7670, "low": 0.7655, "close": 0.7660,
+        },
+    }
+
+    outcomes = _collect_notifications(
+        [], [], _settings(), store, True, False,
+        technical_by_symbol={row.symbol: technical},
+    )
+
+    assert len(outcomes) == 1 and outcomes[0]["type"] == "cancellation"
+    assert FakeTelegram.sent[0][1] == ["chat-1"]
+    assert store.active_notification_states(recipient_keys=[_recipient_key()]) == []
+
+
+def test_missing_symbol_without_fresh_binance_candle_is_not_auto_cancelled(tmp_path, monkeypatch):
+    import screener.service as service
+
+    FakeTelegram.sent = []
+    monkeypatch.setattr(service, "TelegramClient", FakeTelegram)
+    row = _enriched()[0]
+    store = Store(tmp_path / "missing-symbol-unknown")
+    _activate_short(store, row)
+
+    outcomes = _collect_notifications([], [], _settings(), store, True, False)
+
+    assert outcomes == []
+    assert FakeTelegram.sent == []
+    assert len(store.active_notification_states(recipient_keys=[_recipient_key()])) == 1
+
+
+def test_active_symbol_absent_from_coinalyze_remains_a_chart_candidate(tmp_path):
+    from screener.config import DEFAULT_P1_CONFIG
+    from screener.service import _migrate_notification_recipients, _preliminary_candidate_symbols
+
+    row = _enriched()[0]
+    store = Store(tmp_path / "active-candidate")
+    _activate_short(store, row)
+    settings = SimpleNamespace(
+        telegram_bot_token="test-token", telegram_chat_ids=["chat-1"],
+        telegram_storage_hash_key="",
+        p1=DEFAULT_P1_CONFIG,
+    )
+    _migrate_notification_recipients(store, settings)
+
+    candidates = _preliminary_candidate_symbols([], None, settings, store, contract_type="PERPETUAL")
+
+    assert row.symbol in candidates
+
+
+def test_contract_guard_blocks_new_signals_but_allows_confirmed_existing_cancellation(tmp_path, monkeypatch):
+    import screener.service as service
+
+    FakeTelegram.sent = []
+    monkeypatch.setattr(service, "TelegramClient", FakeTelegram)
+    row = _enriched()[0]
+    store = Store(tmp_path / "guarded-cancellation")
+    _activate_short(store, row)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    hour_open = (now_ms // 3_600_000) * 3_600_000 - 3_600_000
+    technical = {
+        "binance_symbol": "FILUSDT",
+        "last_closed_1h": {
+            "open_time_ms": hour_open,
+            "close_time_ms": hour_open + 3_599_999,
+            "open": 0.7660, "high": 0.7670, "low": 0.7655, "close": 0.7660,
+        },
+    }
+
+    outcomes = _collect_notifications(
+        [], [], _settings(), store, False, False,
+        contract_type="ALL_CONTRACTS",
+        technical_by_symbol={row.symbol: technical},
+    )
+
+    assert len(outcomes) == 1 and outcomes[0]["type"] == "cancellation"
+    assert FakeTelegram.sent[0][1] == ["chat-1"]
+    records = [
+        __import__("json").loads(line)
+        for line in store.notifications_path.read_text(encoding="utf-8").splitlines()
+    ]
+    cancellation = records[-1]
+    assert cancellation["event_state"] == "CANCELLED"
+    assert cancellation["contract_type"] == "PERPETUAL"
+    assert store.active_notification_states(recipient_keys=[_recipient_key()]) == []
+
+
+def test_legacy_active_without_saved_invalidation_can_be_upgraded_when_symbol_is_missing(tmp_path, monkeypatch):
+    import screener.service as service
+
+    FakeTelegram.sent = []
+    monkeypatch.setattr(service, "TelegramClient", FakeTelegram)
+    row = _enriched()[0]
+    store = Store(tmp_path / "legacy-missing-symbol")
+    group = f"{row.symbol}|SHORT D — Long Liquidation Cascade"
+    store.record_notification(
+        "legacy-short-event", 21, chat_id="chat-1", event_group=group,
+        fingerprint="legacy-short-fingerprint", event_state="ACTIVE",
+        pair="FILUSDT", scenario_code="SHORT D", contract_type="PERPETUAL",
+        delivery_status="SENT",
+    )
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    hour_open = (now_ms // 3_600_000) * 3_600_000 - 3_600_000
+    technical = {
+        "binance_symbol": "FILUSDT",
+        "weak_bounce_rejection": {"resistance": 0.7659},
+        "last_closed_1h": {
+            "open_time_ms": hour_open,
+            "close_time_ms": hour_open + 3_599_999,
+            "open": 0.7660, "high": 0.7670, "low": 0.7655, "close": 0.7660,
+        },
+    }
+
+    outcomes = _collect_notifications(
+        [], [], _settings(), store, True, False,
+        technical_by_symbol={row.symbol: technical},
+    )
+
+    assert len(outcomes) == 1 and outcomes[0]["type"] == "cancellation"
+    assert FakeTelegram.sent[0][1] == ["chat-1"]
+    assert store.active_notification_states(recipient_keys=[_recipient_key()]) == []

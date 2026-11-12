@@ -51,7 +51,33 @@ def test_workflow_queues_pending_runs_and_does_not_commit_per_run_journal():
 def test_repository_keeps_only_runtime_workflow_and_excludes_reference_docs():
     root = Path(__file__).parents[1]
     workflows = sorted((root / ".github/workflows").glob("*.yml"))
-    assert [path.name for path in workflows] == ["screener.yml"]
+    assert [path.name for path in workflows] == ["screener.yml", "tests.yml"]
     assert not (root / "P1_REFERENCE.txt").exists()
     assert not (root / "OPERATIONS.md").exists()
 
+
+
+def test_dedicated_ci_workflow_runs_full_tests_on_python_311():
+    root = Path(__file__).parents[1]
+    workflow = (root / ".github/workflows/tests.yml").read_text()
+    assert "push:" in workflow
+    assert "pull_request:" in workflow
+    assert 'python-version: "3.11"' in workflow
+    assert "python -m pip install -r requirements.txt" in workflow
+    assert "python -m compileall -q screener tests" in workflow
+    assert "python -m pytest -q" in workflow
+
+
+def test_runtime_requirements_are_exactly_pinned_in_one_file():
+    root = Path(__file__).parents[1]
+    requirements = (root / "requirements.txt").read_text().splitlines()
+    assert requirements == [
+        "beautifulsoup4==4.15.0",
+        "lxml==6.1.3",
+        "playwright==1.62.0",
+        "playwright-stealth==2.0.3",
+        "requests==2.34.2",
+        "pytest==8.4.2",
+    ]
+    assert not (root / "requirements-dev.txt").exists()
+    assert not (root / "constraints.txt").exists()

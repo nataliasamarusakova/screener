@@ -52,3 +52,12 @@ def test_settings_do_not_have_an_output_reports_directory(tmp_path, monkeypatch)
     monkeypatch.delenv("OUTPUT_DIR", raising=False)
     settings = load_settings(tmp_path)
     assert not hasattr(settings, "output_dir")
+
+
+def test_settings_read_optional_telegram_storage_hash_key(tmp_path, monkeypatch):
+    _set_required_secrets(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_STORAGE_HASH_KEY", "stable-hash-secret")
+
+    settings = load_settings(tmp_path)
+
+    assert settings.telegram_storage_hash_key == "stable-hash-secret"

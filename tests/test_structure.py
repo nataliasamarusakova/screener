@@ -53,3 +53,60 @@ def test_failed_breakout_rejection_returns_the_confirmation_candle_anchor():
 
     assert result["confirmed"] is True
     assert result["failure_open_time_ms"] == values[-1].open_time_ms
+
+
+def test_short_breakdown_retest_uses_same_old_level_as_structure_break(monkeypatch):
+    import screener.structure as structure
+
+    values = [
+        candle(0, 105, 103, 104),
+        candle(1, 103, 101, 102),
+        candle(2, 102, 100, 101),  # old confirmed support at 100
+        candle(3, 99, 94, 95),     # close breaks 100
+        candle(4, 97, 92, 94),
+        candle(5, 95, 90, 91),     # later lower swing low
+        candle(6, 96, 92, 94),
+        candle(7, 99, 95, 97),
+        candle(8, 98, 96, 97),     # newer pivot low at 96
+        candle(9, 101, 97, 99),    # retest of old 100 level
+        candle(10, 99, 96, 98),    # latest close remains below old level
+    ]
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([], [(2, 100.0), (5, 90.0), (8, 96.0)]))
+    monkeypatch.setattr(structure, "atr", lambda *_args, **_kwargs: 2.0)
+
+    retest = structure.breakout_and_retest(values, "SHORT", left=1, right=1, lookback=30, retest_lookback=8)
+    paired_break = structure.bearish_structure_break(
+        values, left=1, right=1, lookback=30, reference_level=retest.get("level")
+    )
+    invalidation = structure.scenario_invalidation("SHORT", "SHORT C — Long Squeeze", {
+        "trend_retest_short": retest,
+        "bearish_structure_break": paired_break,
+    })
+
+    assert retest["confirmed"] is True
+    assert retest["level"] == 100.0
+    assert retest["pivot_open_time_ms"] == values[2].open_time_ms
+    assert paired_break["confirmed"] is True
+    assert paired_break["level"] == 100.0
+    assert paired_break["pivot_open_time_ms"] == retest["pivot_open_time_ms"]
+    assert invalidation["level"] == 100.0
+
+
+def test_breakout_retest_is_not_confirmed_if_latest_close_loses_the_level(monkeypatch):
+    import screener.structure as structure
+
+    values = [
+        candle(0, 105, 103, 104),
+        candle(1, 103, 101, 102),
+        candle(2, 102, 100, 101),
+        candle(3, 99, 94, 95),
+        candle(4, 97, 92, 94),
+        candle(5, 101, 97, 99),  # retest initially holds below 100
+        candle(6, 102, 98, 101), # a later close reclaims the broken level
+    ]
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([], [(2, 100.0)]))
+    monkeypatch.setattr(structure, "atr", lambda *_args, **_kwargs: 2.0)
+
+    result = structure.breakout_and_retest(values, "SHORT", left=1, right=1, lookback=30, retest_lookback=8)
+
+    assert result["confirmed"] is False

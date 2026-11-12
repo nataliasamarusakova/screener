@@ -180,9 +180,18 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
     assert second["no_new_coinalyze_data"] is True
     assert second["snapshot_saved"] is False
     assert second["notifications"] == []
-    # Polling an identical table must not move the observation timestamp forward.
+    # Polling in the same UTC slot does not create a duplicate independent observation.
     latest_history = store.recent_symbol_history("ALT0USDT_PERP.A", limit=5)
     assert latest_history[-1]["snapshot_at"] == fixed_time.isoformat()
+
+    # The first identical poll in the next four-hour UTC slot is a distinct scheduled observation.
+    scraped.fetched_at = fixed_time + timedelta(hours=4)
+    third = service.run_scan_once(settings, dry_run=True)
+    assert third["no_new_coinalyze_data"] is True
+    assert third["snapshot_saved"] is True
+    latest_history = Store(settings.data_dir).recent_symbol_history("ALT0USDT_PERP.A", limit=5)
+    assert len(latest_history) == 2
+    assert latest_history[-1]["snapshot_at"] == (fixed_time + timedelta(hours=4)).isoformat()
 
 
 def test_price_oi_snapshot_classification_marks_overlapping_windows_preliminary(tmp_path):
@@ -605,15 +614,18 @@ def test_short_e_has_a_stable_notification_anchor_for_service_and_telegram():
 
 
 
-def test_telegram_request_errors_redact_bot_token_from_result_and_logs(monkeypatch, caplog):
+def test_telegram_request_errors_redact_bot_token_and_recipient_from_logs(monkeypatch, caplog):
     import logging
     import screener.telegram as telegram_module
     from screener.telegram import TelegramClient
 
     token = "123456:SECRET-BOT-TOKEN"
 
-    def failed_post(url, **_kwargs):
-        raise telegram_module.requests.ConnectionError(f"Connection failed for {url}: timed out")
+    def failed_post(url, **kwargs):
+        recipient = kwargs.get("json", {}).get("chat_id", "")
+        raise telegram_module.requests.ConnectionError(
+            f"Connection failed for recipient {recipient} at {url}: timed out"
+        )
 
     monkeypatch.setattr(telegram_module.requests, "post", failed_post)
     with caplog.at_level(logging.ERROR, logger="screener.telegram"):
@@ -622,4 +634,7 @@ def test_telegram_request_errors_redact_bot_token_from_result_and_logs(monkeypat
     assert result[0]["delivery_unknown"] is True
     assert token not in str(result)
     assert "[REDACTED]" in result[0]["error"]
+    assert token not in result[0]["error"]
+    assert "chat-1" not in result[0]["error"]
     assert token not in caplog.text
+    assert "chat-1" not in caplog.text

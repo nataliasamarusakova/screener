@@ -94,7 +94,7 @@ def test_short_e_requires_three_snapshots_and_actual_flow_turn_down():
     row = MarketRow(
         symbol="ALTUSDT_PERP", name="ALT", price=10, chg24_pct=-2,
         market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=100_000_000,
-        oi_chg24_pct=-1, oi_chg24_usd=-1_000_000, oi_chg4h_pct=0.2, oi_chg4h_usd=200_000,
+        oi_chg24_pct=-1, oi_chg24_usd=-1_000_000, oi_chg4h_pct=-0.2, oi_chg4h_usd=-200_000,
         oi_vol_ratio=0.5, oi_mktcap_ratio=0.1, vol_mktcap_ratio=0.2,
         fr_avg_pct=0.001, fr_oiw_pct=0.001, pfr_oiw_pct=0.001,
         liq_total24_usd=1_000_000, liq_long24_usd=400_000, liq_short24_usd=600_000,
@@ -102,7 +102,7 @@ def test_short_e_requires_three_snapshots_and_actual_flow_turn_down():
     )
     enriched, stats = analyze_universe([row], {"thresholds": {}})
     from datetime import datetime, timedelta, timezone
-    base_time = datetime(2026, 11, 9, 8, 0, tzinfo=timezone.utc)
+    base_time = datetime.now(timezone.utc) - timedelta(hours=8)
     values = [
         (2, 3, 300_000, 700_000, -3),
         (1, 2, 500_000, 500_000, -1),
@@ -115,12 +115,18 @@ def test_short_e_requires_three_snapshots_and_actual_flow_turn_down():
         for index, value in enumerate(values)
     ]
     technical = {"failed_breakout_rejection": {"confirmed": True}}
-    result = evaluate_scenarios(enriched[0], stats, {"thresholds": {}}, history=history, technical=technical)
+    result = evaluate_scenarios(
+        enriched[0], stats, {"thresholds": {}}, history=history, technical=technical,
+        as_of=base_time + timedelta(hours=8),
+    )
     short_e = next(item for item in result if item.scenario.startswith("SHORT E"))
     assert short_e.status == "CONFIRMED_SIGNAL"
     assert short_e.complete
 
-    result_without_3 = evaluate_scenarios(enriched[0], stats, {"thresholds": {}}, history=history[-2:], technical=technical)
+    result_without_3 = evaluate_scenarios(
+        enriched[0], stats, {"thresholds": {}}, history=history[-2:], technical=technical,
+        as_of=base_time + timedelta(hours=8),
+    )
     short_e_without_3 = next(item for item in result_without_3 if item.scenario.startswith("SHORT E"))
     assert short_e_without_3.status == "NOT_MET"
     assert short_e_without_3.checks[0].passed is False
@@ -204,20 +210,20 @@ def test_oi_growth_threshold_uses_exact_major_asset_codes_only():
         assert _oi_growth_min(symbol, thresholds) == 1.0
 
 
-def test_short_e_requires_three_independently_spaced_4h_snapshots():
+def test_short_e_accepts_symmetric_interval_tolerance_and_requires_fresh_history():
     from datetime import datetime, timedelta, timezone
 
     market = MarketRow(
         symbol="ALTUSDT_PERP", name="ALT", price=10, chg24_pct=-2,
         market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=100_000_000,
-        oi_chg24_pct=-1, oi_chg24_usd=-1_000_000, oi_chg4h_pct=0.2, oi_chg4h_usd=200_000,
+        oi_chg24_pct=-1, oi_chg24_usd=-1_000_000, oi_chg4h_pct=-0.2, oi_chg4h_usd=-200_000,
         oi_vol_ratio=0.5, oi_mktcap_ratio=0.1, vol_mktcap_ratio=0.2,
         fr_avg_pct=0.001, fr_oiw_pct=0.001, pfr_oiw_pct=0.001,
         liq_total24_usd=1_000_000, liq_long24_usd=400_000, liq_short24_usd=600_000,
         ls_ratio_1d=1.5, futures_imbalance_4h=-4, spot_imbalance_4h=-5,
     )
     enriched, stats = analyze_universe([market], {"thresholds": {}})
-    base = datetime(2026, 11, 9, 8, 0, tzinfo=timezone.utc)
+    base = datetime.now(timezone.utc) - timedelta(hours=7, minutes=48)
     values = [(2, 3, 300_000, 700_000, -3), (1, 2, 500_000, 500_000, -1), (-4, -5, 400_000, 600_000, -1)]
 
     def history_at(hours):
@@ -229,11 +235,100 @@ def test_short_e_requires_three_independently_spaced_4h_snapshots():
         ]
 
     tech = {"failed_breakout_rejection": {"confirmed": True}}
-    spaced = evaluate_scenarios(enriched[0], stats, {"thresholds": {}}, history=history_at((0, 4, 8)), technical=tech)
-    assert next(item for item in spaced if item.scenario.startswith("SHORT E")).status == "CONFIRMED_SIGNAL"
+    latest_at = base + timedelta(hours=7, minutes=48)
+    early_tolerance = evaluate_scenarios(
+        enriched[0], stats, {"thresholds": {}}, history=history_at((0, 3.9, 7.8)),
+        technical=tech, as_of=latest_at,
+    )
+    assert next(item for item in early_tolerance if item.scenario.startswith("SHORT E")).status == "CONFIRMED_SIGNAL"
 
-    overlapping = evaluate_scenarios(enriched[0], stats, {"thresholds": {}}, history=history_at((0, 3.9, 7.8)), technical=tech)
-    assert next(item for item in overlapping if item.scenario.startswith("SHORT E")).status == "NOT_MET"
+    too_early = evaluate_scenarios(
+        enriched[0], stats, {"thresholds": {}}, history=history_at((0, 3.8, 7.6)),
+        technical=tech, as_of=base + timedelta(hours=7, minutes=36),
+    )
+    assert next(item for item in too_early if item.scenario.startswith("SHORT E")).status == "NOT_MET"
 
-    late_gap = evaluate_scenarios(enriched[0], stats, {"thresholds": {}}, history=history_at((0, 4, 9)), technical=tech)
+    late_gap = evaluate_scenarios(
+        enriched[0], stats, {"thresholds": {}}, history=history_at((0, 4.2, 8.4)),
+        technical=tech, as_of=base + timedelta(hours=8, minutes=24),
+    )
     assert next(item for item in late_gap if item.scenario.startswith("SHORT E")).status == "NOT_MET"
+
+    stale = evaluate_scenarios(
+        enriched[0], stats, {"thresholds": {}},
+        history=history_at((0, 4, 8)), technical=tech, as_of=latest_at + timedelta(days=2),
+    )
+    assert next(item for item in stale if item.scenario.startswith("SHORT E")).status == "NOT_MET"
+
+
+def test_long_c_preparation_is_blocked_by_market_quality_flags():
+    row = MarketRow(
+        symbol="BTWUSDT_PERP", name="BTW", price=1.0, chg24_pct=0,
+        market_cap_usd=1_000_000_000, volume24_usd=100_000_000, oi_usd=23_700_000,
+        oi_chg24_pct=0, oi_chg24_usd=0, oi_chg4h_pct=0, oi_chg4h_usd=0,
+        oi_vol_ratio=1.0, oi_mktcap_ratio=0.0237, vol_mktcap_ratio=0.1,
+        fr_avg_pct=-0.01, fr_oiw_pct=-0.01, pfr_oiw_pct=-0.01,
+        liq_total24_usd=100_000, liq_long24_usd=50_000, liq_short24_usd=50_000,
+        ls_ratio_1d=0.8, futures_imbalance_4h=1.0, spot_imbalance_4h=None,
+    )
+    enriched, stats = analyze_universe([row], {"thresholds": {}})
+    result = evaluate_scenarios(enriched[0], stats, {"thresholds": {}})
+    long_c = next(item for item in result if item.scenario.startswith("LONG C"))
+
+    assert long_c.status == "BLOCKED_QUALITY"
+    assert long_c.status != "PREPARATION"
+    assert "SPOT_IMBALANCE_NA" in long_c.quality_flags
+    assert any(check.name == "Quality flags" and check.passed is False for check in long_c.checks)
+
+
+def test_opposed_oi_and_positive_flows_cap_long_b_at_observation():
+    from datetime import datetime, timedelta, timezone
+
+    rows = []
+    for index in range(75):
+        is_target = index == 0
+        rows.append(MarketRow(
+            symbol="TARGETUSDT_PERP" if is_target else f"ALT{index:02d}USDT_PERP",
+            name="TARGET" if is_target else f"ALT{index:02d}",
+            price=10, chg24_pct=1.0, market_cap_usd=1_000_000_000,
+            volume24_usd=100_000_000, oi_usd=100_000_000,
+            oi_chg24_pct=0, oi_chg24_usd=0,
+            oi_chg4h_pct=-1.0 if is_target else 0.0, oi_chg4h_usd=-1_000_000 if is_target else 0,
+            oi_vol_ratio=1.0, oi_mktcap_ratio=0.1, vol_mktcap_ratio=0.1,
+            fr_avg_pct=0.001, fr_oiw_pct=0.001, pfr_oiw_pct=0.001,
+            liq_total24_usd=100_000, liq_long24_usd=50_000, liq_short24_usd=50_000,
+            ls_ratio_1d=1.2, futures_imbalance_4h=1.0 if is_target else -1.0,
+            spot_imbalance_4h=20.0 if is_target else -1.0,
+        ))
+    enriched, stats = analyze_universe(rows, {"thresholds": {}})
+    target = next(item for item in enriched if item.symbol == "TARGETUSDT_PERP")
+    results = evaluate_scenarios(
+        target, stats, {"thresholds": {}},
+        technical={"spot_sequence_ok": True, "higher_low": {"confirmed": True}},
+        history=[],
+    )
+    long_b = next(item for item in results if item.scenario.startswith("LONG B"))
+
+    assert any("observation only" in note for note in target.diagnostic_notes)
+    assert long_b.status == "OBSERVATION"
+    assert "opposed" in long_b.reason.lower() and "observation only" in long_b.reason.lower()
+
+
+def test_zero_known_liquidations_mean_no_cascade_not_unknown():
+    row = MarketRow(
+        symbol="ZEROUSDT_PERP", name="ZERO", price=10, chg24_pct=-2,
+        market_cap_usd=1_000_000_000, volume24_usd=100_000_000, oi_usd=100_000_000,
+        oi_chg24_pct=-2, oi_chg24_usd=-2_000_000, oi_chg4h_pct=-0.5, oi_chg4h_usd=-500_000,
+        oi_vol_ratio=1.0, oi_mktcap_ratio=0.1, vol_mktcap_ratio=0.1,
+        fr_avg_pct=0.001, fr_oiw_pct=0.001, pfr_oiw_pct=0.001,
+        liq_total24_usd=0, liq_long24_usd=0, liq_short24_usd=0,
+        ls_ratio_1d=1.4, futures_imbalance_4h=-5.0, spot_imbalance_4h=-3.0,
+    )
+    enriched, stats = analyze_universe([row], {"thresholds": {}})
+    results = evaluate_scenarios(enriched[0], stats, {"thresholds": {}})
+    short_a = next(item for item in results if item.scenario.startswith("SHORT A"))
+    no_cascade = next(check for check in short_a.checks if check.name == "No cascade")
+
+    assert enriched[0].long_liq_share is None
+    assert no_cascade.passed is True
+
