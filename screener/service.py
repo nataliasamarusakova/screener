@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -31,6 +32,51 @@ from .telegram import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _recipient_storage_key(chat_id: str, settings: Settings) -> str | None:
+    """Create a stable, one-way pseudonym for a Telegram recipient.
+
+    Prefer a dedicated secret so rotating the bot token does not change the
+    storage identity. The bot token is a backward-compatible fallback.
+    """
+    secret = str(
+        getattr(settings, "telegram_storage_hash_key", "")
+        or getattr(settings, "telegram_bot_token", "")
+        or ""
+    )
+    if not secret:
+        return None
+    digest = hmac.new(secret.encode("utf-8"), str(chat_id).encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"hmac-sha256:{digest}"
+
+
+def _migrate_notification_recipients(store: Store, settings: Settings) -> int:
+    """Migrate raw legacy chat IDs before the notification store is queried."""
+    migrate = getattr(store, "migrate_notification_recipient_ids", None)
+    if not callable(migrate):
+        return 0
+    secret = str(
+        getattr(settings, "telegram_storage_hash_key", "")
+        or getattr(settings, "telegram_bot_token", "")
+        or ""
+    )
+    if not secret:
+        return 0
+    recipient_keys = [
+        key for chat_id in getattr(settings, "telegram_chat_ids", [])
+        if (key := _recipient_storage_key(str(chat_id), settings)) is not None
+    ]
+    migrated = migrate(lambda chat_id: _recipient_storage_key(chat_id, settings))
+    expanded = 0
+    expand_legacy = getattr(store, "migrate_redacted_broadcast_notifications", None)
+    if callable(expand_legacy):
+        expanded = expand_legacy(recipient_keys)
+    if migrated:
+        log.info("Migrated %d stored Telegram recipient identifier(s) to HMAC keys", migrated)
+    if expanded:
+        log.warning("Expanded %d redacted legacy notification state(s) across configured recipients", expanded)
+    return migrated + expanded
 
 
 def _ema(values: list[float], period: int) -> float | None:
@@ -105,7 +151,22 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
             candles1h, "SHORT", left=left, right=right, lookback=lookback,
             retest_lookback=retest_lookback, atr_tolerance=atr_tolerance,
         )
-        result["bearish_structure_break"] = bearish_structure_break(candles1h, left, right, lookback)
+        short_retest = result["trend_retest_short"]
+        short_reference_level = (
+            short_retest.get("level") if short_retest.get("confirmed") is True else None
+        )
+        short_reference_pivot_time = (
+            short_retest.get("pivot_open_time_ms") if short_retest.get("confirmed") is True else None
+        )
+        short_reference_break_time = (
+            short_retest.get("breakout_open_time_ms") if short_retest.get("confirmed") is True else None
+        )
+        result["bearish_structure_break"] = bearish_structure_break(
+            candles1h, left, right, lookback,
+            reference_level=short_reference_level,
+            reference_pivot_open_time_ms=short_reference_pivot_time,
+            reference_break_open_time_ms=short_reference_break_time,
+        )
         result["weak_bounce_rejection"] = weak_bounce_rejection(
             candles1h,
             left=left,
@@ -177,32 +238,38 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
 
 def _preliminary_candidate_symbols(
     enriched: list[EnrichedRow], stats: Any, settings: Settings, store: Store,
-    *, contract_type: str | None = None,
+    *, contract_type: str | None = None, as_of: datetime | None = None,
 ) -> set[str]:
     symbols: set[str] = set()
     # Continue monitoring 1H invalidation for every previously delivered active
     # setup, even after its Coinalyze table filters stop passing.
+    recipient_keys = [
+        key for chat_id in settings.telegram_chat_ids
+        if (key := _recipient_storage_key(str(chat_id), settings)) is not None
+    ]
     active_symbols = {
         str(item.get("event_group") or "").split("|", 1)[0]
-        for item in store.active_notification_states(
-            chat_ids=settings.telegram_chat_ids, contract_type=contract_type
-        )
+        for item in store.active_notification_states(recipient_keys=recipient_keys)
         if str(item.get("event_group") or "").split("|", 1)[0]
     }
+    # Active alerts remain chart candidates even when a coin disappears from
+    # the current Coinalyze universe. Absence from that table is not cancellation.
+    symbols.update(active_symbols)
     for row in enriched:
-        if row.symbol in active_symbols:
-            symbols.add(row.symbol)
-        history = store.recent_symbol_history(row.symbol, limit=100)
+        history = store.recent_symbol_history(row.symbol, limit=100, contract_type=contract_type)
         spot_sequence = store.spot_sequence_status(
             row.symbol,
             required=int(settings.p1.get("scenario", {}).get("spot_accumulation_required_snapshots", 3)),
             interval_hours=float(settings.p1.get("scenario", {}).get("snapshot_interval_hours", 4.0)),
             tolerance_minutes=int(settings.p1.get("scenario", {}).get("snapshot_interval_tolerance_minutes", 10)),
+            as_of=as_of,
+            contract_type=contract_type,
         )
         draft = evaluate_scenarios(
             row, stats, settings.p1,
             technical={"spot_sequence_ok": spot_sequence},
             history=history,
+            as_of=as_of,
         )
         if any(r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE"} for r in draft):
             symbols.add(row.symbol)
@@ -480,14 +547,25 @@ def _collect_notifications(
     *,
     fetched_at: datetime | None = None,
     contract_type: str = "PERPETUAL",
+    technical_by_symbol: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Deliver new confirmations in a batch; cancellations/reversals as standalone messages."""
     by_symbol = {row.symbol: row for row in rows}
+    technical_by_symbol = technical_by_symbol or {}
     telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_ids)
-    recipients = list(dict.fromkeys(str(item) for item in settings.telegram_chat_ids))
+    actual_recipients = list(dict.fromkeys(str(item) for item in settings.telegram_chat_ids))
+    recipient_to_chat = {
+        key: chat_id
+        for chat_id in actual_recipients
+        if (key := _recipient_storage_key(chat_id, settings)) is not None
+    }
+    recipients = list(recipient_to_chat)
+    _migrate_notification_recipients(store, settings)
     if not contract_alerts_allowed:
-        log.warning("Notification delivery blocked by contract/schema guard")
-        return [{"sent": False, "reason": "contract/schema guard"}]
+        log.warning(
+            "New confirmations and reversals blocked by contract/schema guard; "
+            "existing alerts will still be checked for confirmed 1H invalidation"
+        )
     if not recipients or dry_run or not telegram.configured:
         reason = "dry-run" if dry_run else "telegram not configured"
         log.info("Telegram lifecycle notifications skipped: %s", reason)
@@ -496,7 +574,7 @@ def _collect_notifications(
     results_by_group = {_notification_group(item): item for item in results}
     confirmed: dict[str, list[tuple[ScenarioResult, EnrichedRow, tuple[str, str, str, float]]]] = {}
     confirmed_opposite: dict[str, list[tuple[ScenarioResult, EnrichedRow, tuple[str, str, str, float]]]] = {}
-    for result in results:
+    for result in results if contract_alerts_allowed else []:
         row = by_symbol.get(result.symbol)
         if row is None or not _has_required_confirmation(result, row):
             continue
@@ -506,7 +584,7 @@ def _collect_notifications(
         confirmed.setdefault(result.symbol, []).append((result, row, identity))
         confirmed_opposite.setdefault(result.symbol, []).append((result, row, identity))
 
-    active_states = store.active_notification_states(chat_ids=recipients, contract_type=contract_type)
+    active_states = store.active_notification_states(recipient_keys=recipients)
     # Legacy v1.0.9 records did not have a direction or invalidation_level. Derive
     # those from the current scenario's chart only once, then persist the upgrade.
     normalized_active: list[dict[str, Any]] = []
@@ -515,19 +593,29 @@ def _collect_notifications(
         symbol, scenario, inferred_direction = _event_group_parts(group)
         direction = str(active.get("direction") or inferred_direction).upper()
         level = active.get("invalidation_level")
-        row = by_symbol.get(symbol)
         current_result = results_by_group.get(group)
-        if (not isinstance(level, (int, float)) or not math.isfinite(float(level))) and current_result is not None:
-            inferred = scenario_invalidation(current_result.direction, current_result.scenario, current_result.technical or {}).get("level")
+        chart_technical = (
+            current_result.technical or {}
+            if current_result is not None
+            else technical_by_symbol.get(symbol, {})
+        )
+        if not isinstance(level, (int, float)) or not math.isfinite(float(level)):
+            invalidation_scenario = current_result.scenario if current_result is not None else scenario
+            invalidation_direction = current_result.direction if current_result is not None else direction
+            inferred = scenario_invalidation(
+                invalidation_direction, invalidation_scenario, chart_technical
+            ).get("level")
             if isinstance(inferred, (int, float)) and math.isfinite(float(inferred)) and inferred > 0:
                 level = float(inferred)
                 migrated_key = f"MIGRATED|{active.get('event_key')}|{level:.12g}"
                 store.record_notification(
-                    migrated_key, active.get("telegram_message_id"), chat_id=str(active.get("chat_id")),
+                    migrated_key, active.get("telegram_message_id"),
+                    recipient_key=str(active.get("recipient_key") or active.get("chat_id")),
                     event_group=group, fingerprint=str(active.get("fingerprint") or "legacy"),
                     event_state="ACTIVE", direction=direction, invalidation_level=level,
-                    pair=str(active.get("pair") or (current_result.technical or {}).get("binance_symbol") or ""),
-                    scenario_code=_scenario_code(scenario), contract_type=contract_type,
+                    pair=str(active.get("pair") or chart_technical.get("binance_symbol") or symbol),
+                    scenario_code=_scenario_code(scenario),
+                    contract_type=str(active.get("contract_type") or contract_type),
                 )
                 active = {**active, "event_key": migrated_key, "invalidation_level": level, "direction": direction}
         if not active.get("direction") and direction:
@@ -583,7 +671,7 @@ def _collect_notifications(
                     store.record_notification(
                         f"{reversal_key}|RECOVER_OLD_STATE|{old_group}",
                         latest_old.get("telegram_message_id"),
-                        chat_id=chat_id, event_group=old_group,
+                        recipient_key=chat_id, event_group=old_group,
                         fingerprint=str(latest_old.get("fingerprint") or "legacy"),
                         event_state="REVERSED",
                         direction=str(latest_old.get("direction") or _event_group_parts(old_group)[2]),
@@ -597,7 +685,7 @@ def _collect_notifications(
             latest_new = store.latest_notification_state(new_group, chat_id)
             if latest_new is None or str(latest_new.get("event_state") or "").upper() != "ACTIVE":
                 store.record_notification(
-                    new_event_key, None, chat_id=chat_id,
+                    new_event_key, None, recipient_key=chat_id,
                     event_group=new_group, fingerprint=new_fingerprint,
                     event_state="ACTIVE", direction=new_direction,
                     invalidation_level=new_level, pair=str((new_result.technical or {}).get("binance_symbol") or symbol),
@@ -613,11 +701,11 @@ def _collect_notifications(
         message = format_reversal_message(
             pair, str(old_direction), old_scenario_label, new_direction, _scenario_code(new_result.scenario)
         )
-        delivery = _send_one(telegram, message, chat_id)
+        delivery = _send_one(telegram, message, recipient_to_chat[chat_id])
         if delivery.get("sent") or delivery.get("delivery_unknown"):
             delivery_status = "SENT" if delivery.get("sent") else "UNKNOWN"
             store.record_notification(
-                reversal_key, delivery.get("message_id"), chat_id=chat_id,
+                reversal_key, delivery.get("message_id"), recipient_key=chat_id,
                 event_group=f"REVERSAL|{symbol}|{old_direction}|{new_direction}",
                 fingerprint=new_fingerprint, event_state="SENT", direction=new_direction,
                 pair=pair, scenario_code=_scenario_code(new_result.scenario), contract_type=contract_type,
@@ -626,7 +714,7 @@ def _collect_notifications(
             for old in old_actives:
                 old_group = str(old.get("event_group") or "")
                 store.record_notification(
-                    f"{reversal_key}|OLD_STATE|{old_group}", delivery.get("message_id"), chat_id=chat_id,
+                    f"{reversal_key}|OLD_STATE|{old_group}", delivery.get("message_id"), recipient_key=chat_id,
                     event_group=old_group, fingerprint=str(old.get("fingerprint") or "legacy"),
                     event_state="REVERSED", direction=str(old_direction),
                     invalidation_level=float(old["invalidation_level"]) if isinstance(old.get("invalidation_level"), (int, float)) else None,
@@ -635,7 +723,7 @@ def _collect_notifications(
                 )
                 reversed_groups.add((old_group, chat_id))
             store.record_notification(
-                new_event_key, delivery.get("message_id"), chat_id=chat_id,
+                new_event_key, delivery.get("message_id"), recipient_key=chat_id,
                 event_group=new_group, fingerprint=new_fingerprint, event_state="ACTIVE",
                 direction=new_direction, invalidation_level=new_level, pair=pair,
                 scenario_code=_scenario_code(new_result.scenario), contract_type=contract_type,
@@ -652,9 +740,14 @@ def _collect_notifications(
         if not chat_id or (group, chat_id) in reversed_groups:
             continue
         current_result = results_by_group.get(group)
-        if current_result is None:
+        technical = (current_result.technical or {}) if current_result is not None else {}
+        if not technical.get("last_closed_1h"):
+            technical = technical_by_symbol.get(symbol, {})
+        last = technical.get("last_closed_1h") or {}
+        if not last:
+            # No current Coinalyze row is not proof of invalidation. Only a
+            # fresh closed Binance 1H candle crossing the persisted level can cancel.
             continue
-        last = (current_result.technical or {}).get("last_closed_1h") or {}
         close_time = last.get("close_time_ms")
         close_time = close_time if isinstance(close_time, int) else "unknown"
         invalidated, level, _ = _event_invalidated(last, active)
@@ -663,15 +756,16 @@ def _collect_notifications(
         cancel_key = f"CANCEL|{active.get('event_key')}|{close_time}"
         if store.notification_exists(cancel_key, chat_id):
             continue
-        pair = str(active.get("pair") or (current_result.technical or {}).get("binance_symbol") or symbol)
+        pair = str(active.get("pair") or technical.get("binance_symbol") or symbol)
         message = format_cancellation_message(pair, direction, _scenario_code(scenario), level)
-        delivery = _send_one(telegram, message, chat_id)
+        delivery = _send_one(telegram, message, recipient_to_chat[chat_id])
         if delivery.get("sent") or delivery.get("delivery_unknown"):
+            active_contract_type = str(active.get("contract_type") or contract_type).upper()
             store.record_notification(
-                cancel_key, delivery.get("message_id"), chat_id=chat_id,
+                cancel_key, delivery.get("message_id"), recipient_key=chat_id,
                 event_group=group, fingerprint=str(active.get("fingerprint") or "legacy"),
                 event_state="CANCELLED", direction=direction, invalidation_level=level,
-                pair=pair, scenario_code=_scenario_code(scenario), contract_type=contract_type,
+                pair=pair, scenario_code=_scenario_code(scenario), contract_type=active_contract_type,
                 delivery_status="SENT" if delivery.get("sent") else "UNKNOWN",
                 error=str(delivery.get("error") or "") or None,
             )
@@ -683,7 +777,7 @@ def _collect_notifications(
     # its trigger timestamp/metrics changed.
     active_groups_by_chat = {
         (str(item.get("event_group") or ""), str(item.get("chat_id") or ""))
-        for item in store.active_notification_states(chat_ids=recipients, contract_type=contract_type)
+        for item in store.active_notification_states(recipient_keys=recipients)
     }
     normal_by_chat: dict[str, list[tuple[ScenarioResult, EnrichedRow, tuple[str, str, str, float]]]] = {chat: [] for chat in recipients}
     for symbol, items in confirmed.items():
@@ -719,10 +813,10 @@ def _collect_notifications(
 
             # One call to sendMessage per signal. Do not combine messages,
             # prepend a batch heading, or place separator lines between signals.
-            delivery = _send_one(telegram, message, chat_id)
+            delivery = _send_one(telegram, message, recipient_to_chat[chat_id])
             if delivery.get("sent") or delivery.get("delivery_unknown"):
                 store.record_notification(
-                    event_key, delivery.get("message_id"), chat_id=chat_id,
+                    event_key, delivery.get("message_id"), recipient_key=chat_id,
                     event_group=group, fingerprint=fingerprint, event_state="ACTIVE",
                     direction=result.direction, invalidation_level=level,
                     pair=str((result.technical or {}).get("binance_symbol") or row.symbol),
@@ -741,6 +835,7 @@ def _collect_notifications(
 
 def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[str, Any]:
     store = Store(settings.data_dir)
+    _migrate_notification_recipients(store, settings)
     pruned = store.prune(snapshot_retention_days=30, run_retention_days=90, notification_retention_days=180)
     if any(pruned.values()):
         log.info("Persistent state pruned: %s", pruned)
@@ -764,6 +859,7 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             scrape.fetched_at,
             interval_hours=snapshot_interval_hours,
             tolerance_minutes=snapshot_tolerance_minutes,
+            contract_type=scrape.contract_type,
         ):
             store.add_snapshot(scrape.fetched_at, scrape.contract_type, scrape.rows)
             snapshot_saved = True
@@ -783,7 +879,7 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         if scrape.contract_type == "UNKNOWN":
             stats.warnings.append("Perpetual vs All Contracts could not be verified")
         candidate_symbols = _preliminary_candidate_symbols(
-            enriched, stats, settings, store, contract_type=scrape.contract_type
+            enriched, stats, settings, store, contract_type=scrape.contract_type, as_of=scrape.fetched_at
         )
         binance = BinanceClient(
             settings.binance_base_url,
@@ -798,34 +894,42 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
 
         results: list[ScenarioResult] = []
         for row in enriched:
-            # An identical table poll does not advance the saved observation time.
-            # Keep the original timestamp so it cannot masquerade as a new snapshot.
-            history = store.recent_symbol_history(row.symbol, limit=100)
+            # Use only durable observations for multi-snapshot patterns. An
+            # unchanged Coinalyze poll is deliberately not a new independent sample.
+            history = store.recent_symbol_history(row.symbol, limit=100, contract_type=scrape.contract_type)
             spot_sequence = store.spot_sequence_status(
                 row.symbol,
                 required=int(settings.p1.get("scenario", {}).get("spot_accumulation_required_snapshots", 3)),
                 interval_hours=float(settings.p1.get("scenario", {}).get("snapshot_interval_hours", 4.0)),
                 tolerance_minutes=int(settings.p1.get("scenario", {}).get("snapshot_interval_tolerance_minutes", 10)),
+                as_of=scrape.fetched_at,
+                contract_type=scrape.contract_type,
             )
             technical = {"spot_sequence_ok": spot_sequence, **technical_by_symbol.get(row.symbol, {})}
-            scenario_results = evaluate_scenarios(row, stats, settings.p1, technical=technical, history=history)
+            scenario_results = evaluate_scenarios(
+                row, stats, settings.p1, technical=technical, history=history, as_of=scrape.fetched_at
+            )
             for scenario_result in scenario_results:
                 # Preserve both global diagnostics (order book/context) and scenario-specific predicates.
                 scenario_result.technical = {**technical, **scenario_result.technical}
             results.extend(scenario_results)
 
         allowed, guard_reason = _can_send_alerts(scrape, settings)
-        if not allowed:
-            log.warning("Telegram alert guard: %s", guard_reason)
+        entry_allowed = allowed and not unchanged
+        if unchanged:
+            guard_reason = f"{guard_reason}; unchanged Coinalyze table: new position openings blocked"
+        if not entry_allowed:
+            log.warning("New position-entry notifications blocked: %s", guard_reason)
         notifications = _collect_notifications(
             results,
             enriched,
             settings,
             store,
-            allowed,
+            entry_allowed,
             use_dry_run,
             fetched_at=scrape.fetched_at,
             contract_type=scrape.contract_type,
+            technical_by_symbol=technical_by_symbol,
         )
         visible_results = [r for r in results if r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE", "OBSERVATION_AFTER_BOUNCE"}]
         store.finish_run(run_id, len(scrape.rows), len(visible_results), "OK")

@@ -184,34 +184,93 @@ class Store:
         return self._manifests_cache
 
     def _history_index(self) -> dict[str, list[dict[str, Any]]]:
+        """Return only snapshots whose manifest, row count and canonical hash agree.
+
+        A manifest is a commit marker, not proof that the committed rows remain
+        intact forever. Validate the complete snapshot before exposing any of its
+        rows to historical scenario rules.
+        """
         if self._history_cache is None:
-            committed = {
-                item["snapshot_id"]: item.get("fetched_at")
-                for item in self._snapshot_manifests() if item.get("snapshot_id")
-            }
-            index: dict[str, list[dict[str, Any]]] = {}
+            rows_by_snapshot: dict[str, list[dict[str, Any]]] = {}
+            invalid_snapshots: set[str] = set()
             for item in self._read_jsonl(self.market_rows_path):
-                snapshot_id = item.get("snapshot_id")
-                symbol = item.get("symbol")
-                data = item.get("data")
-                if snapshot_id not in committed or not symbol or not isinstance(data, dict):
+                if item.get("record_type") != "market_row":
                     continue
-                index.setdefault(str(symbol), []).append({
-                    **data,
-                    "snapshot_at": committed[snapshot_id],
-                })
+                snapshot_id = str(item.get("snapshot_id") or "")
+                symbol = str(item.get("symbol") or "")
+                data = item.get("data")
+                if not snapshot_id:
+                    continue
+                if not symbol or not isinstance(data, dict) or str(data.get("symbol") or "") != symbol:
+                    invalid_snapshots.add(snapshot_id)
+                    continue
+                rows_by_snapshot.setdefault(snapshot_id, []).append(item)
+
+            manifest_counts: dict[str, int] = {}
+            for manifest in self._snapshot_manifests():
+                snapshot_id = str(manifest.get("snapshot_id") or "")
+                if snapshot_id:
+                    manifest_counts[snapshot_id] = manifest_counts.get(snapshot_id, 0) + 1
+
+            index: dict[str, list[dict[str, Any]]] = {}
+            for manifest in self._snapshot_manifests():
+                snapshot_id = str(manifest.get("snapshot_id") or "")
+                if not snapshot_id:
+                    continue
+                if manifest_counts.get(snapshot_id) != 1 or snapshot_id in invalid_snapshots:
+                    log.error("Ignoring snapshot %s: missing/duplicate manifest or malformed row", snapshot_id)
+                    continue
+                contract_type = str(manifest.get("contract_type") or "").upper()
+                fetched_at = manifest.get("fetched_at")
+                expected_count = manifest.get("row_count")
+                expected_hash = str(manifest.get("snapshot_hash") or "")
+                try:
+                    datetime.fromisoformat(str(fetched_at))
+                    expected_count = int(expected_count)
+                except (TypeError, ValueError):
+                    expected_count = -1
+                snapshot_rows = rows_by_snapshot.get(snapshot_id, [])
+                symbols = [str(item.get("symbol") or "") for item in snapshot_rows]
+                row_data = [item["data"] for item in snapshot_rows]
+                valid = (
+                    bool(contract_type)
+                    and expected_count >= 0
+                    and len(snapshot_rows) == expected_count
+                    and len(set(symbols)) == len(symbols)
+                    and bool(expected_hash)
+                    and self._canonical_snapshot(contract_type, row_data) == expected_hash
+                )
+                if not valid:
+                    log.error(
+                        "Ignoring snapshot %s: integrity check failed (rows=%d expected=%s)",
+                        snapshot_id, len(snapshot_rows), expected_count,
+                    )
+                    continue
+                for item in snapshot_rows:
+                    symbol = str(item["symbol"])
+                    index.setdefault(symbol, []).append({
+                        **item["data"],
+                        "snapshot_at": fetched_at,
+                        "contract_type": contract_type,
+                    })
+
             for records in index.values():
                 records.sort(key=lambda row: str(row.get("snapshot_at", "")))
             self._history_cache = index
         return self._history_cache
 
     def snapshot_unchanged(self, contract_type: str, rows: list[MarketRow]) -> bool:
-        manifests = self._snapshot_manifests()
+        # Compare against the latest observation of this same contract universe.
+        # A more recent ALL_CONTRACTS snapshot must not make unchanged PERPETUAL
+        # data look new (or vice versa) and thereby bypass the entry freshness gate.
+        expected_contract = str(contract_type).upper()
+        manifests = [
+            item for item in self._snapshot_manifests()
+            if str(item.get("contract_type") or "").upper() == expected_contract
+        ]
         if not manifests:
             return False
         previous = manifests[-1]
-        if previous.get("contract_type") != contract_type:
-            return False
         return previous.get("snapshot_hash") == self._canonical_snapshot(contract_type, rows)
 
     def snapshot_due(
@@ -220,32 +279,43 @@ class Store:
         *,
         interval_hours: float = 4.0,
         tolerance_minutes: int = 10,
+        contract_type: str | None = None,
     ) -> bool:
-        """Persist at most one changed market snapshot per approximate P1 4H window.
+        """Return true only after a complete interval since the last snapshot.
 
-        The polling interval may be five minutes, but P1 explicitly says snapshots
-        closer than four hours are overlapping and are not independent observations.
-        The tolerance allows the first poll after the expected four-hour boundary.
+        Coinalyze 4H values are rolling windows. UTC-slot changes alone do not
+        make two observations independent: two polls on opposite sides of a
+        slot boundary can still be seconds apart. ``tolerance_minutes`` is kept
+        for call compatibility; it is used by sequence validation as a late
+        polling allowance, never as an early-save allowance.
         """
         manifests = self._snapshot_manifests()
+        normalized_contract = str(contract_type).upper() if contract_type else None
+        if normalized_contract:
+            manifests = [
+                item for item in manifests
+                if str(item.get("contract_type") or "").upper() == normalized_contract
+            ]
         if not manifests:
             return True
-        previous_value = manifests[-1].get("fetched_at")
         try:
-            previous_at = datetime.fromisoformat(str(previous_value))
+            interval_seconds = float(interval_hours) * 3600.0
+            if not math.isfinite(interval_seconds) or interval_seconds <= 0:
+                raise ValueError("interval_hours must be positive and finite")
+            previous_at = datetime.fromisoformat(str(manifests[-1].get("fetched_at")))
         except (TypeError, ValueError):
+            log.warning("Latest snapshot has invalid timestamp or interval; allowing a fresh snapshot")
             return True
-        current_at = fetched_at
-        if current_at.tzinfo is None:
-            current_at = current_at.replace(tzinfo=timezone.utc)
-        if previous_at.tzinfo is None:
-            previous_at = previous_at.replace(tzinfo=timezone.utc)
-        elapsed_seconds = (current_at.astimezone(timezone.utc) - previous_at.astimezone(timezone.utc)).total_seconds()
-        required_seconds = max(
-            0.0,
-            max(0.0, float(interval_hours)) * 3600.0 - max(0, int(tolerance_minutes)) * 60.0,
-        )
-        return elapsed_seconds >= required_seconds
+
+        current_at = fetched_at if fetched_at.tzinfo else fetched_at.replace(tzinfo=timezone.utc)
+        previous_at = previous_at if previous_at.tzinfo else previous_at.replace(tzinfo=timezone.utc)
+        current_ts = current_at.astimezone(timezone.utc).timestamp()
+        previous_ts = previous_at.astimezone(timezone.utc).timestamp()
+        if current_ts < previous_ts:
+            log.warning("Coinalyze fetched_at moved backwards; refusing to create an out-of-order snapshot")
+            return False
+        elapsed_seconds = current_ts - previous_ts
+        return elapsed_seconds >= interval_seconds
 
     def add_snapshot(self, fetched_at: datetime, contract_type: str, rows: list[MarketRow]) -> str:
         snapshot_id = uuid.uuid4().hex
@@ -274,80 +344,186 @@ class Store:
         self._history_cache = None
         return snapshot_id
 
-    def recent_symbol_history(self, symbol: str, limit: int = 24) -> list[dict[str, Any]]:
+    def recent_symbol_history(
+        self, symbol: str, limit: int = 24, *, contract_type: str | None = None
+    ) -> list[dict[str, Any]]:
         records = self._history_index().get(symbol, [])
+        if contract_type:
+            expected = str(contract_type).upper()
+            records = [row for row in records if str(row.get("contract_type") or "").upper() == expected]
         return records[-max(1, limit):]
 
     def spot_sequence_status(
-        self, symbol: str, required: int = 3, interval_hours: float = 4.0, tolerance_minutes: int = 10
+        self,
+        symbol: str,
+        required: int = 3,
+        interval_hours: float = 4.0,
+        tolerance_minutes: int = 10,
+        *,
+        as_of: datetime | None = None,
+        contract_type: str | None = None,
     ) -> bool | None:
-        """Find positive Spot readings spaced by distinct, committed 4H snapshots."""
-        history = self.recent_symbol_history(symbol, limit=max(100, required * 12))
+        """Evaluate the latest consecutive positive Spot observations only.
+
+        An older positive subsequence cannot survive a newer negative reading.
+        A missing, stale, out-of-order or poorly-spaced latest observation is
+        UNKNOWN (None), not evidence of accumulation.
+        """
+        if required < 1:
+            return None
+        history = self.recent_symbol_history(
+            symbol, limit=max(100, required * 12), contract_type=contract_type
+        )
         if len(history) < required:
             return None
-        target = timedelta(hours=interval_hours)
-        tolerance = timedelta(minutes=tolerance_minutes)
-        times: list[tuple[datetime, float | None]] = []
-        for item in history:
-            try:
-                ts = datetime.fromisoformat(item["snapshot_at"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            times.append((ts, item.get("spot_imbalance_4h")))
-        if len(times) < required:
-            return None
-        for end in range(len(times) - 1, required - 2, -1):
-            selected = [times[end]]
-            cursor = end
-            while len(selected) < required:
-                target_time = selected[-1][0] - target
-                options = [
-                    (idx, item) for idx, item in enumerate(times[:cursor])
-                    if abs(item[0] - target_time) <= tolerance
-                ]
-                if not options:
-                    break
-                idx, item = min(options, key=lambda pair: abs(pair[1][0] - target_time))
-                selected.append(item)
-                cursor = idx
-            if len(selected) == required:
-                return all(value is not None and value > 0 for _, value in selected)
-        return None
 
-    def _notification_records(self, event_key: str, chat_id: str | None = None) -> list[dict[str, Any]]:
+        target_seconds = float(interval_hours) * 3600.0
+        tolerance_seconds = max(0, int(tolerance_minutes)) * 60.0
+        if not math.isfinite(target_seconds) or target_seconds <= 0:
+            return None
+
+        selected = history[-required:]
+        parsed: list[tuple[datetime, float | None]] = []
+        for item in selected:
+            try:
+                timestamp = datetime.fromisoformat(str(item["snapshot_at"]))
+            except (KeyError, TypeError, ValueError):
+                return None
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            value = item.get("spot_imbalance_4h")
+            try:
+                number = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                number = None
+            if number is not None and not math.isfinite(number):
+                number = None
+            parsed.append((timestamp.astimezone(timezone.utc), number))
+
+        now = as_of or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        latest_at, latest_value = parsed[-1]
+        age_seconds = (now.astimezone(timezone.utc) - latest_at).total_seconds()
+        if age_seconds < -300 or age_seconds > target_seconds + tolerance_seconds:
+            return None
+        # A fresh, known non-positive latest reading terminates the sequence,
+        # regardless of whether older samples were positive.
+        if latest_value is not None and latest_value <= 0:
+            return False
+        if latest_value is None:
+            return None
+
+        for (earlier_at, _), (later_at, _) in zip(parsed, parsed[1:]):
+            gap = (later_at - earlier_at).total_seconds()
+            if not target_seconds <= gap <= target_seconds + tolerance_seconds:
+                return None
+        if any(value is None for _, value in parsed):
+            return None
+        return all(value is not None and value > 0 for _, value in parsed)
+
+    def migrate_notification_recipient_ids(self, key_function: Any) -> int:
+        """Replace legacy raw Telegram chat IDs with one-way recipient keys."""
+        records = list(self._read_jsonl(self.notifications_path))
+        migrated = 0
+        for item in records:
+            raw_chat = item.get("chat_id")
+            if raw_chat is None or item.get("recipient_key"):
+                continue
+            item["recipient_key"] = str(key_function(str(raw_chat)))
+            item.pop("chat_id", None)
+            migrated += 1
+        if migrated:
+            self._rewrite_jsonl(self.notifications_path, records)
+        return migrated
+
+    def migrate_redacted_broadcast_notifications(self, recipient_keys: list[str]) -> int:
+        """Assign explicitly redacted legacy broadcast rows to current recipients.
+
+        The packaged legacy state may have its original recipient removed for
+        privacy. On the first configured run, materialize one recipient-scoped
+        copy per current recipient, then remove the broadcast marker.
+        """
+        keys = list(dict.fromkeys(str(value) for value in recipient_keys if str(value)))
+        if not keys:
+            return 0
+        if len(keys) != 1:
+            log.warning(
+                "Cannot safely assign redacted legacy notification state to %d recipients; "
+                "configure the original recipient alone for the migration run",
+                len(keys),
+            )
+            return 0
+        records = list(self._read_jsonl(self.notifications_path))
+        migrated: list[dict[str, Any]] = []
+        expanded = 0
+        changed = False
+        for item in records:
+            if item.get("recipient_scope") != "LEGACY_REDACTED_BROADCAST":
+                migrated.append(item)
+                continue
+            changed = True
+            base = dict(item)
+            base.pop("recipient_scope", None)
+            base.pop("chat_id", None)
+            # A Telegram message ID is scoped to one private chat. The redacted
+            # legacy row cannot tell us which recipient owns that ID.
+            base.pop("telegram_message_id", None)
+            for key in keys:
+                copy = dict(base)
+                copy["recipient_key"] = key
+                migrated.append(copy)
+                expanded += 1
+        if changed:
+            self._rewrite_jsonl(self.notifications_path, migrated)
+        return expanded
+
+    def _notification_records(
+        self, event_key: str, chat_id: str | None = None, *, recipient_key: str | None = None
+    ) -> list[dict[str, Any]]:
         records = [
             item for item in self._read_jsonl(self.notifications_path)
             if item.get("event_key") == event_key
         ]
-        if chat_id is None:
+        recipient = recipient_key if recipient_key is not None else chat_id
+        if recipient is None:
             return records
-        recipient = str(chat_id)
-        # Pre-recipient records were only written after every configured recipient
-        # succeeded. Preserve them as successful broadcast records for all chats.
+        recipient = str(recipient)
+        # Rows without a recipient key are legacy broadcast records.
         return [
             item for item in records
-            if item.get("chat_id") is None or str(item.get("chat_id")) == recipient
+            if (item.get("recipient_key") is None and item.get("chat_id") is None)
+            or str(item.get("recipient_key") or item.get("chat_id")) == recipient
         ]
 
-    def notification_exists(self, event_key: str, chat_id: str | None = None) -> bool:
-        return bool(self._notification_records(event_key, chat_id))
+    def notification_exists(
+        self, event_key: str, chat_id: str | None = None, *, recipient_key: str | None = None
+    ) -> bool:
+        return bool(self._notification_records(event_key, chat_id, recipient_key=recipient_key))
 
-    def latest_notification_state(self, event_group: str, chat_id: str) -> dict[str, Any] | None:
-        """Return the latest successfully delivered scenario state for one recipient."""
-        recipient = str(chat_id)
+    def latest_notification_state(
+        self, event_group: str, chat_id: str | None = None, *, recipient_key: str | None = None
+    ) -> dict[str, Any] | None:
+        """Return the latest state for one recipient key (or legacy broadcast)."""
+        recipient = recipient_key if recipient_key is not None else chat_id
         matching = [
             item for item in self._read_jsonl(self.notifications_path)
             if item.get("event_group") == event_group
-            and str(item.get("chat_id")) == recipient
             and item.get("fingerprint")
+            and (
+                recipient is None
+                or (item.get("recipient_key") is None and item.get("chat_id") is None)
+                or str(item.get("recipient_key") or item.get("chat_id")) == str(recipient)
+            )
         ]
         return matching[-1] if matching else None
 
     def notification_due(
-        self, event_key: str, cooldown_hours: float, chat_id: str | None = None
+        self, event_key: str, cooldown_hours: float, chat_id: str | None = None,
+        *, recipient_key: str | None = None,
     ) -> bool:
         matching = [
-            item for item in self._notification_records(event_key, chat_id)
+            item for item in self._notification_records(event_key, chat_id, recipient_key=recipient_key)
             if item.get("sent_at")
         ]
         if not matching:
@@ -372,6 +548,7 @@ class Store:
         message_id: str | int | None = None,
         chat_id: str | None = None,
         *,
+        recipient_key: str | None = None,
         event_group: str | None = None,
         fingerprint: str | None = None,
         event_state: str | None = None,
@@ -385,9 +562,8 @@ class Store:
     ) -> None:
         """Append a delivery and optional lifecycle-state record.
 
-        A notification record is also the durable state transition. Cancellation
-        and reversal records therefore update the latest state for the original
-        scenario group without mutating older JSONL entries.
+        Production callers pass ``recipient_key`` (an HMAC pseudonym). ``chat_id``
+        remains only as a backwards-compatible input for old tests/migrations.
         """
         record: dict[str, Any] = {
             "record_type": "notification",
@@ -396,7 +572,9 @@ class Store:
             "telegram_message_id": str(message_id) if message_id is not None else None,
             "delivery_status": str(delivery_status).upper(),
         }
-        if chat_id is not None:
+        if recipient_key is not None:
+            record["recipient_key"] = str(recipient_key)
+        elif chat_id is not None:
             record["chat_id"] = str(chat_id)
         if event_group is not None:
             record["event_group"] = str(event_group)
@@ -422,33 +600,47 @@ class Store:
         self,
         *,
         chat_ids: list[str] | None = None,
+        recipient_keys: list[str] | None = None,
         contract_type: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return the latest active alert per scenario group and recipient.
+        """Return the latest active alert per scenario group and recipient key.
 
-        Rows written by older releases did not persist event_state. A legacy row
-        with an event_group and fingerprint is treated as ACTIVE so deployment
-        does not replay old alerts. Such rows may lack invalidation metadata; the
-        service will backfill it only from a currently available chart structure.
+        ``chat_ids`` is retained as a compatibility alias for stored recipient
+        keys. Legacy broadcast rows are expanded into the requested recipient set.
         """
-        allowed_chats = {str(value) for value in chat_ids} if chat_ids is not None else None
+        allowed = recipient_keys if recipient_keys is not None else chat_ids
+        allowed_recipients = {str(value) for value in allowed} if allowed is not None else None
         expected_contract = str(contract_type).upper() if contract_type else None
         latest_by_key: dict[tuple[str, str], dict[str, Any]] = {}
         for item in self._read_jsonl(self.notifications_path):
             group = str(item.get("event_group") or "")
             if not group or not item.get("fingerprint"):
                 continue
-            raw_chat = item.get("chat_id")
-            target_chats = sorted(allowed_chats) if allowed_chats is not None and raw_chat is None else [str(raw_chat or "")]
-            if allowed_chats is not None and raw_chat is not None and str(raw_chat) not in allowed_chats:
+            stored_recipient = item.get("recipient_key") or item.get("chat_id")
+            if item.get("recipient_scope") == "LEGACY_REDACTED_BROADCAST" and stored_recipient is None:
+                # The original recipient was intentionally removed from the
+                # public archive. Never broadcast its lifecycle to unrelated
+                # recipients; the migration method assigns it only when one
+                # unambiguous configured recipient is available.
+                log.warning(
+                    "Skipping legacy notification %s: recipient is redacted and cannot be mapped safely",
+                    item.get("event_key"),
+                )
+                continue
+            target_recipients = [str(stored_recipient or "")]
+            if allowed_recipients is not None and stored_recipient is not None and str(stored_recipient) not in allowed_recipients:
                 continue
             stored_contract = item.get("contract_type")
             if expected_contract and stored_contract and str(stored_contract).upper() != expected_contract:
                 continue
-            for chat_id in target_chats:
-                # Expand legacy broadcast records into recipient-scoped copies;
-                # lifecycle delivery needs the concrete chat_id for cancellation/reversal.
-                latest_by_key[(group, chat_id)] = {**item, "chat_id": chat_id}
+            for recipient in target_recipients:
+                latest_by_key[(group, recipient)] = {
+                    **item,
+                    "recipient_key": recipient,
+                    # Kept in the returned in-memory shape for lifecycle compatibility;
+                    # this field is never written back by production code.
+                    "chat_id": recipient,
+                }
 
         active: list[dict[str, Any]] = []
         for item in latest_by_key.values():
@@ -537,6 +729,21 @@ class Store:
             self._rewrite_jsonl(self.runs_path, kept_runs)
 
         notifications = list(self._read_jsonl(self.notifications_path))
+        # Keep the latest ACTIVE/UNKNOWN-or-SENT lifecycle row for every
+        # scenario-recipient pair even after the ordinary notification retention
+        # period. Otherwise pruning would silently forget a still-active signal.
+        latest_state: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in notifications:
+            group = str(item.get("event_group") or "")
+            if not group or not item.get("fingerprint"):
+                continue
+            recipient = str(item.get("recipient_key") or item.get("chat_id") or "")
+            latest_state[(group, recipient)] = item
+        protected_ids = {
+            id(item) for item in latest_state.values()
+            if str(item.get("event_state") or "ACTIVE").upper() == "ACTIVE"
+            and str(item.get("delivery_status") or "SENT").upper() in {"SENT", "UNKNOWN"}
+        }
         kept_notifications: list[dict[str, Any]] = []
         for item in notifications:
             try:
@@ -545,7 +752,7 @@ class Store:
                     timestamp = timestamp.replace(tzinfo=timezone.utc)
             except (KeyError, TypeError, ValueError):
                 continue
-            if timestamp >= notification_cutoff:
+            if timestamp >= notification_cutoff or id(item) in protected_ids:
                 kept_notifications.append(item)
         deleted_notifications = len(notifications) - len(kept_notifications)
         if deleted_notifications:

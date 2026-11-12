@@ -94,14 +94,15 @@ def _contract_symbol(symbol: str) -> str:
     return value or original
 
 
-def _safe_telegram_error(error: Any, token: str) -> str:
-    """Return a bounded diagnostic string without the Bot API credential."""
+def _safe_telegram_error(error: Any, token: str, recipient_id: str | None = None) -> str:
+    """Return a bounded diagnostic without the Bot API token or recipient ID."""
     message = str(error)
-    if token:
-        variants = {token, quote(token, safe="")}
-        for secret in sorted(variants, key=len, reverse=True):
-            if secret:
-                message = message.replace(secret, "[REDACTED]")
+    secrets = {token, quote(token, safe="")} if token else set()
+    if recipient_id and len(str(recipient_id)) >= 4:
+        secrets.update({str(recipient_id), quote(str(recipient_id), safe="")})
+    for secret in sorted(secrets, key=len, reverse=True):
+        if secret:
+            message = message.replace(secret, "[REDACTED]")
     return message[:500]
 
 
@@ -308,9 +309,9 @@ class TelegramClient:
                     # Telegram may have accepted a POST before the connection
                     # failed. A blind retry can duplicate a cancellation/reversal.
                     # The Bot API token is part of the URL and must never reach logs/JSONL.
-                    safe_error = _safe_telegram_error(exc, self.token)
+                    safe_error = _safe_telegram_error(exc, self.token, chat_id)
                     results.append({"chat_id": chat_id, "sent": False, "delivery_unknown": True, "error": safe_error})
-                    log.error("Telegram delivery outcome unknown for chat_id=%s: %s", chat_id, safe_error)
+                    log.error("Telegram delivery outcome unknown for a configured recipient: %s", safe_error)
                     break
 
                 if response.status_code == 429:
@@ -334,10 +335,10 @@ class TelegramClient:
                     response.raise_for_status()
                     payload = response.json()
                 except (requests.RequestException, ValueError) as exc:
-                    results.append({"chat_id": chat_id, "sent": False, "delivery_unknown": response.status_code < 400, "error": _safe_telegram_error(exc, self.token)})
+                    results.append({"chat_id": chat_id, "sent": False, "delivery_unknown": response.status_code < 400, "error": _safe_telegram_error(exc, self.token, chat_id)})
                     break
                 if not payload.get("ok"):
-                    results.append({"chat_id": chat_id, "sent": False, "delivery_unknown": False, "error": _safe_telegram_error(payload.get("description", "Telegram API returned ok=false"), self.token)})
+                    results.append({"chat_id": chat_id, "sent": False, "delivery_unknown": False, "error": _safe_telegram_error(payload.get("description", "Telegram API returned ok=false"), self.token, chat_id)})
                     break
                 results.append({"chat_id": chat_id, "sent": True, "delivery_unknown": False, "message_id": (payload.get("result") or {}).get("message_id")})
                 break

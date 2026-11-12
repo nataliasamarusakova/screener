@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from .metrics import EnrichedRow
@@ -58,6 +59,35 @@ def _oi_growth_min(symbol: str, thresholds: dict[str, Any]) -> float:
 
 
 def _result(row: EnrichedRow, scenario: str, direction: str, checks: list[Check], status: str = "NOT_MET", reason: str = "", technical: dict[str, Any] | None = None) -> ScenarioResult:
+    # The general opposed-flow diagnostic must not override a scenario's own
+    # explicit entry signature. In particular SHORT A requires rising OI 4H
+    # together with negative F and S; applying the generic sign comparison to
+    # that exact setup would make SHORT A impossible by construction.
+    oi_4h = row.market.oi_chg4h_pct
+    futures_flow = row.market.futures_imbalance_4h
+    spot_flow = row.market.spot_imbalance_4h
+    scenario_code = str(scenario or "").split(" — ", 1)[0].strip().upper()
+    short_a_native_signature = (
+        scenario_code == "SHORT A"
+        and oi_4h is not None and oi_4h > 0
+        and futures_flow is not None and futures_flow < 0
+        and spot_flow is not None and spot_flow < 0
+    )
+    flow_oi_observation_only = (
+        not short_a_native_signature
+        and oi_4h is not None
+        and futures_flow is not None
+        and spot_flow is not None
+        and (
+            (oi_4h > 0 and futures_flow < 0 and spot_flow < 0)
+            or (oi_4h < 0 and futures_flow > 0 and spot_flow > 0)
+        )
+    )
+    if flow_oi_observation_only and status not in {"NOT_MET", "BLOCKED_QUALITY", "BLOCKED_CAUSALITY", "OBSERVATION"}:
+        status = "OBSERVATION"
+        warning = "Opposed F/S flow and OI 4H direction: observation only; signal delivery is blocked."
+        reason = f"{reason}; {warning}" if reason else warning
+
     # A PFR OI_W sign reversal is qualitative in P1: retain it as a warning
     # only after the scenario's numeric and chart confirmation are complete.
     market = row.market
@@ -95,6 +125,12 @@ def _is_cascade(row: EnrichedRow) -> bool | None:
     of blocking shorts until a 1H bounce/rejection is established.
     """
     m = row.market
+    known_liquidations = m.liq_long24_usd is not None and m.liq_short24_usd is not None
+    if known_liquidations:
+        long_liqs = float(m.liq_long24_usd)
+        short_liqs = float(m.liq_short24_usd)
+        if all(map(lambda value: value >= 0, (long_liqs, short_liqs))) and long_liqs + short_liqs == 0:
+            return False
     required = [row.long_liq_share, m.oi_chg24_pct, m.oi_chg4h_pct]
     if any(v is None for v in required):
         return None
@@ -108,6 +144,7 @@ def evaluate_scenarios(
     *,
     technical: dict[str, Any] | None = None,
     history: list[dict[str, Any]] | None = None,
+    as_of: datetime | None = None,
 ) -> list[ScenarioResult]:
     m = row.market
     t = p1.get("thresholds", {})
@@ -179,8 +216,13 @@ def evaluate_scenarios(
         status, reason = "TRIGGER", "Both LONG C stages passed; chart still required for entry"
         visible_checks = trigger_checks
     elif all(c.passed is True for c in prep_checks):
-        status, reason = "PREPARATION", "Preparation stage passed (2/2); squeeze trigger is not confirmed"
-        visible_checks = prep_checks
+        quality_check = _check("Quality flags", no_flags, ", ".join(row.quality_flags) or "none", "none")
+        if no_flags:
+            status, reason = "PREPARATION", "Preparation stage passed (2/2); squeeze trigger is not confirmed"
+            visible_checks = prep_checks
+        else:
+            status, reason = "BLOCKED_QUALITY", "Preparation conditions pass, but market-quality flags prevent even a preparation candidate"
+            visible_checks = prep_checks + [quality_check]
     else:
         status, reason = "NOT_MET", ""
         visible_checks = trigger_checks
@@ -309,14 +351,14 @@ def evaluate_scenarios(
         status, reason = "NOT_MET", ""
     out.append(_result(row, "SHORT D — Long Liquidation Cascade", "SHORT", checks, status, reason, {"weak_bounce_rejection": technical.get("weak_bounce_rejection"), "liq_coverage_of_oi_drop_pct": row.liquidation_coverage_of_oi_drop_pct}))
 
-    # SHORT E — Failed Short Squeeze. Three distinct saved table snapshots are
-    # required to avoid treating one isolated comparison as a sequence.
+    # SHORT E — Failed Short Squeeze. Three distinct, recent saved table
+    # observations are required. The rolling 4H windows must not overlap, so
+    # tolerance only allows a late poll, never an early one.
     latest_three = history[-3:] if len(history) >= 3 else []
     interval_hours = max(0.0, float(s.get("snapshot_interval_hours", 4.0)))
     tolerance_seconds = max(0, int(s.get("snapshot_interval_tolerance_minutes", 10))) * 60.0
     history_times = []
     if len(latest_three) == 3:
-        from datetime import datetime, timezone
         for item in latest_three:
             try:
                 stamp = datetime.fromisoformat(str(item["snapshot_at"]))
@@ -331,12 +373,21 @@ def evaluate_scenarios(
         expected_seconds <= (later - earlier).total_seconds() <= expected_seconds + tolerance_seconds
         for earlier, later in zip(history_times, history_times[1:])
     )
-    initial = latest_three[0] if spacing_ok else None
-    previous = latest_three[1] if spacing_ok else None
-    history_ready = bool(spacing_ok)
+    reference_time = as_of or datetime.now(timezone.utc)
+    if reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
+    fresh_latest = False
+    if history_times:
+        latest_age = (reference_time.astimezone(timezone.utc) - history_times[-1]).total_seconds()
+        fresh_latest = -300.0 <= latest_age <= expected_seconds + tolerance_seconds
+    history_ready = bool(spacing_ok and fresh_latest)
+    initial = latest_three[0] if history_ready else None
+    previous = latest_three[1] if history_ready else None
+    current_snapshot = latest_three[2] if history_ready else None
     initial_short_dominant = None
     initial_oi_falling = None
     prior_flow_not_down = None
+    current_flow_down = None
     if initial:
         long_liqs = initial.get("liq_long24_usd")
         short_liqs = initial.get("liq_short24_usd")
@@ -347,14 +398,22 @@ def evaluate_scenarios(
         prev_f = previous.get("futures_imbalance_4h")
         prev_s = previous.get("spot_imbalance_4h")
         prior_flow_not_down = (prev_f >= 0 and prev_s >= 0) if prev_f is not None and prev_s is not None else None
+    if current_snapshot:
+        current_f = current_snapshot.get("futures_imbalance_4h")
+        current_s = current_snapshot.get("spot_imbalance_4h")
+        current_flow_down = (current_f < 0 and current_s < 0) if current_f is not None and current_s is not None else None
     failed_breakout = technical.get("failed_breakout_rejection", {}).get("confirmed")
-    current_flow_down = None if m.futures_imbalance_4h is None or m.spot_imbalance_4h is None else (m.futures_imbalance_4h < 0 and m.spot_imbalance_4h < 0)
+    live_flow_down = (
+        None if m.futures_imbalance_4h is None or m.spot_imbalance_4h is None
+        else (m.futures_imbalance_4h < 0 and m.spot_imbalance_4h < 0)
+    )
     flow_turned_down = None if prior_flow_not_down is None or current_flow_down is None else (prior_flow_not_down and current_flow_down)
     checks = [
-        _check("Three comparable 4H snapshots available", history_ready, f"latest 3 spacing valid={spacing_ok}", "three observations spaced 4h to 4h + configured grace"),
+        _check("Three fresh comparable 4H snapshots available", history_ready, f"latest 3 spacing valid={spacing_ok}; latest fresh={fresh_latest}", "three consecutive observations spaced 4h..4h + late-poll tolerance; latest age <= interval + tolerance"),
         _check("Earlier short liquidations dominated", initial_short_dominant, str(initial_short_dominant), "Snapshot t−2: Short Liqs > Long Liqs"),
         _check("Earlier OI was falling", initial_oi_falling, str(initial_oi_falling), "Snapshot t−2: OI Chg 24H < 0"),
-        _check("F/S turned down", flow_turned_down, f"previous F/S not both negative={prior_flow_not_down}; current F={m.futures_imbalance_4h}; S={m.spot_imbalance_4h}", "Snapshot t−1: F/S >= 0; current snapshot: F<0 and S<0"),
+        _check("F/S turned down", flow_turned_down, f"snapshot t−1 F/S not both negative={prior_flow_not_down}; snapshot t F={current_snapshot.get('futures_imbalance_4h') if current_snapshot else None}; S={current_snapshot.get('spot_imbalance_4h') if current_snapshot else None}", "Saved snapshot t−1: F/S >= 0; latest saved snapshot t: F<0 and S<0"),
+        _check("Current F/S remain down", live_flow_down, f"current F={m.futures_imbalance_4h}; S={m.spot_imbalance_4h}", "Current Coinalyze poll must still have F<0 and S<0"),
         _check("Breakout failed on 1H", failed_breakout, str(failed_breakout), "Recent high above swing high; latest 1H close back below"),
         _check("No liquidation-cascade prohibition", None if cascade is None else not cascade, str(cascade), "SHORT forbidden during active long-liquidation cascade"),
         _check("Quality flags", no_flags, ", ".join(row.quality_flags) or "none", "none"),

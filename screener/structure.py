@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from .models import Candle
@@ -66,79 +67,201 @@ def breakout_and_retest(
     retest_lookback: int = 8,
     atr_tolerance: float = 0.25,
 ) -> dict[str, Any]:
+    """Confirm a recent breakout, then a retest that has not been invalidated.
+
+    The state machine is important: after a valid retest, any later 1H close
+    back through the level invalidates that setup. A subsequent re-break must
+    produce a *new* retest; the old retest cannot become valid again merely
+    because price later returns to the breakout side.
+    """
     side = side.upper()
+    if side not in {"LONG", "SHORT"}:
+        return {"confirmed": False, "reason": f"Unsupported breakout side: {side}"}
     highs, lows = confirmed_pivots(candles, left, right, lookback)
     pivots = highs if side == "LONG" else lows
     if not pivots:
         return {"confirmed": False, "reason": f"No confirmed 1H swing {'high' if side == 'LONG' else 'low'}"}
-    reference_idx, reference_level = pivots[-1]
     volatility = atr(candles)
-    if volatility is None:
+    if volatility is None or not math.isfinite(volatility) or volatility <= 0:
         return {
             "confirmed": False,
-            "reason": "Insufficient candles to calculate ATR",
-            "level": reference_level,
-            "level_open_time_ms": candles[reference_idx].open_time_ms,
+            "reason": "Insufficient/invalid candles to calculate ATR",
+            "level": pivots[-1][1],
+            "level_open_time_ms": candles[pivots[-1][0]].open_time_ms,
             "invalidation_rule": "LONG: 1H close below level" if side == "LONG" else "SHORT: 1H close above level",
         }
-    tolerance = volatility * atr_tolerance
+
+    tolerance = volatility * max(0.0, float(atr_tolerance))
     last_index = len(candles) - 1
-    earliest_retest = max(0, last_index - retest_lookback + 1)
+    safe_retest_lookback = max(1, int(retest_lookback))
+    earliest_retest = max(0, last_index - safe_retest_lookback + 1)
+
+    def is_breakout_close(close: float, level: float) -> bool:
+        return close > level if side == "LONG" else close < level
+
+    def is_invalidation_close(close: float, level: float) -> bool:
+        return close < level if side == "LONG" else close > level
+
+    def retest_holds(candle: Candle, level: float) -> bool:
+        if side == "LONG":
+            touched = candle.low <= level + tolerance and candle.low >= level - 2 * tolerance
+            return touched and candle.close > level
+        touched = candle.high >= level - tolerance and candle.high <= level + 2 * tolerance
+        return touched and candle.close < level
 
     for pivot_idx, level in reversed(pivots):
-        breakout_indices: list[int] = []
-        for i in range(pivot_idx + 1, last_index + 1):
-            if side == "LONG" and candles[i].close > level:
-                breakout_indices.append(i)
-            elif side == "SHORT" and candles[i].close < level:
-                breakout_indices.append(i)
-        if not breakout_indices:
-            continue
-        breakout_idx = breakout_indices[0]
-        # Require a later closed candle to test the level and close back on the breakout side.
-        for i in range(max(breakout_idx + 1, earliest_retest), last_index + 1):
-            candle = candles[i]
-            if side == "LONG":
-                touched = candle.low <= level + tolerance and candle.low >= level - 2 * tolerance
-                held = candle.close > level
-            else:
-                touched = candle.high >= level - tolerance and candle.high <= level + 2 * tolerance
-                held = candle.close < level
-            if touched and held:
-                return {
-                    "confirmed": True,
-                    "reason": "Closed 1H breakout followed by a successful closed-candle retest",
-                    "side": side,
-                    "level": level,
-                    "atr14": volatility,
-                    "tolerance": tolerance,
-                    "breakout_open_time_ms": candles[breakout_idx].open_time_ms,
-                    "retest_open_time_ms": candle.open_time_ms,
-                    "last_close": candles[-1].close,
-                }
+        state = "WAIT_BREAKOUT"
+        breakout_idx: int | None = None
+        retest_idx: int | None = None
+
+        for index in range(pivot_idx + 1, len(candles)):
+            candle = candles[index]
+            close = candle.close
+            if state == "WAIT_BREAKOUT":
+                if is_breakout_close(close, level):
+                    state = "WAIT_RETEST"
+                    breakout_idx = index
+                    retest_idx = None
+                continue
+
+            if state == "WAIT_RETEST":
+                if is_invalidation_close(close, level):
+                    # The breakout failed before a retest. A later close back
+                    # through the level starts a new breakout attempt.
+                    state = "WAIT_BREAKOUT"
+                    breakout_idx = None
+                    retest_idx = None
+                    continue
+                if index > (breakout_idx if breakout_idx is not None else index) and retest_holds(candle, level):
+                    state = "VALID_RETEST"
+                    retest_idx = index
+                continue
+
+            # A valid retest remains valid only while every later closed 1H
+            # candle stays on the breakout side. A fresh touch can renew the
+            # retest anchor, but a close beyond the level resets the sequence.
+            if is_invalidation_close(close, level):
+                state = "WAIT_BREAKOUT"
+                breakout_idx = None
+                retest_idx = None
+            elif retest_holds(candle, level):
+                retest_idx = index
+
+        if state == "VALID_RETEST" and retest_idx is not None and retest_idx >= earliest_retest:
+            assert breakout_idx is not None
+            return {
+                "confirmed": True,
+                "reason": "Closed 1H breakout followed by a retest with no subsequent invalidating close",
+                "side": side,
+                "level": level,
+                "pivot_open_time_ms": candles[pivot_idx].open_time_ms,
+                "atr14": volatility,
+                "tolerance": tolerance,
+                "breakout_open_time_ms": candles[breakout_idx].open_time_ms,
+                "retest_open_time_ms": candles[retest_idx].open_time_ms,
+                "last_close": candles[-1].close,
+            }
+
     return {
         "confirmed": False,
-        "reason": "No 1H close + subsequent retest found in the recent window",
-        "level": reference_level,
-        "level_open_time_ms": candles[reference_idx].open_time_ms,
+        "reason": "No recent breakout with a subsequent retest that remained valid through the latest closed 1H candle",
+        "level": pivots[-1][1],
+        "level_open_time_ms": candles[pivots[-1][0]].open_time_ms,
         "atr14": volatility,
         "invalidation_rule": "LONG: 1H close below level" if side == "LONG" else "SHORT: 1H close above level",
     }
 
 
-def bearish_structure_break(candles: list[Candle], left: int = 2, right: int = 2, lookback: int = 60) -> dict[str, Any]:
+def bearish_structure_break(
+    candles: list[Candle],
+    left: int = 2,
+    right: int = 2,
+    lookback: int = 60,
+    *,
+    reference_level: float | None = None,
+    reference_pivot_open_time_ms: int | None = None,
+    reference_break_open_time_ms: int | None = None,
+) -> dict[str, Any]:
+    """Confirm a close below a selected confirmed swing low.
+
+    When ``reference_level`` is supplied by a confirmed short retest, use that
+    exact pivot rather than independently selecting the newest swing low. This
+    keeps breakout, retest, invalidation and structure confirmation aligned.
+    """
     _, lows = confirmed_pivots(candles, left, right, lookback)
     if not lows:
         return {"confirmed": False, "reason": "No confirmed 1H swing low"}
-    pivot_idx, level = lows[-1]
-    last = candles[-1]
-    confirmed = last.close < level and len(candles) - 1 > pivot_idx
+
+    if reference_pivot_open_time_ms is not None:
+        matching_by_time = [
+            (idx, price) for idx, price in lows
+            if candles[idx].open_time_ms == reference_pivot_open_time_ms
+        ]
+        if not matching_by_time:
+            return {
+                "confirmed": False,
+                "reason": "Short-retest reference pivot is not a confirmed swing low",
+                "level": reference_level,
+                "pivot_open_time_ms": reference_pivot_open_time_ms,
+            }
+        pivot_idx, level = matching_by_time[-1]
+        if reference_level is not None and not math.isclose(
+            float(reference_level), level, rel_tol=1e-9, abs_tol=1e-12
+        ):
+            return {
+                "confirmed": False,
+                "reason": "Short-retest pivot time and level do not match",
+                "level": level,
+                "pivot_open_time_ms": reference_pivot_open_time_ms,
+            }
+    elif reference_level is None:
+        pivot_idx, level = lows[-1]
+    else:
+        try:
+            level = float(reference_level)
+        except (TypeError, ValueError):
+            return {"confirmed": False, "reason": "Invalid short-retest reference level"}
+        if not math.isfinite(level):
+            return {"confirmed": False, "reason": "Invalid short-retest reference level"}
+        matching = [(idx, price) for idx, price in lows if math.isclose(price, level, rel_tol=1e-9, abs_tol=1e-12)]
+        if not matching:
+            return {
+                "confirmed": False,
+                "reason": "Short-retest reference level is not a confirmed swing low",
+                "level": level,
+            }
+        pivot_idx, level = matching[-1]
+
+    if len(candles) <= pivot_idx + 1:
+        return {
+            "confirmed": False,
+            "reason": "No closed candle after the reference swing low",
+            "level": level,
+            "last_close": candles[-1].close if candles else None,
+        }
+
+    break_indices = [idx for idx in range(pivot_idx + 1, len(candles)) if candles[idx].close < level]
+    if reference_break_open_time_ms is not None:
+        matching_breaks = [
+            idx for idx in break_indices
+            if candles[idx].open_time_ms == reference_break_open_time_ms
+        ]
+        selected_break_idx = matching_breaks[0] if matching_breaks else None
+    else:
+        selected_break_idx = break_indices[-1] if break_indices else None
+    latest_holds_break = candles[-1].close < level
+    confirmed = selected_break_idx is not None and latest_holds_break
     return {
         "confirmed": confirmed,
-        "reason": "Last closed 1H candle closed below the latest confirmed swing low" if confirmed else "Latest confirmed swing low has not been broken by a 1H close",
+        "reason": (
+            "A closed 1H candle broke the selected swing low and the latest close remains below it"
+            if confirmed
+            else "Selected swing low has not been broken and held by the latest 1H close"
+        ),
         "level": level,
-        "last_close": last.close,
-        "break_open_time_ms": last.open_time_ms if confirmed else None,
+        "pivot_open_time_ms": candles[pivot_idx].open_time_ms,
+        "last_close": candles[-1].close,
+        "break_open_time_ms": candles[selected_break_idx].open_time_ms if confirmed and selected_break_idx is not None else None,
     }
 
 

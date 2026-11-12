@@ -73,6 +73,7 @@ class Settings:
     log_level: str
     dry_run: bool
     p1: dict[str, Any]
+    telegram_storage_hash_key: str = ""
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -118,6 +119,7 @@ def load_settings(root: Path = ROOT) -> Settings:
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         dry_run=_bool_env("DRY_RUN", True),
         p1={section: values.copy() for section, values in strategy.items()},
+        telegram_storage_hash_key=os.getenv("TELEGRAM_STORAGE_HASH_KEY", "").strip(),
     )
 
     if not settings.coinalyze_url:
