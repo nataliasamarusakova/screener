@@ -210,7 +210,7 @@ def test_oi_growth_threshold_uses_exact_major_asset_codes_only():
         assert _oi_growth_min(symbol, thresholds) == 1.0
 
 
-def test_short_e_accepts_symmetric_interval_tolerance_and_requires_fresh_history():
+def test_short_e_requires_non_overlapping_4h_snapshots_and_fresh_history():
     from datetime import datetime, timedelta, timezone
 
     market = MarketRow(
@@ -240,7 +240,13 @@ def test_short_e_accepts_symmetric_interval_tolerance_and_requires_fresh_history
         enriched[0], stats, {"thresholds": {}}, history=history_at((0, 3.9, 7.8)),
         technical=tech, as_of=latest_at,
     )
-    assert next(item for item in early_tolerance if item.scenario.startswith("SHORT E")).status == "CONFIRMED_SIGNAL"
+    assert next(item for item in early_tolerance if item.scenario.startswith("SHORT E")).status == "NOT_MET"
+
+    independent_snapshots = evaluate_scenarios(
+        enriched[0], stats, {"thresholds": {}}, history=history_at((0, 4.0, 8.0)),
+        technical=tech, as_of=base + timedelta(hours=8),
+    )
+    assert next(item for item in independent_snapshots if item.scenario.startswith("SHORT E")).status == "CONFIRMED_SIGNAL"
 
     too_early = evaluate_scenarios(
         enriched[0], stats, {"thresholds": {}}, history=history_at((0, 3.8, 7.6)),

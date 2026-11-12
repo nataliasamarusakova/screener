@@ -246,3 +246,41 @@ def test_coin_name_uses_header_index_not_assumed_second_cell():
     rows, _, _, _ = parse_table(html)
     assert rows[0].name == "Bitcoin"
     assert rows[1].name == "Ethereum"
+
+
+def test_parser_rejects_negative_liquidation_amounts_without_dropping_market_row():
+    html = (
+        FIXTURE_HTML
+        .replace("$208.3m", "$-208.3m", 1)
+        .replace("$19.9m", "$-19.9m", 1)
+        .replace("$188.4m", "$-188.4m", 1)
+    )
+
+    rows, _, _, _ = parse_table(html)
+
+    assert len(rows) == 2
+    btc = rows[0]
+    assert btc.liq_total24_usd is None
+    assert btc.liq_short24_usd is None
+    assert btc.liq_long24_usd is None
+    assert set(btc.raw["invalid_market_fields"]) == {
+        "liq_total24_usd", "liq_short24_usd", "liq_long24_usd"
+    }
+
+
+def test_parser_rejects_imbalance_outside_physical_range():
+    html = (
+        FIXTURE_HTML
+        .replace("4.9580", "104.9580", 1)
+        .replace("9.5607", "-109.5607", 1)
+    )
+
+    rows, _, _, _ = parse_table(html)
+
+    assert len(rows) == 2
+    btc = rows[0]
+    assert btc.futures_imbalance_4h is None
+    assert btc.spot_imbalance_4h is None
+    assert set(btc.raw["invalid_market_fields"]) == {
+        "futures_imbalance_4h", "spot_imbalance_4h"
+    }

@@ -111,12 +111,12 @@ def test_notifications_and_run_events_are_appended_as_jsonl(tmp_path):
 
     store = Store(tmp_path / "data")
     run_id = store.start_run()
-    store.record_notification("BTC|LONG A|OBSERVATION", 123)
+    store.record_notification("BTC|LONG A|OBSERVATION", 123, recipient_key="recipient-a", contract_type="PERPETUAL")
     store.finish_run(run_id, row_count=1, result_count=1, status="OK")
 
     notifications = [json.loads(line) for line in store.notifications_path.read_text().splitlines()]
     runs = [json.loads(line) for line in store.runs_path.read_text().splitlines()]
-    assert store.notification_exists("BTC|LONG A|OBSERVATION")
+    assert store.notification_exists("BTC|LONG A|OBSERVATION", recipient_key="recipient-a", contract_type="PERPETUAL")
     assert len(notifications) == 1
     assert notifications[0]["telegram_message_id"] == "123"
     assert [record["record_type"] for record in runs] == ["run_started", "run_finished"]
@@ -125,13 +125,18 @@ def test_notifications_and_run_events_are_appended_as_jsonl(tmp_path):
 
 def test_malformed_jsonl_line_is_skipped_without_losing_following_records(tmp_path):
     store = Store(tmp_path / "data")
-    store._append_jsonl(store.notifications_path, {"event_key": "first", "sent_at": datetime.now(timezone.utc).isoformat()})
+    current_record = {
+        "record_type": "notification", "recipient_key": "recipient-a",
+        "contract_type": "PERPETUAL", "delivery_status": "SENT",
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+    }
+    store._append_jsonl(store.notifications_path, {**current_record, "event_key": "first"})
     with store.notifications_path.open("a", encoding="utf-8") as stream:
         stream.write("{this-is-not-json}\n")
-    store._append_jsonl(store.notifications_path, {"event_key": "last", "sent_at": datetime.now(timezone.utc).isoformat()})
+    store._append_jsonl(store.notifications_path, {**current_record, "event_key": "last"})
 
-    assert store.notification_exists("first")
-    assert store.notification_exists("last")
+    assert store.notification_exists("first", recipient_key="recipient-a", contract_type="PERPETUAL")
+    assert store.notification_exists("last", recipient_key="recipient-a", contract_type="PERPETUAL")
 
 
 
@@ -167,47 +172,42 @@ def test_prune_removes_orphan_rows_even_when_no_snapshot_expired(tmp_path):
     assert store.recent_symbol_history("BTCUSDT_PERP.A", limit=10)[0]["spot_imbalance_4h"] == 3.0
 
 
-def test_notification_delivery_state_is_per_recipient_and_legacy_rows_are_broadcast(tmp_path):
+def test_notification_delivery_state_is_isolated_per_recipient_and_contract(tmp_path):
     store = Store(tmp_path / "data")
     event = "XRP|SHORT D|WAIT_BOUNCE"
-    store.record_notification(event, 1001, chat_id="chat-a")
+    store.record_notification(event, 1001, recipient_key="recipient-a", contract_type="PERPETUAL")
 
-    assert store.notification_exists(event, "chat-a") is True
-    assert store.notification_exists(event, "chat-b") is False
-    assert store.notification_due(event, 4, "chat-a") is False
-    assert store.notification_due(event, 4, "chat-b") is True
-
-    legacy_event = "BTC|LONG A|OBSERVATION"
-    store.record_notification(legacy_event, 1002)
-    assert store.notification_exists(legacy_event, "chat-a") is True
-    assert store.notification_exists(legacy_event, "chat-b") is True
-    assert store.notification_due(legacy_event, 4, "chat-a") is False
-    assert store.notification_due(legacy_event, 4, "chat-b") is False
+    assert store.notification_exists(event, recipient_key="recipient-a", contract_type="PERPETUAL") is True
+    assert store.notification_exists(event, recipient_key="recipient-b", contract_type="PERPETUAL") is False
+    assert store.notification_exists(event, recipient_key="recipient-a", contract_type="INVERSE") is False
+    assert store.notification_due(event, 4, recipient_key="recipient-a", contract_type="PERPETUAL") is False
+    assert store.notification_due(event, 4, recipient_key="recipient-b", contract_type="PERPETUAL") is True
 
 
-def test_snapshot_due_uses_fixed_utc_four_hour_slots_and_is_idempotent(tmp_path):
+def test_snapshot_due_requires_full_rolling_interval_and_is_idempotent(tmp_path):
     base = datetime(2026, 11, 10, 4, 5, tzinfo=timezone.utc)
     store = Store(tmp_path / "sample-data")
     store.add_snapshot(base, "PERPETUAL", [_row()])
 
     assert store.snapshot_due(base + timedelta(minutes=30), interval_hours=4, tolerance_minutes=10) is False
-    next_slot = base + timedelta(hours=3, minutes=55)
-    assert store.snapshot_due(next_slot, interval_hours=4, tolerance_minutes=10) is True
-    store.add_snapshot(next_slot, "PERPETUAL", [_row()])
-    assert store.snapshot_due(next_slot + timedelta(minutes=5), interval_hours=4, tolerance_minutes=10) is False
-    assert store.snapshot_due(next_slot + timedelta(hours=4), interval_hours=4, tolerance_minutes=10) is True
+    assert store.snapshot_due(base + timedelta(hours=3, minutes=55), interval_hours=4, tolerance_minutes=10) is False
+    next_observation = base + timedelta(hours=4)
+    assert store.snapshot_due(next_observation, interval_hours=4, tolerance_minutes=10) is True
+    store.add_snapshot(next_observation, "PERPETUAL", [_row()])
+    assert store.snapshot_due(next_observation + timedelta(minutes=5), interval_hours=4, tolerance_minutes=10) is False
+    assert store.snapshot_due(next_observation + timedelta(hours=4), interval_hours=4, tolerance_minutes=10) is True
 
 
 def test_latest_notification_state_tracks_transition_per_recipient(tmp_path):
     store = Store(tmp_path / "data")
     group = "STRKUSDT_PERP.A|LONG A — Trend Continuation"
-    store.record_notification("event-A", 1, chat_id="chat-1", event_group=group, fingerprint="A")
-    assert store.latest_notification_state(group, "chat-1")["fingerprint"] == "A"
-    assert store.latest_notification_state(group, "chat-2") is None
-    store.record_notification("event-B", 2, chat_id="chat-1", event_group=group, fingerprint="B")
-    assert store.latest_notification_state(group, "chat-1")["fingerprint"] == "B"
-    store.record_notification("event-A-again", 3, chat_id="chat-1", event_group=group, fingerprint="A")
-    assert store.latest_notification_state(group, "chat-1")["fingerprint"] == "A"
+    store.record_notification("event-A", 1, recipient_key="recipient-a", contract_type="PERPETUAL", event_group=group, fingerprint="A", event_state="ACTIVE", direction="LONG", invalidation_level=70_000)
+    assert store.latest_notification_state(group, recipient_key="recipient-a", contract_type="PERPETUAL")["fingerprint"] == "A"
+    assert store.latest_notification_state(group, recipient_key="recipient-b", contract_type="PERPETUAL") is None
+    store.record_notification("event-B", 2, recipient_key="recipient-a", contract_type="PERPETUAL", event_group=group, fingerprint="B", event_state="ACTIVE", direction="LONG", invalidation_level=70_000)
+    assert store.latest_notification_state(group, recipient_key="recipient-a", contract_type="PERPETUAL")["fingerprint"] == "B"
+    store.record_notification("event-A-again", 3, recipient_key="recipient-a", contract_type="PERPETUAL", event_group=group, fingerprint="A", event_state="ACTIVE", direction="LONG", invalidation_level=70_000)
+    assert store.latest_notification_state(group, recipient_key="recipient-a", contract_type="PERPETUAL")["fingerprint"] == "A"
 
 
 def test_spot_sequence_requires_latest_samples_and_freshness(tmp_path):
@@ -250,10 +250,10 @@ def test_prune_preserves_old_active_notification_but_removes_old_cancelled(tmp_p
     old = (datetime.now(timezone.utc) - timedelta(days=181)).isoformat()
     active_group = "BTCUSDT_PERP.A|LONG A — Trend Continuation"
     cancelled_group = "ETHUSDT_PERP.A|LONG A — Trend Continuation"
-    store.record_notification("active-event", 1, chat_id="recipient-a", event_group=active_group,
+    store.record_notification("active-event", 1, recipient_key="recipient-a", contract_type="PERPETUAL", event_group=active_group,
         fingerprint="active", event_state="ACTIVE", direction="LONG", invalidation_level=10,
         pair="BTCUSDT", scenario_code="LONG A")
-    store.record_notification("cancelled-event", 2, chat_id="recipient-a", event_group=cancelled_group,
+    store.record_notification("cancelled-event", 2, recipient_key="recipient-a", contract_type="PERPETUAL", event_group=cancelled_group,
         fingerprint="cancelled", event_state="CANCELLED", direction="LONG", invalidation_level=10,
         pair="ETHUSDT", scenario_code="LONG A")
     records = [json.loads(line) for line in store.notifications_path.read_text(encoding="utf-8").splitlines()]
@@ -264,84 +264,206 @@ def test_prune_preserves_old_active_notification_but_removes_old_cancelled(tmp_p
     deleted = store.prune(notification_retention_days=180)
 
     assert deleted["notifications_deleted"] == 1
-    active = store.active_notification_states(chat_ids=["recipient-a"])
+    active = store.active_notification_states(recipient_keys=["recipient-a"])
     assert len(active) == 1
     assert active[0]["event_group"] == active_group
 
 
-def test_notification_recipient_migration_stores_hmac_not_raw_chat_id(tmp_path):
-    import json
-    import hmac
-    import hashlib
+def test_read_jsonl_skips_invalid_utf8_line_and_continues(tmp_path):
+    path = tmp_path / "notifications.jsonl"
+    path.write_bytes(b'{"id":1}\n{\"id\":\xff}\n{\"id\":2}\n')
 
-    store = Store(tmp_path / "recipient-migration")
-    store.record_notification("event", 123, chat_id="test-chat-id-12345", event_group="BTC|LONG A",
-        fingerprint="fingerprint", event_state="ACTIVE", direction="LONG")
-    secret = "stable-private-key"
-    migrated = store.migrate_notification_recipient_ids(
-        lambda chat_id: hmac.new(secret.encode(), chat_id.encode(), hashlib.sha256).hexdigest()
+    records = list(Store._read_jsonl(path))
+
+    assert records == [{"id": 1}, {"id": 2}]
+
+
+def test_notification_lookup_is_scoped_by_recipient_and_contract_type(tmp_path):
+    store = Store(tmp_path / "contract-scope")
+    group = "BTCUSDT_PERP.A|LONG A — Trend Continuation"
+    for contract_type, event_key in (("PERPETUAL", "perp-event"), ("INVERSE", "inverse-event")):
+        store.record_notification(
+            event_key, 1, recipient_key="recipient-a", event_group=group,
+            fingerprint=event_key, event_state="ACTIVE", direction="LONG",
+            invalidation_level=70_000, contract_type=contract_type, delivery_status="SENT",
+        )
+
+    assert store.notification_exists("perp-event", recipient_key="recipient-a", contract_type="PERPETUAL")
+    assert not store.notification_exists("inverse-event", recipient_key="recipient-a", contract_type="PERPETUAL")
+    assert store.latest_notification_state(group, recipient_key="recipient-a", contract_type="PERPETUAL")["contract_type"] == "PERPETUAL"
+    assert [item["contract_type"] for item in store.active_notification_states(
+        recipient_keys=["recipient-a"], contract_type="PERPETUAL"
+    )] == ["PERPETUAL"]
+
+
+
+
+def test_new_and_canceled_statuses_are_not_treated_as_active(tmp_path):
+    store = Store(tmp_path / "non-active-states")
+    group = "BTCUSDT_PERP.A|LONG A — Trend Continuation"
+    store.record_notification(
+        "active-event", 1, recipient_key="recipient-a", event_group=group,
+        fingerprint="active-fingerprint", event_state="ACTIVE", direction="LONG", invalidation_level=70_000,
+        contract_type="PERPETUAL", delivery_status="SENT",
     )
-
-    records = [json.loads(line) for line in store.notifications_path.read_text(encoding="utf-8").splitlines()]
-    assert migrated == 1
-    assert "chat_id" not in records[0]
-    assert records[0]["recipient_key"] == hmac.new(secret.encode(), b"test-chat-id-12345", hashlib.sha256).hexdigest()
-
-
-def test_packaged_legacy_notification_hides_recipient_and_expands_explicitly(tmp_path):
-    import json
-    from pathlib import Path
-
-    data_dir = Path(__file__).parents[1] / "data"
-    raw = (data_dir / "notifications.jsonl").read_text(encoding="utf-8")
-    assert '"chat_id"' not in raw
-    assert "LEGACY_REDACTED_BROADCAST" in raw
-    records = [json.loads(line) for line in raw.splitlines() if line.strip()]
-    assert records and all(item.get("recipient_scope") == "LEGACY_REDACTED_BROADCAST" for item in records)
-    assert all("telegram_message_id" not in item for item in records)
-
-    store = Store(tmp_path / "redacted-legacy-copy")
-    store.notifications_path.write_text(raw, encoding="utf-8")
-    # A redacted legacy recipient must never be broadcast to every configured
-    # chat. It remains unresolved until exactly one recipient is configured.
-    states = store.active_notification_states(recipient_keys=["recipient-a", "recipient-b"], contract_type="PERPETUAL")
-    assert states == []
-    store.notifications_path.write_text(raw, encoding="utf-8")
-    assert store.migrate_redacted_broadcast_notifications(["recipient-a", "recipient-b"]) == 0
-    assert store.migrate_redacted_broadcast_notifications(["recipient-a"]) == 1
-    states = store.active_notification_states(recipient_keys=["recipient-a"], contract_type="PERPETUAL")
-    assert len(states) == 1
-    assert states[0]["recipient_key"] == "recipient-a"
-
-
-def test_redacted_legacy_notification_is_materialized_per_recipient_once(tmp_path):
-    import json
-
-    store = Store(tmp_path / "redacted-legacy")
-    record = {
-        "record_type": "notification", "event_key": "legacy-event",
-        "event_group": "BTC|LONG A — Trend Continuation",
-        "fingerprint": "legacy-fingerprint", "event_state": "ACTIVE",
-        "delivery_status": "SENT", "contract_type": "PERPETUAL",
-        "recipient_scope": "LEGACY_REDACTED_BROADCAST",
-        "sent_at": datetime.now(timezone.utc).isoformat(),
-    }
-    store._append_jsonl(store.notifications_path, record)
+    store.record_notification(
+        "new-event", None, recipient_key="recipient-b", event_group=group,
+        fingerprint="new-fingerprint", event_state="NEW", direction="LONG",
+        contract_type="PERPETUAL", delivery_status="SENT",
+    )
+    store.record_notification(
+        "cancelled-event", 2, recipient_key="recipient-a", event_group=group,
+        fingerprint="active-fingerprint", event_state="CANCELED", direction="LONG",
+        invalidation_level=70_000, contract_type="PERPETUAL", delivery_status="SENT",
+    )
 
     assert store.active_notification_states(recipient_keys=["recipient-a", "recipient-b"]) == []
-    assert store.migrate_redacted_broadcast_notifications(["recipient-a", "recipient-b"]) == 0
-    assert store.migrate_redacted_broadcast_notifications(["recipient-a"]) == 1
-    assert store.migrate_redacted_broadcast_notifications(["recipient-a"]) == 0
-    records = [json.loads(line) for line in store.notifications_path.read_text(encoding="utf-8").splitlines()]
-    assert len(records) == 1
-    assert {item["recipient_key"] for item in records} == {"recipient-a"}
-    assert all("recipient_scope" not in item and "chat_id" not in item for item in records)
-    assert all("telegram_message_id" not in item for item in records)
 
-    store.record_notification(
-        "cancel-a", 2, recipient_key="recipient-a",
-        event_group=record["event_group"], fingerprint=record["fingerprint"],
-        event_state="CANCELLED", delivery_status="SENT",
+
+def test_active_notifications_keep_same_group_separate_across_contract_types(tmp_path):
+    store = Store(tmp_path / "active-contract-isolation")
+    group = "BTCUSDT_PERP.A|LONG A — Trend Continuation"
+    for contract_type, event_key in (("PERPETUAL", "perp-event"), ("INVERSE", "inverse-event")):
+        store.record_notification(
+            event_key, 1, recipient_key="recipient-a", event_group=group,
+            fingerprint=event_key, event_state="ACTIVE", direction="LONG",
+            invalidation_level=70_000, contract_type=contract_type, delivery_status="SENT",
+        )
+
+    all_active = store.active_notification_states(recipient_keys=["recipient-a"])
+    perpetual_active = store.active_notification_states(
+        recipient_keys=["recipient-a"], contract_type="PERPETUAL"
     )
-    active = store.active_notification_states(recipient_keys=["recipient-a", "recipient-b"])
+    inverse_active = store.active_notification_states(
+        recipient_keys=["recipient-a"], contract_type="INVERSE"
+    )
+
+    assert {item["event_key"] for item in all_active} == {"perp-event", "inverse-event"}
+    assert [item["event_key"] for item in perpetual_active] == ["perp-event"]
+    assert [item["event_key"] for item in inverse_active] == ["inverse-event"]
+
+
+def test_prune_preserves_active_notifications_per_contract_type(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    import json
+
+    store = Store(tmp_path / "prune-contract-isolation")
+    group = "BTCUSDT_PERP.A|LONG A — Trend Continuation"
+    old_sent_at = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+    for contract_type, event_key in (("PERPETUAL", "perp-event"), ("INVERSE", "inverse-event")):
+        store.record_notification(
+            event_key, 1, recipient_key="recipient-a", event_group=group,
+            fingerprint=event_key, event_state="ACTIVE", direction="LONG",
+            invalidation_level=70_000, contract_type=contract_type, delivery_status="SENT",
+        )
+    records = [json.loads(line) for line in store.notifications_path.read_text(encoding="utf-8").splitlines()]
+    for record in records:
+        record["sent_at"] = old_sent_at
+    store._rewrite_jsonl(store.notifications_path, records)
+
+    store.prune(notification_retention_days=180)
+
+    retained = list(Store._read_jsonl(store.notifications_path))
+    assert {item["event_key"] for item in retained} == {"perp-event", "inverse-event"}
+
+
+def test_prune_recognizes_cancellation_for_same_contract(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    import json
+
+    store = Store(tmp_path / "prune-current-transition")
+    group = "BTCUSDT_PERP.A|LONG A — Trend Continuation"
+    old_sent_at = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+    store.record_notification(
+        "active-event", 1, recipient_key="recipient-a", event_group=group,
+        fingerprint="active-fingerprint", event_state="ACTIVE", direction="LONG", invalidation_level=70_000,
+        contract_type="PERPETUAL", delivery_status="SENT",
+    )
+    store.record_notification(
+        "cancel-event", 2, recipient_key="recipient-a", contract_type="PERPETUAL", event_group=group,
+        fingerprint="active-fingerprint", event_state="CANCELLED", direction="LONG",
+        invalidation_level=70_000, delivery_status="SENT",
+    )
+    records = [json.loads(line) for line in store.notifications_path.read_text(encoding="utf-8").splitlines()]
+    for record in records:
+        record["sent_at"] = old_sent_at
+    store._rewrite_jsonl(store.notifications_path, records)
+
+    store.prune(notification_retention_days=180)
+
+    assert list(Store._read_jsonl(store.notifications_path)) == []
+
+
+def test_notification_record_requires_current_recipient_and_contract_scope(tmp_path):
+    import pytest
+
+    store = Store(tmp_path / "strict-notification-schema")
+    with pytest.raises(TypeError):
+        store.record_notification("event", 1, recipient_key="recipient-a")
+    with pytest.raises(TypeError):
+        store.record_notification("event", 1, contract_type="PERPETUAL")
+
+
+def test_active_notifications_ignore_records_without_current_schema_fields(tmp_path):
+    store = Store(tmp_path / "strict-active-schema")
+    group = "BTCUSDT_PERP.A|LONG A — Trend Continuation"
+    now = datetime.now(timezone.utc).isoformat()
+    store._append_jsonl(store.notifications_path, {
+        "record_type": "notification", "event_key": "untyped-event",
+        "recipient_key": "recipient-a", "event_group": group,
+        "fingerprint": "untyped", "event_state": "ACTIVE",
+        "direction": "LONG", "invalidation_level": 70_000,
+        "delivery_status": "SENT", "sent_at": now,
+    })
+    store._append_jsonl(store.notifications_path, {
+        "record_type": "notification", "event_key": "chat-id-event",
+        "chat_id": "recipient-a", "contract_type": "PERPETUAL",
+        "event_group": group, "fingerprint": "chat-id", "event_state": "ACTIVE",
+        "direction": "LONG", "invalidation_level": 70_000,
+        "delivery_status": "SENT", "sent_at": now,
+    })
+    store._append_jsonl(store.notifications_path, {
+        "record_type": "notification", "event_key": "incomplete-event",
+        "recipient_key": "recipient-a", "contract_type": "PERPETUAL",
+        "event_group": group, "fingerprint": "incomplete", "event_state": "ACTIVE",
+        "delivery_status": "SENT", "sent_at": now,
+    })
+
+    active = store.active_notification_states(recipient_keys=["recipient-a"])
+
     assert active == []
+    store.prune()
+    assert list(Store._read_jsonl(store.notifications_path)) == []
+
+
+def test_notification_storage_exposes_only_current_schema_api(tmp_path):
+    store = Store(tmp_path / "current-schema-api")
+
+    assert not any("migrate" in name for name in dir(store))
+
+    import inspect
+    assert "chat_ids" not in inspect.signature(store.active_notification_states).parameters
+    assert "chat_id" not in inspect.signature(store.record_notification).parameters
+
+
+def test_active_notification_write_rejects_incomplete_lifecycle_state(tmp_path):
+    import pytest
+
+    store = Store(tmp_path / "required-active-fields")
+    with pytest.raises(ValueError, match="event_group"):
+        store.record_notification(
+            "active-event", recipient_key="recipient-a", contract_type="PERPETUAL",
+            event_state="ACTIVE", direction="LONG", invalidation_level=70_000,
+        )
+    with pytest.raises(ValueError, match="invalidation_level"):
+        store.record_notification(
+            "active-event", recipient_key="recipient-a", contract_type="PERPETUAL",
+            event_group="BTCUSDT_PERP.A|LONG A", fingerprint="fingerprint",
+            event_state="ACTIVE", direction="LONG",
+        )
+    with pytest.raises(ValueError, match="direction"):
+        store.record_notification(
+            "active-event", recipient_key="recipient-a", contract_type="PERPETUAL",
+            event_group="BTCUSDT_PERP.A|LONG A", fingerprint="fingerprint",
+            event_state="ACTIVE", direction="UNKNOWN", invalidation_level=70_000,
+        )

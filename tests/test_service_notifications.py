@@ -184,11 +184,20 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
     latest_history = store.recent_symbol_history("ALT0USDT_PERP.A", limit=5)
     assert latest_history[-1]["snapshot_at"] == fixed_time.isoformat()
 
-    # The first identical poll in the next four-hour UTC slot is a distinct scheduled observation.
+    # A UTC-slot change does not make an identical rolling Coinalyze table a new observation.
     scraped.fetched_at = fixed_time + timedelta(hours=4)
     third = service.run_scan_once(settings, dry_run=True)
     assert third["no_new_coinalyze_data"] is True
-    assert third["snapshot_saved"] is True
+    assert third["snapshot_saved"] is False
+    latest_history = Store(settings.data_dir).recent_symbol_history("ALT0USDT_PERP.A", limit=5)
+    assert len(latest_history) == 1
+    assert latest_history[-1]["snapshot_at"] == fixed_time.isoformat()
+
+    # Changed data can become a new independent observation after a full rolling interval.
+    markets[0].price += 0.01
+    fourth = service.run_scan_once(settings, dry_run=True)
+    assert fourth["no_new_coinalyze_data"] is False
+    assert fourth["snapshot_saved"] is True
     latest_history = Store(settings.data_dir).recent_symbol_history("ALT0USDT_PERP.A", limit=5)
     assert len(latest_history) == 2
     assert latest_history[-1]["snapshot_at"] == (fixed_time + timedelta(hours=4)).isoformat()
@@ -476,11 +485,11 @@ def test_active_setup_is_not_repeated_when_chart_state_updates(tmp_path):
     assert _notification_identity(first) == _notification_identity(changed_metrics)
     store = Store(tmp_path / "state")
     group, event_key, fingerprint, level = _notification_identity(first)
-    store.record_notification(event_key, 1, chat_id="chat-1", event_group=group,
+    store.record_notification(event_key, 1, recipient_key="chat-1", contract_type="PERPETUAL", event_group=group,
         fingerprint=fingerprint, event_state="ACTIVE", direction="LONG",
         invalidation_level=level, pair="STRKUSDT", scenario_code="LONG A")
-    assert store.notification_exists(event_key, "chat-1")
-    assert len(store.active_notification_states(chat_ids=["chat-1"])) == 1
+    assert store.notification_exists(event_key, recipient_key="chat-1", contract_type="PERPETUAL")
+    assert len(store.active_notification_states(recipient_keys=["chat-1"])) == 1
 
 
 def test_technical_for_symbol_uses_closed_15m_and_derives_24h_low_from_closed_1h():
@@ -638,3 +647,76 @@ def test_telegram_request_errors_redact_bot_token_and_recipient_from_logs(monkey
     assert "chat-1" not in result[0]["error"]
     assert token not in caplog.text
     assert "chat-1" not in caplog.text
+
+
+def test_telegram_client_marks_non_rate_limit_4xx_as_permanent_failure(monkeypatch):
+    import screener.telegram as telegram_module
+    from screener.telegram import TelegramClient
+
+    class Response:
+        status_code = 400
+        headers = {}
+
+        def json(self):
+            return {"ok": False, "description": "Bad Request: chat not found"}
+
+        def raise_for_status(self):
+            raise telegram_module.requests.HTTPError("HTTP 400")
+
+    calls = []
+    monkeypatch.setattr(telegram_module.requests, "post", lambda *_args, **_kwargs: calls.append(1) or Response())
+
+    result = TelegramClient("token", ["chat-1"]).send("test message")
+
+    assert len(calls) == 1
+    assert result[0]["sent"] is False
+    assert result[0]["delivery_unknown"] is False
+    assert result[0]["permanent_failure"] is True
+
+
+def test_telegram_client_keeps_http_timeout_retryable(monkeypatch):
+    import screener.telegram as telegram_module
+    from screener.telegram import TelegramClient
+
+    class Response:
+        status_code = 408
+        headers = {}
+
+        def json(self):
+            return {"description": "Request Timeout"}
+
+        def raise_for_status(self):
+            raise telegram_module.requests.HTTPError("HTTP 408")
+
+    monkeypatch.setattr(telegram_module.requests, "post", lambda *_args, **_kwargs: Response())
+    result = TelegramClient("token", ["chat-1"]).send("test message")
+
+    assert result[0]["sent"] is False
+    assert result[0]["delivery_unknown"] is False
+    assert result[0].get("permanent_failure") is not True
+
+
+def test_telegram_client_keeps_api_server_error_retryable(monkeypatch):
+    import screener.telegram as telegram_module
+    from screener.telegram import TelegramClient
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def json(self):
+            return {
+                "ok": False,
+                "error_code": 500,
+                "description": "Internal Server Error",
+            }
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(telegram_module.requests, "post", lambda *_args, **_kwargs: Response())
+    result = TelegramClient("token", ["chat-1"]).send("test message")
+
+    assert result[0]["sent"] is False
+    assert result[0]["delivery_unknown"] is False
+    assert result[0].get("permanent_failure") is not True

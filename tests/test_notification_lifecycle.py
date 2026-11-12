@@ -117,7 +117,7 @@ def _enriched():
 def _activate_short(store: Store, row, *, level: float = 0.7659):
     group = f"{row.symbol}|SHORT D — Long Liquidation Cascade"
     store.record_notification(
-        "old-short-event", 11, chat_id="chat-1", event_group=group,
+        "old-short-event", 11, recipient_key=_recipient_key(), event_group=group,
         fingerprint="old-short-fingerprint", event_state="ACTIVE", direction="SHORT",
         invalidation_level=level, pair="FILUSDT", scenario_code="SHORT D",
         contract_type="PERPETUAL", delivery_status="SENT",
@@ -181,7 +181,7 @@ def test_long_scenario_is_cancelled_only_after_closed_1h_below_saved_support(tmp
     store = Store(tmp_path / "long-state")
     group = f"{row.symbol}|LONG A — Trend Continuation"
     store.record_notification(
-        "old-long-event", 10, chat_id="chat-1", event_group=group,
+        "old-long-event", 10, recipient_key=_recipient_key(), event_group=group,
         fingerprint="old-long", event_state="ACTIVE", direction="LONG",
         invalidation_level=0.7500, pair="FILUSDT", scenario_code="LONG A",
         contract_type="PERPETUAL", delivery_status="SENT",
@@ -385,7 +385,7 @@ def test_missing_symbol_without_fresh_binance_candle_is_not_auto_cancelled(tmp_p
 
 def test_active_symbol_absent_from_coinalyze_remains_a_chart_candidate(tmp_path):
     from screener.config import DEFAULT_P1_CONFIG
-    from screener.service import _migrate_notification_recipients, _preliminary_candidate_symbols
+    from screener.service import _preliminary_candidate_symbols
 
     row = _enriched()[0]
     store = Store(tmp_path / "active-candidate")
@@ -395,8 +395,6 @@ def test_active_symbol_absent_from_coinalyze_remains_a_chart_candidate(tmp_path)
         telegram_storage_hash_key="",
         p1=DEFAULT_P1_CONFIG,
     )
-    _migrate_notification_recipients(store, settings)
-
     candidates = _preliminary_candidate_symbols([], None, settings, store, contract_type="PERPETUAL")
 
     assert row.symbol in candidates
@@ -439,37 +437,190 @@ def test_contract_guard_blocks_new_signals_but_allows_confirmed_existing_cancell
     assert store.active_notification_states(recipient_keys=[_recipient_key()]) == []
 
 
-def test_legacy_active_without_saved_invalidation_can_be_upgraded_when_symbol_is_missing(tmp_path, monkeypatch):
+def test_permanent_failure_for_new_signal_is_recorded_and_not_retried(tmp_path, monkeypatch):
+    import screener.service as service
+    from screener.service import _notification_identity
+
+    class PermanentFailureTelegram(FakeTelegram):
+        calls = 0
+
+        def send(self, message, chat_ids=None):
+            type(self).calls += 1
+            return [{
+                "chat_id": (chat_ids or self.chat_ids)[0], "sent": False,
+                "delivery_unknown": False, "permanent_failure": True,
+                "error": "Telegram HTTP 403",
+            }]
+
+    monkeypatch.setattr(service, "TelegramClient", PermanentFailureTelegram)
+    PermanentFailureTelegram.calls = 0
+    rows = _enriched()
+    row = rows[0]
+    result = _confirmed_result(row, "LONG", "LONG A", level=0.7500, close=0.7700)
+    identity = _notification_identity(result)
+    assert identity is not None
+    store = Store(tmp_path / "terminal-send-failure")
+
+    first = _collect_notifications([result], rows, _settings(), store, True, False, contract_type="PERPETUAL")
+    second = _collect_notifications([result], rows, _settings(), store, True, False, contract_type="PERPETUAL")
+
+    assert len(first) == 1 and len(second) == 0
+    assert PermanentFailureTelegram.calls == 1
+    assert store.notification_exists(identity[1], recipient_key=_recipient_key(), contract_type="PERPETUAL")
+    assert store.active_notification_states(recipient_keys=[_recipient_key()], contract_type="PERPETUAL") == []
+
+
+def test_permanent_cancellation_failure_is_terminal_without_clearing_active_alert(tmp_path, monkeypatch):
+    import screener.service as service
+
+    class PermanentFailureTelegram(FakeTelegram):
+        calls = 0
+
+        def send(self, message, chat_ids=None):
+            type(self).calls += 1
+            return [{
+                "chat_id": (chat_ids or self.chat_ids)[0], "sent": False,
+                "delivery_unknown": False, "permanent_failure": True,
+                "error": "Telegram HTTP 403",
+            }]
+
+    monkeypatch.setattr(service, "TelegramClient", PermanentFailureTelegram)
+    PermanentFailureTelegram.calls = 0
+    rows = _enriched()
+    row = rows[0]
+    store = Store(tmp_path / "terminal-cancel-failure")
+    _activate_short(store, row)
+    cancelled = _waiting_short(row, last_close=0.7660)
+
+    first = _collect_notifications([cancelled], rows, _settings(), store, True, False, contract_type="PERPETUAL")
+    second = _collect_notifications([cancelled], rows, _settings(), store, True, False, contract_type="PERPETUAL")
+
+    assert first == [] and second == []
+    assert PermanentFailureTelegram.calls == 1
+    active = store.active_notification_states(recipient_keys=[_recipient_key()], contract_type="PERPETUAL")
+    assert len(active) == 1
+    assert active[0]["event_key"] == "old-short-event"
+
+
+def test_active_other_contract_does_not_suppress_current_contract_notification(tmp_path, monkeypatch):
+    import screener.service as service
+    from screener.service import _notification_identity
+
+    FakeTelegram.sent = []
+    monkeypatch.setattr(service, "TelegramClient", FakeTelegram)
+    rows = _enriched()
+    row = rows[0]
+    result = _confirmed_result(row, "LONG", "LONG A", level=0.7500, close=0.7700)
+    identity = _notification_identity(result)
+    assert identity is not None
+    group, event_key, fingerprint, level = identity
+    store = Store(tmp_path / "contract-isolated-alerts")
+    store.record_notification(
+        event_key, 11, recipient_key=_recipient_key(), event_group=group,
+        fingerprint=fingerprint, event_state="ACTIVE", direction="LONG",
+        invalidation_level=level, pair="FILUSDT", scenario_code="LONG A",
+        contract_type="INVERSE", delivery_status="SENT",
+    )
+
+    outcomes = _collect_notifications(
+        [result], rows, _settings(), store, True, False, contract_type="PERPETUAL"
+    )
+
+    assert len(FakeTelegram.sent) == 1
+    assert len(outcomes) == 1 and outcomes[0]["type"] == "confirmed_signal"
+    active = store.active_notification_states(
+        recipient_keys=[_recipient_key()], contract_type="PERPETUAL"
+    )
+    assert len(active) == 1 and active[0]["contract_type"] == "PERPETUAL"
+
+
+def test_permanent_reversal_failure_is_recorded_without_replacing_old_active_alert(tmp_path, monkeypatch):
+    import screener.service as service
+
+    class PermanentFailureTelegram(FakeTelegram):
+        calls = 0
+
+        def send(self, message, chat_ids=None):
+            type(self).calls += 1
+            return [{
+                "chat_id": (chat_ids or self.chat_ids)[0], "sent": False,
+                "delivery_unknown": False, "permanent_failure": True,
+                "error": "Telegram HTTP 403",
+            }]
+
+    monkeypatch.setattr(service, "TelegramClient", PermanentFailureTelegram)
+    PermanentFailureTelegram.calls = 0
+    rows = _enriched()
+    row = rows[0]
+    store = Store(tmp_path / "terminal-reversal-failure")
+    _activate_short(store, row)
+    new_long = _confirmed_result(row, "LONG", "LONG A", level=0.7500, close=0.7700)
+
+    first = _collect_notifications(
+        [new_long], rows, _settings(), store, True, False, contract_type="PERPETUAL"
+    )
+    second = _collect_notifications(
+        [new_long], rows, _settings(), store, True, False, contract_type="PERPETUAL"
+    )
+
+    assert len(first) == 1 and first[0]["type"] == "reversal" and not first[0]["sent"]
+    assert second == []
+    assert PermanentFailureTelegram.calls == 1
+    records = list(Store._read_jsonl(store.notifications_path))
+    assert any(
+        str(item.get("event_key", "")).startswith("FAILED|REVERSAL|")
+        and item.get("event_state") == "FAILED"
+        for item in records
+    )
+    active = store.active_notification_states(
+        recipient_keys=[_recipient_key()], contract_type="PERPETUAL"
+    )
+    assert len(active) == 1
+    assert active[0]["event_key"] == "old-short-event"
+
+
+def test_persisted_reversal_marker_recovers_partial_state_without_resending(tmp_path, monkeypatch):
     import screener.service as service
 
     FakeTelegram.sent = []
     monkeypatch.setattr(service, "TelegramClient", FakeTelegram)
-    row = _enriched()[0]
-    store = Store(tmp_path / "legacy-missing-symbol")
-    group = f"{row.symbol}|SHORT D — Long Liquidation Cascade"
+    rows = _enriched()
+    row = rows[0]
+    store = Store(tmp_path / "reversal-recovery")
+    old_group = _activate_short(store, row)
+    new_long = _confirmed_result(row, "LONG", "LONG A", level=0.7500, close=0.7700)
+    from screener.service import _notification_identity
+    identity = _notification_identity(new_long)
+    assert identity is not None
+    new_group, new_event_key, new_fingerprint, _ = identity
+    reversal_key = f"REVERSAL|{row.symbol}|SHORT|LONG|{new_event_key}"
+
+    # Simulate a crash after the Telegram reversal record was persisted, but
+    # before the old/new per-scenario lifecycle rows were appended.
     store.record_notification(
-        "legacy-short-event", 21, chat_id="chat-1", event_group=group,
-        fingerprint="legacy-short-fingerprint", event_state="ACTIVE",
-        pair="FILUSDT", scenario_code="SHORT D", contract_type="PERPETUAL",
+        reversal_key, 77, recipient_key=_recipient_key(),
+        event_group=f"REVERSAL|{row.symbol}|SHORT|LONG",
+        fingerprint=new_fingerprint, event_state="SENT", direction="LONG",
+        pair="FILUSDT", scenario_code="LONG A", contract_type="PERPETUAL",
         delivery_status="SENT",
     )
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    hour_open = (now_ms // 3_600_000) * 3_600_000 - 3_600_000
-    technical = {
-        "binance_symbol": "FILUSDT",
-        "weak_bounce_rejection": {"resistance": 0.7659},
-        "last_closed_1h": {
-            "open_time_ms": hour_open,
-            "close_time_ms": hour_open + 3_599_999,
-            "open": 0.7660, "high": 0.7670, "low": 0.7655, "close": 0.7660,
-        },
-    }
 
-    outcomes = _collect_notifications(
-        [], [], _settings(), store, True, False,
-        technical_by_symbol={row.symbol: technical},
+    first = _collect_notifications(
+        [new_long], rows, _settings(), store, True, False, contract_type="PERPETUAL"
+    )
+    second = _collect_notifications(
+        [new_long], rows, _settings(), store, True, False, contract_type="PERPETUAL"
     )
 
-    assert len(outcomes) == 1 and outcomes[0]["type"] == "cancellation"
-    assert FakeTelegram.sent[0][1] == ["chat-1"]
-    assert store.active_notification_states(recipient_keys=[_recipient_key()]) == []
+    assert first == [] and second == []
+    assert FakeTelegram.sent == []
+    assert store.latest_notification_state(
+        old_group, recipient_key=_recipient_key(), contract_type="PERPETUAL"
+    )["event_state"] == "REVERSED"
+    assert store.latest_notification_state(
+        new_group, recipient_key=_recipient_key(), contract_type="PERPETUAL"
+    )["event_state"] == "ACTIVE"
+    active = store.active_notification_states(
+        recipient_keys=[_recipient_key()], contract_type="PERPETUAL"
+    )
+    assert len(active) == 1 and active[0]["event_group"] == new_group
