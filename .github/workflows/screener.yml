@@ -251,7 +251,7 @@ jobs:
             rm -rf "$VPN_DIR"
           fi
 
-      - name: Persist JSONL history on the current branch
+      - name: Persist scanner state on the current branch
         if: always() && !cancelled()
         shell: bash
         run: |
@@ -270,10 +270,13 @@ jobs:
             git rm --cached -f data/runs.jsonl
           fi
           git add data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl
+          if [[ -f data/poll_state.json ]]; then
+            git add data/poll_state.json
+          fi
           if git diff --cached --quiet; then
-            echo "No JSONL state changes to commit"
+            echo "No scanner state changes to commit"
             exit 0
           fi
-          git commit -m "Persist screener JSONL history [skip ci]"
+          git commit -m "Persist screener state [skip ci]"
           git push origin "HEAD:${GITHUB_REF}"
-          echo "Persisted JSONL history on ${GITHUB_REF}"
+          echo "Persisted screener state on ${GITHUB_REF}"
