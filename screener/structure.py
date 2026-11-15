@@ -22,6 +22,8 @@ def confirmed_pivots(
     candles: list[Candle], left: int = 2, right: int = 2, lookback: int = 60
 ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
     """Return confirmed (index, price) swing highs/lows; right-side bars confirm a pivot."""
+    if left < 1 or right < 1:
+        raise ValueError("left and right pivot windows must both be >= 1")
     if len(candles) < left + right + 3:
         return [], []
     start = max(left, len(candles) - lookback)
@@ -46,10 +48,18 @@ def higher_low(candles: list[Candle], left: int = 2, right: int = 2, lookback: i
     if len(lows) < 2:
         return {"confirmed": False, "reason": "Need at least two confirmed 1H swing lows", "pivot_lows": [x[1] for x in lows]}
     previous, latest = lows[-2], lows[-1]
-    confirmed = latest[1] > previous[1]
+    later_closes = [candle.close for candle in candles[latest[0] + 1:]]
+    invalidated = any(close < latest[1] for close in later_closes)
+    confirmed = latest[1] > previous[1] and not invalidated
+    if invalidated:
+        reason = "Latest confirmed swing low was invalidated by a later 1H close"
+    elif confirmed:
+        reason = "Latest confirmed swing low is higher and remains unbroken"
+    else:
+        reason = "Latest confirmed swing low is not higher"
     return {
         "confirmed": confirmed,
-        "reason": "Latest confirmed swing low is higher" if confirmed else "Latest confirmed swing low is not higher",
+        "reason": reason,
         "previous_low": previous[1],
         "latest_low": latest[1],
         "previous_open_time_ms": candles[previous[0]].open_time_ms,
@@ -125,6 +135,15 @@ def breakout_and_retest(
                 continue
 
             if state == "WAIT_RETEST":
+                if breakout_idx is not None and index - breakout_idx > safe_retest_lookback:
+                    # An old breakout cannot wait indefinitely for a retest.
+                    # Re-arm only after price closes back through the level;
+                    # otherwise a sustained move beyond the level would be
+                    # misread as a fresh breakout on every later candle.
+                    state = "WAIT_BREAKOUT" if is_invalidation_close(close, level) else "WAIT_REARM"
+                    breakout_idx = None
+                    retest_idx = None
+                    continue
                 if is_invalidation_close(close, level):
                     # The breakout failed before a retest. A later close back
                     # through the level starts a new breakout attempt.
@@ -135,6 +154,11 @@ def breakout_and_retest(
                 if index > (breakout_idx if breakout_idx is not None else index) and retest_holds(candle, level):
                     state = "VALID_RETEST"
                     retest_idx = index
+                continue
+
+            if state == "WAIT_REARM":
+                if is_invalidation_close(close, level):
+                    state = "WAIT_BREAKOUT"
                 continue
 
             # A valid retest remains valid only while every later closed 1H
@@ -285,23 +309,32 @@ def weak_bounce_rejection(
         return {"confirmed": False, "reason": "Insufficient candles to calculate ATR", "candidate_resistance": latest[1]}
     tolerance = volatility * atr_tolerance
     resistance = latest[1]
-    for candle in candles[-3:]:
-        body = abs(candle.close - candle.open)
-        upper_wick = candle.high - max(candle.open, candle.close)
-        wick_ok = upper_wick >= max(body * wick_body_ratio, volatility * 0.05)
-        near_resistance = candle.high >= resistance - tolerance and candle.high <= resistance + 2 * tolerance
-        bearish_close = candle.close < candle.open and candle.close <= candle.low + (candle.high - candle.low) * 0.45
-        if wick_ok and near_resistance and bearish_close:
-            return {
-                "confirmed": True,
-                "reason": "Lower-high bounce rejected near resistance on a closed 1H candle",
-                "resistance": resistance,
-                "previous_swing_high": previous[1],
-                "latest_swing_high": latest[1],
-                "rejection_open_time_ms": candle.open_time_ms,
-                "atr14": volatility,
-            }
-    return {"confirmed": False, "reason": "No closed 1H rejection candle at the lower-high resistance"}
+    # Only the latest closed candle can confirm a fresh entry. A rejection
+    # from candles[-3] must not survive two subsequent candles that have
+    # already moved price materially away from resistance.
+    candle = candles[-1]
+    body = abs(candle.close - candle.open)
+    upper_wick = candle.high - max(candle.open, candle.close)
+    wick_ok = upper_wick >= max(body * wick_body_ratio, volatility * 0.05)
+    near_resistance = candle.high >= resistance - tolerance and candle.high <= resistance + 2 * tolerance
+    candle_range = candle.high - candle.low
+    bearish_close = (
+        candle.close < candle.open
+        and candle.close < resistance
+        and candle_range > 0
+        and candle.close <= candle.low + candle_range * 0.45
+    )
+    if wick_ok and near_resistance and bearish_close:
+        return {
+            "confirmed": True,
+            "reason": "Latest closed 1H candle rejected the lower-high resistance",
+            "resistance": resistance,
+            "previous_swing_high": previous[1],
+            "latest_swing_high": latest[1],
+            "rejection_open_time_ms": candle.open_time_ms,
+            "atr14": volatility,
+        }
+    return {"confirmed": False, "reason": "Latest closed 1H candle did not reject the lower-high resistance"}
 
 
 def rising_1h(candles: list[Candle]) -> bool | None:
@@ -316,12 +349,13 @@ def failed_breakout_rejection(candles: list[Candle], left: int = 2, right: int =
     if not highs or len(candles) < 2:
         return {"confirmed": False, "reason": "No confirmed 1H swing high or insufficient candles"}
     last = candles[-1]
-    for pivot_idx, level in reversed(highs):
-        recent = candles[max(pivot_idx + 1, len(candles) - 8):]
-        ran_above = any(c.high > level for c in recent)
-        if ran_above and last.close < level:
-            return {"confirmed": True, "reason": "Price traded above a prior 1H swing high but the latest close is back below it", "failed_level": level, "last_close": last.close, "failure_open_time_ms": last.open_time_ms}
-    return {"confirmed": False, "reason": "No recent failed upside breakout detected"}
+    for _pivot_idx, level in reversed(highs):
+        # The sweep/rejection must occur on the latest closed 1H candle.
+        # A high from several bars ago cannot keep this trigger alive while
+        # price continues drifting lower.
+        if last.high > level and last.close < level:
+            return {"confirmed": True, "reason": "Latest closed 1H candle swept a prior swing high and closed back below it", "failed_level": level, "last_close": last.close, "failure_open_time_ms": last.open_time_ms}
+    return {"confirmed": False, "reason": "Latest closed 1H candle did not reject a prior swing high"}
 
 
 def scenario_invalidation(direction: str, scenario: str, technical: dict[str, Any]) -> dict[str, Any]:

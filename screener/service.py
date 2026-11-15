@@ -229,6 +229,8 @@ def _preliminary_candidate_symbols(
     symbols.update(active_symbols)
     for row in enriched:
         history = store.recent_symbol_history(row.symbol, limit=100, contract_type=contract_type)
+        if contract_type and not store.symbol_history_is_current(row.symbol, contract_type=contract_type):
+            history = []
         spot_sequence = store.spot_sequence_status(
             row.symbol,
             required=int(settings.p1.get("scenario", {}).get("spot_accumulation_required_snapshots", 3)),
@@ -437,17 +439,36 @@ def _has_required_confirmation(result: ScenarioResult, row: EnrichedRow) -> bool
     context = technical.get("context_4h") or {}
     close_4h = context.get("last_close")
     close_4h_ms = context.get("last_close_time_ms")
-    if not isinstance(close_4h, (int, float)) or not isinstance(close_4h_ms, int):
+    if (
+        not isinstance(close_4h, (int, float))
+        or isinstance(close_4h, bool)
+        or not math.isfinite(float(close_4h))
+        or float(close_4h) <= 0
+        or not isinstance(close_4h_ms, int)
+        or isinstance(close_4h_ms, bool)
+    ):
         return False
     if close_4h_ms > now_ms + 5_000 or now_ms - close_4h_ms > 4 * 60 * 60_000 + 15 * 60_000:
         return False
     if result.direction.upper() == "LONG":
         support = context.get("last_confirmed_support")
-        if not isinstance(support, (int, float)) or close_4h < support:
+        if (
+            not isinstance(support, (int, float))
+            or isinstance(support, bool)
+            or not math.isfinite(float(support))
+            or float(support) <= 0
+            or float(close_4h) < float(support)
+        ):
             return False
     else:
         resistance = context.get("last_confirmed_resistance")
-        if not isinstance(resistance, (int, float)) or close_4h > resistance:
+        if (
+            not isinstance(resistance, (int, float))
+            or isinstance(resistance, bool)
+            or not math.isfinite(float(resistance))
+            or float(resistance) <= 0
+            or float(close_4h) > float(resistance)
+        ):
             return False
     return True
 
@@ -835,7 +856,13 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             headless=settings.coinalyze_headless,
             timeout_ms=settings.coinalyze_timeout_ms,
         )
-        unchanged = store.snapshot_unchanged(scrape.contract_type, scrape.rows)
+        # Dry runs retain the legacy 4H duplicate-snapshot check but never
+        # mutate the new last-successful-live-poll marker.
+        unchanged = (
+            store.snapshot_unchanged(scrape.contract_type, scrape.rows)
+            if use_dry_run
+            else store.poll_unchanged(scrape.contract_type, scrape.rows)
+        )
         snapshot_cfg = settings.p1.get("scenario", {})
         snapshot_interval_hours = float(snapshot_cfg.get("snapshot_interval_hours", 4.0))
         snapshot_tolerance_minutes = int(snapshot_cfg.get("snapshot_interval_tolerance_minutes", 10))
@@ -882,6 +909,8 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             # Use only durable observations for multi-snapshot patterns. An
             # unchanged Coinalyze poll is deliberately not a new independent sample.
             history = store.recent_symbol_history(row.symbol, limit=100, contract_type=scrape.contract_type)
+            if not store.symbol_history_is_current(row.symbol, contract_type=scrape.contract_type):
+                history = []
             spot_sequence = store.spot_sequence_status(
                 row.symbol,
                 required=int(settings.p1.get("scenario", {}).get("spot_accumulation_required_snapshots", 3)),
@@ -918,6 +947,14 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         )
         visible_results = [r for r in results if r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE", "OBSERVATION_AFTER_BOUNCE"}]
         store.finish_run(run_id, len(scrape.rows), len(visible_results), "OK")
+        if (
+            not use_dry_run
+            and allowed
+            and not unchanged
+            and settings.telegram_bot_token
+            and settings.telegram_chat_ids
+        ):
+            store.record_poll(scrape.contract_type, scrape.rows, polled_at=scrape.fetched_at)
         log.info("Scan complete: rows=%d near-scenarios=%d contract=%s", len(scrape.rows), len(visible_results), scrape.contract_type)
         return {
             "status": "OK",

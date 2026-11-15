@@ -249,9 +249,18 @@ def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[
             name=name,
             price=None if price_unavailable else parsed_price,
             chg24_pct=_value(cells, index, "chg24_pct"),
-            market_cap_usd=_value(cells, index, "market_cap_usd"),
-            fdv_usd=_value(cells, index, "fdv_usd"),
-            volume24_usd=_value(cells, index, "volume24_usd"),
+            market_cap_usd=_validated_market_value(
+                cells, index, "market_cap_usd", minimum=0.0,
+                invalid_fields=invalid_market_fields, symbol=symbol,
+            ),
+            fdv_usd=_validated_market_value(
+                cells, index, "fdv_usd", minimum=0.0,
+                invalid_fields=invalid_market_fields, symbol=symbol,
+            ),
+            volume24_usd=_validated_market_value(
+                cells, index, "volume24_usd", minimum=0.0,
+                invalid_fields=invalid_market_fields, symbol=symbol,
+            ),
             oi_usd=_value(cells, index, "oi_usd"),
             oi_chg24_pct=oi24_pct,
             oi_chg24_usd=oi24_usd,
@@ -279,10 +288,16 @@ def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[
             ),
             liq_vol_ratio=_value(cells, index, "liq_vol_ratio"),
             liq_oi_ratio=_value(cells, index, "liq_oi_ratio"),
-            ls_ratio_1h=_value(cells, index, "ls_ratio_1h"),
+            ls_ratio_1h=_validated_market_value(
+                cells, index, "ls_ratio_1h", minimum=0.0,
+                invalid_fields=invalid_market_fields, symbol=symbol,
+            ),
             long_accounts_1h_pct=_value(cells, index, "long_accounts_1h_pct"),
             short_accounts_1h_pct=_value(cells, index, "short_accounts_1h_pct"),
-            ls_ratio_1d=_value(cells, index, "ls_ratio_1d"),
+            ls_ratio_1d=_validated_market_value(
+                cells, index, "ls_ratio_1d", minimum=0.0,
+                invalid_fields=invalid_market_fields, symbol=symbol,
+            ),
             long_accounts_1d_pct=_value(cells, index, "long_accounts_1d_pct"),
             short_accounts_1d_pct=_value(cells, index, "short_accounts_1d_pct"),
             futures_imbalance_4h=_validated_market_value(

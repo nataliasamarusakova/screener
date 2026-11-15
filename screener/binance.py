@@ -14,6 +14,8 @@ from .models import Candle
 
 log = logging.getLogger(__name__)
 
+_DEPTH_LIMITS = (5, 10, 20, 50, 100, 500, 1000)
+
 
 class BinanceDataError(RuntimeError):
     pass
@@ -182,7 +184,9 @@ class BinanceClient:
             raise BinanceDataError(f"No active Binance USDT perpetual for Coinalyze symbol {coinalyze_symbol}")
         if not math.isfinite(float(notional_usd)) or float(notional_usd) < 0:
             raise BinanceDataError("Execution notional must be a finite non-negative USD amount")
-        safe_limit = min(max(int(limit), 5), 1000)
+        requested_limit = min(max(int(limit), _DEPTH_LIMITS[0]), _DEPTH_LIMITS[-1])
+        # USDⓈ-M /fapi/v1/depth accepts only these discrete limits.
+        safe_limit = next((allowed for allowed in _DEPTH_LIMITS if allowed >= requested_limit), _DEPTH_LIMITS[-1])
         payload = self._get_json("/fapi/v1/depth", {"symbol": resolved, "limit": safe_limit})
         if not isinstance(payload, dict):
             raise BinanceDataError(f"Unexpected Binance depth response for {resolved}")
@@ -238,7 +242,9 @@ class BinanceClient:
             elif level_data is asks:
                 slippage = (average_price / reference - 1.0) * 10_000.0
             else:
-                slippage = (reference / average_price - 1.0) * 10_000.0
+                # Sell-side shortfall is measured against the best bid, using
+                # the same benchmark denominator as buy-side shortfall.
+                slippage = (reference - average_price) / reference * 10_000.0
             return {
                 "filled_usd": filled_usd,
                 "average_price": average_price,

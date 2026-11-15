@@ -44,7 +44,11 @@ def _median(values: list[float | None]) -> float | None:
 
 def _rank_map(rows: list[MarketRow], attr: str) -> tuple[dict[str, float], int]:
     """Return descending average ranks so tied flows are treated identically."""
-    values = [(r.symbol, float(getattr(r, attr))) for r in rows if getattr(r, attr) is not None]
+    values = [
+        (r.symbol, float(value))
+        for r in rows
+        if (value := getattr(r, attr)) is not None and math.isfinite(float(value))
+    ]
     values.sort(key=lambda item: item[1], reverse=True)
     ranks: dict[str, float] = {}
     start = 0

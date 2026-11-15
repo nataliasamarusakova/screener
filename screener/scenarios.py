@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -59,23 +60,14 @@ def _oi_growth_min(symbol: str, thresholds: dict[str, Any]) -> float:
 
 
 def _result(row: EnrichedRow, scenario: str, direction: str, checks: list[Check], status: str = "NOT_MET", reason: str = "", technical: dict[str, Any] | None = None) -> ScenarioResult:
-    # The general opposed-flow diagnostic must not override a scenario's own
-    # explicit entry signature. In particular SHORT A requires rising OI 4H
-    # together with negative F and S; applying the generic sign comparison to
-    # that exact setup would make SHORT A impossible by construction.
+    # A small set of P1 scenarios explicitly allows opposed F/S and OI signs.
+    # Preserve the general observation-only guard everywhere else.
     oi_4h = row.market.oi_chg4h_pct
     futures_flow = row.market.futures_imbalance_4h
     spot_flow = row.market.spot_imbalance_4h
     scenario_code = str(scenario or "").split(" — ", 1)[0].strip().upper()
-    short_a_native_signature = (
-        scenario_code == "SHORT A"
-        and oi_4h is not None and oi_4h > 0
-        and futures_flow is not None and futures_flow < 0
-        and spot_flow is not None and spot_flow < 0
-    )
-    flow_oi_observation_only = (
-        not short_a_native_signature
-        and oi_4h is not None
+    opposed_flow_oi = (
+        oi_4h is not None
         and futures_flow is not None
         and spot_flow is not None
         and (
@@ -83,6 +75,21 @@ def _result(row: EnrichedRow, scenario: str, direction: str, checks: list[Check]
             or (oi_4h < 0 and futures_flow > 0 and spot_flow > 0)
         )
     )
+    native_opposed_allowed = (
+        (
+            scenario_code in {"SHORT A", "SHORT B", "SHORT C", "SHORT E"}
+            and oi_4h is not None and oi_4h > 0
+            and futures_flow is not None and futures_flow < 0
+            and spot_flow is not None and spot_flow < 0
+        )
+        or (
+            scenario_code in {"LONG B", "LONG D"}
+            and oi_4h is not None and oi_4h < 0
+            and futures_flow is not None and futures_flow > 0
+            and spot_flow is not None and spot_flow > 0
+        )
+    )
+    flow_oi_observation_only = opposed_flow_oi and not native_opposed_allowed
     if flow_oi_observation_only and status not in {"NOT_MET", "BLOCKED_QUALITY", "BLOCKED_CAUSALITY", "OBSERVATION"}:
         status = "OBSERVATION"
         warning = "Opposed F/S flow and OI 4H direction: observation only; signal delivery is blocked."
@@ -131,10 +138,33 @@ def _is_cascade(row: EnrichedRow) -> bool | None:
         short_liqs = float(m.liq_short24_usd)
         if all(map(lambda value: value >= 0, (long_liqs, short_liqs))) and long_liqs + short_liqs == 0:
             return False
-    required = [row.long_liq_share, m.oi_chg24_pct, m.oi_chg4h_pct]
-    if any(v is None for v in required):
+    # Apply known predicates before propagating missing values. A known
+    # non-negative OI change, or a known long-liquidation share below 80%,
+    # already disproves the cascade regardless of other missing fields.
+    known_predicates = (
+        (row.long_liq_share, lambda value: value >= 0.80),
+        (m.oi_chg24_pct, lambda value: value < 0),
+        (m.oi_chg4h_pct, lambda value: value < 0),
+    )
+    normalized_values: list[float | None] = []
+    for value, predicate in known_predicates:
+        if value is None:
+            normalized_values.append(None)
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            normalized_values.append(None)
+            continue
+        if not math.isfinite(number):
+            normalized_values.append(None)
+            continue
+        normalized_values.append(number)
+        if not predicate(number):
+            return False
+    if any(value is None for value in normalized_values):
         return None
-    return bool(row.long_liq_share >= 0.80 and m.oi_chg24_pct < 0 and m.oi_chg4h_pct < 0)
+    return True
 
 
 def evaluate_scenarios(

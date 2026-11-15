@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 
 
 class Store:
-    """Append-only JSONL storage for snapshots, market rows, notifications and runs.
+    """Persistent storage for snapshots, market rows, notifications and poll state.
 
     A snapshot manifest is appended only after all of its market-row records have
     been written. The manifest therefore acts as the commit marker: incomplete
@@ -32,6 +32,7 @@ class Store:
         self.snapshots_path = self.data_dir / "snapshots.jsonl"
         self.market_rows_path = self.data_dir / "market_rows.jsonl"
         self.notifications_path = self.data_dir / "notifications.jsonl"
+        self.poll_state_path = self.data_dir / "poll_state.json"
         self.runs_path = self.data_dir / "runs.jsonl"
         for path in self.paths:
             path.touch(exist_ok=True)
@@ -253,6 +254,7 @@ class Store:
                         **item["data"],
                         "snapshot_at": fetched_at,
                         "contract_type": contract_type,
+                        "_snapshot_id": snapshot_id,
                     })
 
             for records in index.values():
@@ -273,6 +275,87 @@ class Store:
             return False
         previous = manifests[-1]
         return previous.get("snapshot_hash") == self._canonical_snapshot(contract_type, rows)
+
+    def poll_unchanged(self, contract_type: str, rows: list[MarketRow]) -> bool:
+        """Compare current values with the last successfully processed live poll."""
+        expected_contract = str(contract_type).upper()
+        current_hash = self._canonical_snapshot(expected_contract, rows)
+        if not self.poll_state_path.exists():
+            # A 4H snapshot is not proof that an intervening 5-minute poll was
+            # fully processed. On first deployment, re-evaluate rather than
+            # suppressing a signal because a previous run may have failed.
+            return False
+        try:
+            state = json.loads(self.poll_state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            log.warning("Ignoring unreadable poll state; treating current poll as new")
+            return False
+        if not isinstance(state, dict):
+            return False
+        contracts = state.get("contracts")
+        if not isinstance(contracts, dict):
+            return False
+        previous = contracts.get(expected_contract)
+        previous_hash = previous.get("snapshot_hash") if isinstance(previous, dict) else None
+        return isinstance(previous_hash, str) and bool(previous_hash) and previous_hash == current_hash
+
+    def record_poll(
+        self, contract_type: str, rows: list[MarketRow], *, polled_at: datetime | None = None
+    ) -> None:
+        """Atomically persist a poll only after its live scan completed successfully."""
+        expected_contract = str(contract_type).upper()
+        current_hash = self._canonical_snapshot(expected_contract, rows)
+        state: dict[str, Any] = {}
+        if self.poll_state_path.exists():
+            try:
+                loaded = json.loads(self.poll_state_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    state = loaded
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                log.warning("Replacing unreadable poll state after successful scan")
+        contracts = state.get("contracts")
+        if not isinstance(contracts, dict):
+            contracts = {}
+        previous = contracts.get(expected_contract)
+        if isinstance(previous, dict) and previous.get("snapshot_hash") == current_hash:
+            return
+
+        timestamp = polled_at or datetime.now(timezone.utc)
+        contracts[expected_contract] = {
+            "snapshot_hash": current_hash,
+            "polled_at": self._utc_iso(timestamp),
+        }
+        payload = {"schema_version": 1, "contracts": contracts}
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{self.poll_state_path.name}.", suffix=".tmp", dir=self.data_dir
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+                json.dump(payload, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_name, self.poll_state_path)
+        except Exception:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def symbol_history_is_current(self, symbol: str, *, contract_type: str) -> bool:
+        """Whether a symbol was present in the latest committed universe snapshot."""
+        expected_contract = str(contract_type).upper()
+        manifests = [
+            item for item in self._snapshot_manifests()
+            if str(item.get("contract_type") or "").upper() == expected_contract
+        ]
+        if not manifests:
+            return False
+        history = self.recent_symbol_history(symbol, limit=1, contract_type=expected_contract)
+        if not history:
+            return False
+        return history[-1].get("_snapshot_id") == manifests[-1].get("snapshot_id")
 
     def snapshot_due(
         self,
@@ -376,6 +459,8 @@ class Store:
             symbol, limit=max(100, required * 12), contract_type=contract_type
         )
         if len(history) < required:
+            return None
+        if contract_type and not self.symbol_history_is_current(symbol, contract_type=contract_type):
             return None
 
         target_seconds = float(interval_hours) * 3600.0
