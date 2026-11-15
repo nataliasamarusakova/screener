@@ -173,6 +173,8 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
     assert (settings.data_dir / "market_rows.jsonl").exists()
     assert (settings.data_dir / "notifications.jsonl").exists()
     assert (settings.data_dir / "runs.jsonl").exists()
+    # Dry-run must not mark the data as successfully processed by live delivery.
+    assert not (settings.data_dir / "poll_state.json").exists()
 
     store = Store(settings.data_dir)
     scraped.fetched_at = fixed_time + timedelta(minutes=30)
@@ -201,6 +203,39 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
     latest_history = Store(settings.data_dir).recent_symbol_history("ALT0USDT_PERP.A", limit=5)
     assert len(latest_history) == 2
     assert latest_history[-1]["snapshot_at"] == (fixed_time + timedelta(hours=4)).isoformat()
+
+    # The last-poll marker is committed only by a successful live scan with
+    # delivery configured; it is not mutated by the four preceding dry-runs.
+    settings.telegram_bot_token = "test-token"
+    settings.telegram_chat_ids = ["12345"]
+    scraped.fetched_at = fixed_time + timedelta(hours=4, minutes=5)
+    live = service.run_scan_once(settings, dry_run=False)
+    assert live["status"] == "OK"
+    assert (settings.data_dir / "poll_state.json").exists()
+
+    scraped.fetched_at = fixed_time + timedelta(hours=4, minutes=10)
+    repeated = service.run_scan_once(settings, dry_run=False)
+    assert repeated["no_new_coinalyze_data"] is True
+    assert repeated["alert_guard"].endswith("new position openings blocked")
+
+    # A later scan that fails during analysis must not advance the marker; the
+    # same changed table must be retried by the next successful live run.
+    import pytest
+    import screener.service as service_module
+
+    saved_poll_state = (settings.data_dir / "poll_state.json").read_text(encoding="utf-8")
+    markets[0].price += 0.02
+    scraped.fetched_at = fixed_time + timedelta(hours=4, minutes=15)
+    real_analyze = service_module.analyze_universe
+    monkeypatch.setattr(service_module, "analyze_universe", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("analysis failed")))
+    with pytest.raises(RuntimeError, match="analysis failed"):
+        service.run_scan_once(settings, dry_run=False)
+    assert (settings.data_dir / "poll_state.json").read_text(encoding="utf-8") == saved_poll_state
+
+    monkeypatch.setattr(service_module, "analyze_universe", real_analyze)
+    retry = service.run_scan_once(settings, dry_run=False)
+    assert retry["status"] == "OK"
+    assert retry["no_new_coinalyze_data"] is False
 
 
 def test_price_oi_snapshot_classification_marks_overlapping_windows_preliminary(tmp_path):
@@ -617,6 +652,11 @@ def test_short_e_has_a_stable_notification_anchor_for_service_and_telegram():
     assert _confirmation_anchor(result) == anchor
     assert telegram_confirmation_anchor(result) == anchor
     assert _has_required_confirmation(result, enriched[0]) is True
+    result.technical["context_4h"]["last_close"] = float("nan")
+    assert _has_required_confirmation(result, enriched[0]) is False
+    result.technical["context_4h"]["last_close"] = 99.0
+    result.technical["context_4h"]["last_confirmed_resistance"] = True
+    assert _has_required_confirmation(result, enriched[0]) is False
     identity = _notification_identity(result)
     assert identity is not None
     assert identity[1].endswith(f"|{anchor}")

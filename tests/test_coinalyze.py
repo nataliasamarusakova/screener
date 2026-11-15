@@ -76,6 +76,25 @@ def test_zero_rounded_price_does_not_drop_the_market_row():
     assert rows[0].raw["price_rounded_or_invalid_zero"] is True
 
 
+def test_negative_volume_capitalization_and_ls_ratios_are_rejected():
+    html = FIXTURE_HTML.replace("$1.5t</td><td>$1.5t", "$-1.5t</td><td>$-1.5t", 1)
+    html = html.replace("$50.2b</td>", "$-50.2b</td>", 1)
+    html = html.replace("<td>1.64</td>", "<td>-1.64</td>", 1)
+    html = html.replace("<td>1.61</td>", "<td>-1.61</td>", 1)
+
+    rows, _, _, _ = parse_table(html)
+    row = rows[0]
+
+    assert row.market_cap_usd is None
+    assert row.fdv_usd is None
+    assert row.volume24_usd is None
+    assert row.ls_ratio_1h is None
+    assert row.ls_ratio_1d is None
+    assert {"market_cap_usd", "fdv_usd", "volume24_usd", "ls_ratio_1h", "ls_ratio_1d"}.issubset(
+        set(row.raw["invalid_market_fields"])
+    )
+
+
 def test_parser_accepts_data_symbol_attribute_fallback():
     html = FIXTURE_HTML.replace("data-coin=", "data-symbol=")
     rows, _, _, _ = parse_table(html)

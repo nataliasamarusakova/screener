@@ -22,6 +22,32 @@ def test_orderbook_diagnostics_calculate_spread_depth_and_estimated_slippage(mon
     assert result["estimated_only"] is True
 
 
+def test_orderbook_maps_unsupported_depth_limit_and_uses_correct_sell_slippage(monkeypatch):
+    client = BinanceClient("https://fapi.binance.com", min_interval_sec=0)
+    captured = {}
+    monkeypatch.setattr(client, "resolve_symbol", lambda _: "BTCUSDT")
+
+    def fake_get_json(_path, params):
+        captured.update(params)
+        return {
+            "bids": [["100", "1"], ["90", "10"]],
+            "asks": [["101", "10"]],
+        }
+
+    monkeypatch.setattr(client, "_get_json", fake_get_json)
+    result = client.fetch_orderbook_diagnostics("BTCUSDT", limit=99, notional_usd=500)
+
+    expected_average = 500 / (1 + 400 / 90)
+    expected_slippage = (100 - expected_average) / 100 * 10_000
+    assert captured["limit"] == 100
+    assert abs(result["market_sell_estimate"]["slippage_bps"] - expected_slippage) < 1e-9
+
+    # Mapping rounds upward, so the API response cannot have fewer levels
+    # than the caller requested (e.g. 75 -> 100, not 50).
+    client.fetch_orderbook_diagnostics("BTCUSDT", limit=75, notional_usd=0)
+    assert captured["limit"] == 100
+
+
 def test_orderbook_rejects_crossed_market(monkeypatch):
     client = BinanceClient("https://fapi.binance.com", min_interval_sec=0)
     monkeypatch.setattr(client, "resolve_symbol", lambda _: "BTCUSDT")

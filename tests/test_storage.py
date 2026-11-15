@@ -30,6 +30,58 @@ def test_identical_parsed_values_do_not_create_a_new_snapshot(tmp_path):
     assert store.snapshot_unchanged("PERPETUAL", [changed]) is False
 
 
+def test_poll_unchanged_compares_with_last_successfully_processed_poll(tmp_path):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    first = _row()
+    second = _row()
+    second.price = 70_100
+
+    # Merely checking a poll must not persist it: a failed run may not have
+    # reached the notification stage, so the next run must retry the same data.
+    assert store.poll_unchanged("PERPETUAL", [first]) is False
+    assert not (data_dir / "poll_state.json").exists()
+    store.record_poll("PERPETUAL", [first])
+
+    assert store.poll_unchanged("PERPETUAL", [first]) is True
+    assert store.poll_unchanged("PERPETUAL", [second]) is False
+    store.record_poll("PERPETUAL", [second])
+    state_before_repeat = (data_dir / "poll_state.json").read_text(encoding="utf-8")
+    assert Store(data_dir).poll_unchanged("PERPETUAL", [second]) is True
+    assert (data_dir / "poll_state.json").read_text(encoding="utf-8") == state_before_repeat
+
+
+def test_first_live_poll_is_not_assumed_processed_from_a_four_hour_snapshot(tmp_path):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    row = _row()
+    store.add_snapshot(datetime.now(timezone.utc), "PERPETUAL", [row])
+
+    # A durable 4H snapshot may have been committed by a run that later failed.
+    # It cannot substitute for proof that a live scan/notification pass completed.
+    assert store.poll_unchanged("PERPETUAL", [row]) is False
+    assert not (data_dir / "poll_state.json").exists()
+
+
+def test_spot_sequence_is_unknown_if_symbol_is_missing_from_latest_universe_snapshot(tmp_path):
+    store = Store(tmp_path / "data")
+    base = datetime.now(timezone.utc) - timedelta(hours=8)
+    for index in range(2):
+        row = _row()
+        row.spot_imbalance_4h = 2.0
+        store.add_snapshot(base + timedelta(hours=4 * index), "PERPETUAL", [row])
+
+    other = _row()
+    other.symbol = "ETHUSDT_PERP.A"
+    other.name = "Ethereum"
+    store.add_snapshot(base + timedelta(hours=8), "PERPETUAL", [other])
+
+    assert store.symbol_history_is_current("BTCUSDT_PERP.A", contract_type="PERPETUAL") is False
+    assert store.spot_sequence_status(
+        "BTCUSDT_PERP.A", required=2, as_of=base + timedelta(hours=8), contract_type="PERPETUAL"
+    ) is None
+
+
 def test_spot_sequence_requires_distinct_snapshots_near_four_hour_spacing(tmp_path):
     store = Store(tmp_path / "data")
     base = datetime.now(timezone.utc) - timedelta(hours=12)
@@ -67,12 +119,13 @@ def test_prune_retains_recent_market_history_and_drops_dom_raw(tmp_path):
     assert "raw" not in history[0]
 
 
-def test_storage_is_jsonl_only_and_records_committed_snapshot(tmp_path):
+def test_storage_files_include_expected_jsonl_history(tmp_path):
     import json
 
     data_dir = tmp_path / "data"
     store = Store(data_dir)
     store.add_snapshot(datetime.now(timezone.utc), "PERPETUAL", [_row()])
+    store.poll_unchanged("PERPETUAL", [_row()])
 
     expected = {
         "snapshots.jsonl",

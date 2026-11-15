@@ -32,6 +32,18 @@ def test_metrics_keep_n_a_and_calculate_derived_fields():
     assert stats.warnings
 
 
+def test_rank_map_ignores_non_finite_flow_values():
+    from screener.metrics import _rank_map
+
+    rows = [mk("FINITE", 10.0, 1.0, 0.0, 0.0, 0.0),
+            mk("NAN", float("nan"), 1.0, 0.0, 0.0, 0.0),
+            mk("INF", float("inf"), 1.0, 0.0, 0.0, 0.0)]
+    ranks, count = _rank_map(rows, "futures_imbalance_4h")
+
+    assert ranks == {"FINITE": 1.0}
+    assert count == 1
+
+
 def test_unavailable_price_is_a_quality_flag_not_a_dropped_row():
     row = mk("ZERO", 1.0, 2.0, -1.0, 1.5, 1.0)
     row.price = None

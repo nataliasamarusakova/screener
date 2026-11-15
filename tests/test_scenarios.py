@@ -287,7 +287,7 @@ def test_long_c_preparation_is_blocked_by_market_quality_flags():
     assert any(check.name == "Quality flags" and check.passed is False for check in long_c.checks)
 
 
-def test_opposed_oi_and_positive_flows_cap_long_b_at_observation():
+def test_opposed_oi_and_positive_flows_remain_a_warning_not_a_scenario_veto():
     from datetime import datetime, timedelta, timezone
 
     rows = []
@@ -316,8 +316,82 @@ def test_opposed_oi_and_positive_flows_cap_long_b_at_observation():
     long_b = next(item for item in results if item.scenario.startswith("LONG B"))
 
     assert any("observation only" in note for note in target.diagnostic_notes)
-    assert long_b.status == "OBSERVATION"
-    assert "opposed" in long_b.reason.lower() and "observation only" in long_b.reason.lower()
+    assert long_b.status == "CONFIRMED_SIGNAL"
+    assert "observation only" not in long_b.reason.lower()
+
+
+def test_native_scenario_flow_oi_signatures_keep_confirmed_status():
+    from screener.models import Check
+    from screener.scenarios import _result
+
+    cases = (
+        ("LONG B", -0.3, 0.2, 15.0),
+        ("LONG D", -2.0, 2.0, 3.0),
+        ("SHORT A", 0.4, -2.0, -20.0),
+        ("SHORT B", 1.0, -1.5, -15.0),
+        ("SHORT C", 0.3, -3.0, -2.0),
+        ("SHORT E", 0.2, -1.0, -2.0),
+    )
+    for scenario, oi4h, futures, spot in cases:
+        market = MarketRow(
+            symbol="TESTUSDT_PERP", name="TEST", oi_chg4h_pct=oi4h,
+            futures_imbalance_4h=futures, spot_imbalance_4h=spot,
+            fr_oiw_pct=0.001, pfr_oiw_pct=0.001,
+        )
+        enriched, _ = analyze_universe([market], {"thresholds": {}})
+        result = _result(
+            enriched[0], f"{scenario} — native-signature test", "LONG" if scenario.startswith("LONG") else "SHORT",
+            [Check("all P1 predicates", True, "passed", "scenario-local rules")],
+            status="CONFIRMED_SIGNAL",
+        )
+        assert result.status == "CONFIRMED_SIGNAL", scenario
+        assert "observation only" not in result.reason.lower(), scenario
+
+
+def test_unlisted_opposed_flow_oi_signature_remains_observation_only():
+    from screener.models import Check
+    from screener.scenarios import _result
+
+    market = MarketRow(
+        symbol="TESTUSDT_PERP", name="TEST", oi_chg4h_pct=-0.2,
+        futures_imbalance_4h=2.0, spot_imbalance_4h=3.0,
+        fr_oiw_pct=0.001, pfr_oiw_pct=0.001,
+    )
+    enriched, _ = analyze_universe([market], {"thresholds": {}})
+    result = _result(
+        enriched[0], "LONG C — Short Squeeze", "LONG",
+        [Check("stage predicates", True, "passed", "scenario-local rules")],
+        status="TRIGGER",
+    )
+
+    assert result.status == "OBSERVATION"
+    assert "observation only" in result.reason.lower()
+
+
+def test_known_non_cascade_oi_direction_overrides_missing_liquidation_side():
+    from screener.scenarios import _is_cascade
+
+    row = MarketRow(
+        symbol="VIRTUALUSDT_PERP", name="VIRTUAL", price=1.0,
+        oi_chg24_pct=2.0, oi_chg4h_pct=1.35,
+        liq_long24_usd=100_000.0, liq_short24_usd=None,
+        futures_imbalance_4h=-2.0, spot_imbalance_4h=-5.0,
+    )
+    enriched, _ = analyze_universe([row], {"thresholds": {}})
+    assert enriched[0].long_liq_share is None
+    assert _is_cascade(enriched[0]) is False
+
+
+def test_blocked_scenarios_are_not_near_candidates():
+    from screener.models import Check, ScenarioResult
+
+    result = ScenarioResult(
+        symbol="ALTUSDT", name="ALT", scenario="LONG C", direction="LONG",
+        checks=[Check("prep 1", True, "yes", "yes"), Check("prep 2", True, "yes", "yes"),
+                Check("quality", False, "bad", "none")],
+        quality_flags=["bad"], status="BLOCKED_QUALITY",
+    )
+    assert result.near_candidate is False
 
 
 def test_zero_known_liquidations_mean_no_cascade_not_unknown():

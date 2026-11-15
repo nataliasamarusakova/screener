@@ -3,7 +3,7 @@ from pathlib import Path
 
 def test_workflow_persists_jsonl_on_current_branch_without_state_branch():
     workflow = (Path(__file__).parents[1] / ".github/workflows/screener.yml").read_text()
-    assert "Persist JSONL history on the current branch" in workflow
+    assert "Persist scanner state on the current branch" in workflow
     assert 'git push origin "HEAD:${GITHUB_REF}"' in workflow
     assert "refs/heads/screener-state" not in workflow
     assert "Restore persistent analysis history" not in workflow
@@ -42,7 +42,10 @@ def test_workflow_queues_pending_runs_and_does_not_commit_per_run_journal():
     assert "queue: single" in workflow
     assert "cancel-in-progress: false" in workflow
     assert "git add data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl" in workflow
+    assert 'if [[ -f data/poll_state.json ]]; then' in workflow
+    assert 'git add data/poll_state.json' in workflow
     assert "git add data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl data/runs.jsonl" not in workflow
+    assert "touch data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl data/runs.jsonl" in workflow
     assert "git rm --cached -f data/runs.jsonl" in workflow
     assert "data/runs.jsonl" in gitignore
 
