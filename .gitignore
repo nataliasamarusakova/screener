@@ -4,5 +4,6 @@ __pycache__/
 *.py[cod]
 playwright/.cache/
 
-# Per-invocation diagnostics are local to a runner; durable P1 state is snapshots + notifications.
+# Per-invocation diagnostics are local to a runner; durable state includes
+# 4H snapshots, last-poll freshness, and notification lifecycle.
 data/runs.jsonl
