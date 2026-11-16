@@ -355,3 +355,38 @@ def test_pagination_next_disabled_checks_bootstrap_parent_state():
     assert _pagination_next_is_disabled(FakeButton(disabled=True)) is True
     assert _pagination_next_is_disabled(FakeButton(visible=False)) is True
     assert _pagination_next_is_disabled(FakeButton()) is False
+
+
+def test_parse_number_handles_mixed_and_decimal_comma_formats():
+    assert parse_number("1.234,56") == 1234.56
+    assert parse_number("4,9580") == 4.958
+    assert parse_number("1,234.56") == 1234.56
+    assert parse_number("1,234") == 1234.0
+    assert parse_number("–") is None
+
+
+def test_duplicate_oi_column_without_unit_is_not_guessed_as_usd():
+    from bs4 import BeautifulSoup
+    from screener.coinalyze import _disambiguate_oi
+
+    cells = BeautifulSoup("<table><tr><td>1.58</td><td>$250k</td></tr></table>", "lxml").select("td")
+    percent, usd = _disambiguate_oi(cells, [0, 1])
+    assert percent is None
+    assert usd == 250_000
+
+
+def test_pagination_accepts_www_variant_of_same_coinalyze_host():
+    html = '<div class="pagination"><a href="https://www.coinalyze.net/?page=2">2</a></div>'
+    urls = _pagination_urls(html, "https://coinalyze.net/?columns=x&contract_type=perpetual")
+    assert len(urls) == 2
+    assert "www.coinalyze.net" in urls[1]
+    assert "columns=x" in urls[1]
+
+
+def test_one_hour_long_short_ratio_is_optional_for_p1_schema():
+    from screener.coinalyze import REQUIRED_FOR_P1
+
+    # P1 scenarios use the 1D account ratio; the 1H ratio is parsed for
+    # diagnostics only and must not disable every alert when absent.
+    assert "ls_ratio_1h" not in REQUIRED_FOR_P1
+    assert "ls_ratio_1d" in REQUIRED_FOR_P1

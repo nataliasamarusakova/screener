@@ -164,45 +164,32 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
     first = service.run_scan_once(settings, dry_run=True)
     assert first["status"] == "OK"
     assert first["rows"] == 20
-    assert first["snapshot_saved"] is True
+    assert first["snapshot_saved"] is False
     assert first["notifications"] == []
     assert not any(item.status in {"OBSERVATION", "WAIT_BOUNCE", "PREPARATION", "TRIGGER"} for item in first["results"])
     assert "output_paths" not in first
     assert not (tmp_path / "reports").exists()
-    assert (settings.data_dir / "snapshots.jsonl").exists()
-    assert (settings.data_dir / "market_rows.jsonl").exists()
-    assert (settings.data_dir / "notifications.jsonl").exists()
-    assert (settings.data_dir / "runs.jsonl").exists()
-    # Dry-run must not mark the data as successfully processed by live delivery.
-    assert not (settings.data_dir / "poll_state.json").exists()
+    # A dry run must not even create empty persistent files/directories.
+    assert not settings.data_dir.exists()
 
-    store = Store(settings.data_dir)
     scraped.fetched_at = fixed_time + timedelta(minutes=30)
     second = service.run_scan_once(settings, dry_run=True)
-    assert second["no_new_coinalyze_data"] is True
+    assert second["no_new_coinalyze_data"] is False
     assert second["snapshot_saved"] is False
     assert second["notifications"] == []
-    # Polling in the same UTC slot does not create a duplicate independent observation.
-    latest_history = store.recent_symbol_history("ALT0USDT_PERP.A", limit=5)
-    assert latest_history[-1]["snapshot_at"] == fixed_time.isoformat()
+    assert not settings.data_dir.exists()
 
-    # A UTC-slot change does not make an identical rolling Coinalyze table a new observation.
     scraped.fetched_at = fixed_time + timedelta(hours=4)
     third = service.run_scan_once(settings, dry_run=True)
-    assert third["no_new_coinalyze_data"] is True
+    assert third["no_new_coinalyze_data"] is False
     assert third["snapshot_saved"] is False
-    latest_history = Store(settings.data_dir).recent_symbol_history("ALT0USDT_PERP.A", limit=5)
-    assert len(latest_history) == 1
-    assert latest_history[-1]["snapshot_at"] == fixed_time.isoformat()
+    assert not settings.data_dir.exists()
 
-    # Changed data can become a new independent observation after a full rolling interval.
     markets[0].price += 0.01
     fourth = service.run_scan_once(settings, dry_run=True)
     assert fourth["no_new_coinalyze_data"] is False
-    assert fourth["snapshot_saved"] is True
-    latest_history = Store(settings.data_dir).recent_symbol_history("ALT0USDT_PERP.A", limit=5)
-    assert len(latest_history) == 2
-    assert latest_history[-1]["snapshot_at"] == (fixed_time + timedelta(hours=4)).isoformat()
+    assert fourth["snapshot_saved"] is False
+    assert not settings.data_dir.exists()
 
     # The last-poll marker is committed only by a successful live scan with
     # delivery configured; it is not mutated by the four preceding dry-runs.
@@ -211,12 +198,16 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
     scraped.fetched_at = fixed_time + timedelta(hours=4, minutes=5)
     live = service.run_scan_once(settings, dry_run=False)
     assert live["status"] == "OK"
+    assert live["snapshot_saved"] is True
     assert (settings.data_dir / "poll_state.json").exists()
+    assert (settings.data_dir / "snapshots.jsonl").exists()
+    assert (settings.data_dir / "market_rows.jsonl").exists()
 
     scraped.fetched_at = fixed_time + timedelta(hours=4, minutes=10)
     repeated = service.run_scan_once(settings, dry_run=False)
     assert repeated["no_new_coinalyze_data"] is True
-    assert repeated["alert_guard"].endswith("new position openings blocked")
+    assert "new position openings blocked" not in repeated["alert_guard"]
+    assert any("fresh 1H Binance confirmations remain eligible" in warning for warning in repeated["stats"].warnings)
 
     # A later scan that fails during analysis must not advance the marker; the
     # same changed table must be retried by the next successful live run.
@@ -269,7 +260,7 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
     incomplete = service.run_scan_once(settings, dry_run=True)
     assert incomplete["snapshot_saved"] is False
     assert any("Snapshot not committed" in warning for warning in incomplete["stats"].warnings)
-    assert len(Store(settings.data_dir).recent_symbol_history("ALT0USDT_PERP.A", limit=10)) == 2
+    assert len(Store(settings.data_dir).recent_symbol_history("ALT0USDT_PERP.A", limit=10)) == 1
 
 
 def test_price_oi_snapshot_classification_marks_overlapping_windows_preliminary(tmp_path):
@@ -337,8 +328,11 @@ def test_telegram_alert_shows_market_data_and_minimal_graph_context():
 def test_funding_sign_reversal_is_warning_only_after_chart_confirmation(tmp_path):
     from screener.telegram import format_alert
     from screener.scenarios import evaluate_scenarios
+    from copy import deepcopy
     from screener.config import DEFAULT_P1_CONFIG
 
+    config = deepcopy(DEFAULT_P1_CONFIG)
+    config["thresholds"]["strong_flow_min_rows"] = 1  # Isolate alert formatting from the universe-size guard.
     market = MarketRow(
         symbol="GRASSUSDT_PERP.A", name="GRASS", price=1.0, chg24_pct=5.09,
         market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=100_000_000,
@@ -350,11 +344,11 @@ def test_funding_sign_reversal_is_warning_only_after_chart_confirmation(tmp_path
         ls_ratio_1d=1.08, futures_imbalance_4h=7.6293, spot_imbalance_4h=4.2696,
         btc_corr7d=0.88,
     )
-    enriched, stats = analyze_universe([market], DEFAULT_P1_CONFIG)
+    enriched, stats = analyze_universe([market], config)
     technical = {
         "trend_retest_long": {"confirmed": True, "level": 0.98, "retest_open_time_ms": 1_790_000_000_000},
     }
-    results = evaluate_scenarios(enriched[0], stats, DEFAULT_P1_CONFIG, technical=technical)
+    results = evaluate_scenarios(enriched[0], stats, config, technical=technical)
     long_a = next(item for item in results if item.scenario.startswith("LONG A"))
     assert long_a.passed_count == 6 and long_a.total_count == 6
     assert long_a.status == "CONFIRMED_SIGNAL_WITH_WARNING"
@@ -516,9 +510,14 @@ def test_telegram_client_retries_rate_limit_once_then_succeeds(monkeypatch):
         return responses.pop(0)
 
     sleeps = []
+    clock = {"now": 100.0}
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+    monkeypatch.setattr(telegram_module.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr(telegram_module.requests, "post", fake_post)
-    monkeypatch.setattr(telegram_module.time, "sleep", lambda seconds: sleeps.append(seconds))
-    client = TelegramClient("token", ["chat-1"])
+    monkeypatch.setattr(telegram_module.time, "sleep", fake_sleep)
+    client = TelegramClient("token", ["chat-1"], min_interval_per_chat_sec=0, min_interval_global_sec=0)
     result = client.send("test message")
 
     assert len(calls) == 2
@@ -687,10 +686,8 @@ def test_short_e_has_a_stable_notification_anchor_for_service_and_telegram():
     assert telegram_confirmation_anchor(result) == anchor
     assert _has_required_confirmation(result, enriched[0]) is True
     result.technical["context_4h"]["last_close"] = float("nan")
-    assert _has_required_confirmation(result, enriched[0]) is False
-    result.technical["context_4h"]["last_close"] = 99.0
-    result.technical["context_4h"]["last_confirmed_resistance"] = True
-    assert _has_required_confirmation(result, enriched[0]) is False
+    result.technical["context_4h"]["last_confirmed_resistance"] = None
+    assert _has_required_confirmation(result, enriched[0]) is True
     identity = _notification_identity(result)
     assert identity is not None
     assert identity[1].endswith(f"|{anchor}")
@@ -806,6 +803,7 @@ def test_latest_opposite_candidate_uses_confirmation_time_not_event_key_or_pivot
         technical={"higher_low": {
             "latest_open_time_ms": 1_700_000_000_000,
             "confirmation_open_time_ms": 1_700_000_007_200,
+            "confirmation_close_time_ms": 1_700_000_010_799,
         }},
     )
     newer_lexically_smaller = ScenarioResult(
@@ -840,3 +838,349 @@ def test_notification_outcome_marks_only_definite_transient_failures_retryable()
         "type": "confirmed_signal",
         "delivery": {"sent": False, "delivery_unknown": False, "permanent_failure": True},
     }]) is False
+
+
+def test_chart_candidate_cap_prefers_scenario_completeness_before_open_interest(monkeypatch):
+    from types import SimpleNamespace
+    import screener.service as service
+
+    markets = [
+        MarketRow(
+            symbol="BIGUSDT_PERP", name="BIG", price=1, chg24_pct=1,
+            volume24_usd=100_000_000, oi_usd=900_000_000,
+            oi_vol_ratio=0.5, vol_mktcap_ratio=0.1,
+            futures_imbalance_4h=10, spot_imbalance_4h=10,
+        ),
+        MarketRow(
+            symbol="SMALLUSDT_PERP", name="SMALL", price=1, chg24_pct=1,
+            volume24_usd=100_000_000, oi_usd=45_000_000,
+            oi_vol_ratio=0.5, vol_mktcap_ratio=0.1,
+            futures_imbalance_4h=9, spot_imbalance_4h=9,
+        ),
+    ]
+    enriched, stats = analyze_universe(markets, {"thresholds": {}})
+
+    class FakeStore:
+        def active_notification_states(self, **_kwargs):
+            return []
+        def recent_symbol_history(self, *_args, **_kwargs):
+            return []
+        def symbol_history_is_current(self, *_args, **_kwargs):
+            return True
+        def spot_sequence_status(self, *_args, **_kwargs):
+            return {"ok": False}
+
+    def fake_evaluate(row, *_args, **_kwargs):
+        if row.symbol.startswith("SMALL"):
+            checks = [Check("a", True, "yes", "rule") for _ in range(4)]
+            status = "CONFIRMED_SIGNAL"
+        else:
+            checks = [Check("a", True, "yes", "rule"), Check("b", False, "no", "rule")]
+            status = "PREPARATION"
+        return [ScenarioResult(
+            symbol=row.symbol, name=row.market.name, scenario="LONG A", direction="LONG",
+            checks=checks, quality_flags=[], status=status,
+        )]
+
+    monkeypatch.setattr(service, "evaluate_scenarios", fake_evaluate)
+    settings = SimpleNamespace(
+        p1={"scenario": {}, "scanner": {"max_chart_candidates": 1}},
+        telegram_bot_token="", telegram_chat_ids=[],
+    )
+
+    selected = service._preliminary_candidate_symbols(enriched, stats, settings, FakeStore())
+
+    assert selected == {"SMALLUSDT_PERP"}
+
+
+def test_unchanged_coinalyze_poll_still_allows_fresh_1h_entry_processing(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    import screener.service as service
+    from screener.coinalyze import ScrapeResult
+    from screener.config import DEFAULT_P1_CONFIG, Settings
+    from screener.storage import Store
+
+    settings = Settings(
+        coinalyze_url="https://coinalyze.net/", coinalyze_p_sid="", coinalyze_chat_sid="",
+        coinalyze_max_pages=20, coinalyze_headless=True, coinalyze_timeout_ms=30_000,
+        binance_base_url="https://fapi.binance.com", binance_http_proxy="", binance_vpn_enabled=False,
+        binance_kline_limit=300, binance_request_interval_sec=0.0, binance_fetch_orderbook=False,
+        binance_orderbook_limit=100, execution_notional_usd=0.0, trading_fee_bps_per_side=None,
+        telegram_bot_token="token", telegram_chat_ids=["123"], data_dir=tmp_path / "data",
+        log_level="INFO", dry_run=False,
+        p1={section: values.copy() for section, values in DEFAULT_P1_CONFIG.items()},
+    )
+    rows = [MarketRow(
+        symbol=f"ALT{i}USDT_PERP", name=f"ALT{i}", price=1.0,
+        volume24_usd=100_000_000, oi_usd=100_000_000,
+        oi_vol_ratio=1.0, vol_mktcap_ratio=0.1,
+        futures_imbalance_4h=1.0, spot_imbalance_4h=1.0,
+    ) for i in range(20)]
+    fetched_at = datetime.now(timezone.utc)
+    scraped = ScrapeResult(
+        rows=rows, fetched_at=fetched_at, contract_type="PERPETUAL", pages_loaded=1,
+        headers_found=[], missing_columns=[], source_url=settings.coinalyze_url,
+    )
+    store = Store(settings.data_dir)
+    store.record_poll("PERPETUAL", rows, polled_at=fetched_at)
+    monkeypatch.setattr(service, "fetch_table", lambda **_kwargs: scraped)
+    monkeypatch.setattr(service, "_technical_for_symbol", lambda *_args: {})
+    allowed_values = []
+    monkeypatch.setattr(
+        service, "_collect_notifications",
+        lambda _results, _rows, _settings, _store, allowed, _dry_run, **_kwargs: allowed_values.append(allowed) or [],
+    )
+
+    result = service.run_scan_once(settings, dry_run=False)
+
+    assert result["no_new_coinalyze_data"] is True
+    assert allowed_values == [True]
+    # Unchanged rows are intentionally not committed as another successful poll.
+    assert result["poll_state_updated"] is False
+
+
+def test_higher_low_reentry_uses_confirmation_candle_after_cancellation(monkeypatch):
+    from datetime import datetime, timezone
+    import screener.service as service
+    from screener.telegram import _confirmation_anchor as telegram_confirmation_anchor
+
+    pivot_open = 1_790_000_000_000
+    cancelled_close = pivot_open + 2 * 60 * 60_000 - 1
+    confirmation_open = cancelled_close + 1
+    market = MarketRow(
+        symbol="ALTUSDT_PERP", name="ALT", price=1.25, chg24_pct=2.0,
+        market_cap_usd=1_000_000_000, volume24_usd=100_000_000,
+        oi_usd=80_000_000, oi_vol_ratio=0.8, oi_mktcap_ratio=0.08,
+        vol_mktcap_ratio=0.1, fr_oiw_pct=0.01, pfr_oiw_pct=0.01,
+        liq_long24_usd=100_000, liq_short24_usd=80_000,
+        futures_imbalance_4h=3.0, spot_imbalance_4h=4.0,
+    )
+    enriched, _ = analyze_universe([market], {"thresholds": {}})
+    result = ScenarioResult(
+        symbol=market.symbol, name=market.name, scenario="LONG B — Spot Accumulation",
+        direction="LONG", checks=[Check("complete", True, "yes", "rule")],
+        quality_flags=[], status="CONFIRMED_SIGNAL",
+        technical={
+            "binance_symbol": "ALTUSDT",
+            "higher_low": {
+                "confirmed": True,
+                "previous_low": 1.10,
+                "latest_low": 1.20,
+                "latest_open_time_ms": pivot_open,
+                "confirmation_open_time_ms": confirmation_open,
+                "confirmation_close_time_ms": confirmation_open + 60 * 60_000 - 1,
+            },
+            "spot_sequence_ok": True,
+            "last_closed_1h": {
+                "open_time_ms": confirmation_open,
+                "close_time_ms": confirmation_open + 60 * 60_000 - 1,
+                "close": 1.25,
+                "open": 1.22,
+                "high": 1.27,
+                "low": 1.19,
+            },
+        },
+    )
+
+    # The pivot predates cancellation, but its confirming 1H candle is newer.
+    confirmation_close = confirmation_open + 60 * 60_000 - 1
+    assert service._confirmation_anchor(result) == confirmation_close
+    assert telegram_confirmation_anchor(result) == confirmation_close
+    identity = service._notification_identity(result)
+    assert identity is not None and identity[1].endswith(f"|{confirmation_close}")
+
+    class Store:
+        def __init__(self, cancelled_at=cancelled_close):
+            self.cancelled_at = cancelled_at
+            self.recorded = []
+
+        def active_notification_states(self, *, recipient_keys):
+            return []
+
+        def notification_exists(self, *_args, **_kwargs):
+            return False
+
+        def latest_cancelled_close_time_ms(self, *_args, **_kwargs):
+            return self.cancelled_at
+
+        def record_notification(self, *args, **kwargs):
+            self.recorded.append((args, kwargs))
+
+    class FakeTelegram:
+        configured = True
+
+        def __init__(self, *_args):
+            pass
+
+        def send(self, _message, chat_ids=None):
+            return [{"chat_id": chat_ids[0], "sent": True, "delivery_unknown": False, "message_id": 10}]
+
+    monkeypatch.setattr(service, "TelegramClient", FakeTelegram)
+    monkeypatch.setattr(service, "_has_required_confirmation", lambda *_args: True)
+    settings = type("Settings", (), {
+        "telegram_bot_token": "token",
+        "telegram_chat_ids": ["chat-1"],
+        "telegram_storage_hash_key": "stable-key",
+    })()
+    store = Store()
+    outcomes = service._collect_notifications([result], enriched, settings, store, True, False)
+
+    assert len(outcomes) == 1 and outcomes[0]["sent"] is True
+    assert len(store.recorded) == 1
+    assert store.recorded[0][0][0] == identity[1]
+
+    # If cancellation and Higher Low confirmation close on the same candle,
+    # the trigger was not confirmed strictly after cancellation and is blocked.
+    same_candle_store = Store(cancelled_at=confirmation_close)
+    same_candle_outcomes = service._collect_notifications(
+        [result], enriched, settings, same_candle_store, True, False
+    )
+    assert same_candle_outcomes == []
+    assert same_candle_store.recorded == []
+
+
+def test_telegram_rate_limit_wait_is_not_capped_at_thirty_seconds(monkeypatch):
+    import screener.telegram as telegram_module
+    from screener.telegram import TelegramClient
+
+    class Response:
+        def __init__(self, status, payload):
+            self.status_code = status
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise telegram_module.requests.HTTPError(f"HTTP {self.status_code}")
+
+    responses = [
+        Response(429, {"ok": False, "parameters": {"retry_after": 75}}),
+        Response(200, {"ok": True, "result": {"message_id": 55}}),
+    ]
+    sleeps = []
+    clock = {"now": 100.0}
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+    monkeypatch.setattr(telegram_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(telegram_module.requests, "post", lambda *_args, **_kwargs: responses.pop(0))
+    monkeypatch.setattr(telegram_module.time, "sleep", fake_sleep)
+    client = TelegramClient("token", ["chat-1"], min_interval_per_chat_sec=0, min_interval_global_sec=0)
+
+    result = client.send("rate-limited message")
+
+    assert result[0]["sent"] is True
+    assert sleeps == [75.0]
+
+
+def test_telegram_client_enforces_conservative_per_chat_send_interval(monkeypatch):
+    import screener.telegram as telegram_module
+    from screener.telegram import TelegramClient
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"ok": True, "result": {"message_id": 1}}
+
+        def raise_for_status(self):
+            return None
+
+    clock = {"now": 100.0}
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(telegram_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(telegram_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(telegram_module.requests, "post", lambda *_args, **_kwargs: Response())
+    client = TelegramClient("token", ["chat-1"])
+
+    assert client.send("first")[0]["sent"] is True
+    assert client.send("second")[0]["sent"] is True
+    assert sleeps == [3.05]
+
+
+def test_telegram_client_enforces_bot_wide_broadcast_pacing(monkeypatch):
+    import screener.telegram as telegram_module
+    from screener.telegram import TelegramClient
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"ok": True, "result": {"message_id": 1}}
+
+        def raise_for_status(self):
+            return None
+
+    clock = {"now": 100.0}
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(telegram_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(telegram_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(telegram_module.requests, "post", lambda *_args, **_kwargs: Response())
+    client = TelegramClient("token", ["chat-1", "chat-2", "chat-3"])
+
+    result = client.send("one message to each recipient")
+
+    assert all(item["sent"] for item in result)
+    assert sleeps == [0.04, 0.04]
+
+
+def test_telegram_429_cooldown_applies_before_sending_to_other_recipients(monkeypatch):
+    import screener.telegram as telegram_module
+    from screener.telegram import TelegramClient
+
+    class Response:
+        def __init__(self, status, payload):
+            self.status_code = status
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise telegram_module.requests.HTTPError(f"HTTP {self.status_code}")
+
+    responses = [
+        Response(429, {"parameters": {"retry_after": 10}}),
+        Response(429, {"parameters": {"retry_after": 10}}),
+        Response(429, {"parameters": {"retry_after": 10}}),
+        Response(200, {"ok": True, "result": {"message_id": 2}}),
+    ]
+    recipients = []
+    clock = {"now": 100.0}
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    def fake_post(_url, *, json, timeout):
+        recipients.append(json["chat_id"])
+        return responses.pop(0)
+
+    monkeypatch.setattr(telegram_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(telegram_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(telegram_module.requests, "post", fake_post)
+    client = TelegramClient(
+        "token", ["chat-1", "chat-2"],
+        min_interval_per_chat_sec=0, min_interval_global_sec=0,
+    )
+
+    result = client.send("broadcast")
+
+    assert recipients == ["chat-1", "chat-1", "chat-1", "chat-2"]
+    assert sleeps == [10.0, 10.0, 10.0]
+    assert result[0]["sent"] is False
+    assert result[1]["sent"] is True

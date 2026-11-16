@@ -562,3 +562,36 @@ def test_notification_cache_detects_external_file_change_and_prune_refreshes_it(
     after_prune = store._current_notification_records()
     assert len(after_prune) == 2
     assert after_prune is store._notification_cache
+
+
+def test_cancelled_setup_requires_a_newer_trigger_anchor_for_same_pair_direction(tmp_path):
+    store = Store(tmp_path / "data")
+    group = "ALTUSDT_PERP|SHORT A — Trend Continuation"
+    close_time_ms = 1_800_000_000_000
+    store.record_notification(
+        f"CANCEL|{group}|old-anchor|{close_time_ms}", 10,
+        recipient_key="recipient-a", contract_type="PERPETUAL",
+        event_group=group, fingerprint="old", event_state="CANCELLED",
+        direction="SHORT", invalidation_level=1.25,
+    )
+
+    assert store.latest_cancelled_close_time_ms(
+        "ALTUSDT_PERP", "SHORT", recipient_key="recipient-a", contract_type="PERPETUAL"
+    ) == close_time_ms
+    assert store.latest_cancelled_close_time_ms(
+        "ALTUSDT_PERP", "LONG", recipient_key="recipient-a", contract_type="PERPETUAL"
+    ) is None
+    assert store.latest_cancelled_close_time_ms(
+        "ALTUSDT_PERP", "SHORT", recipient_key="recipient-b", contract_type="PERPETUAL"
+    ) is None
+
+    # A subsequent active lifecycle in the same group clears the old cooldown.
+    store.record_notification(
+        f"ALTUSDT_PERP|SHORT A — Trend Continuation|{close_time_ms + 3_600_000}", 11,
+        recipient_key="recipient-a", contract_type="PERPETUAL",
+        event_group=group, fingerprint="new", event_state="ACTIVE",
+        direction="SHORT", invalidation_level=1.20,
+    )
+    assert store.latest_cancelled_close_time_ms(
+        "ALTUSDT_PERP", "SHORT", recipient_key="recipient-a", contract_type="PERPETUAL"
+    ) is None

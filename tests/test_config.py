@@ -61,3 +61,34 @@ def test_settings_read_optional_telegram_storage_hash_key(tmp_path, monkeypatch)
     settings = load_settings(tmp_path)
 
     assert settings.telegram_storage_hash_key == "stable-hash-secret"
+
+
+def test_expensive_optional_binance_context_is_opt_in(tmp_path: Path, monkeypatch):
+    _set_required_secrets(monkeypatch)
+    monkeypatch.delenv("BINANCE_FETCH_ORDERBOOK", raising=False)
+
+    settings = load_settings(tmp_path)
+
+    assert settings.binance_fetch_orderbook is False
+    assert settings.p1["scanner"]["fetch_15m_context"] is False
+
+    monkeypatch.setenv("BINANCE_FETCH_15M_CONTEXT", "true")
+    settings = load_settings(tmp_path)
+    assert settings.p1["scanner"]["fetch_15m_context"] is True
+
+    monkeypatch.setenv("BINANCE_FETCH_ORDERBOOK", "true")
+    settings = load_settings(tmp_path)
+    assert settings.binance_fetch_orderbook is True
+
+
+def test_live_telegram_configuration_warns_when_storage_hash_key_is_not_stable(tmp_path, monkeypatch, caplog):
+    _set_required_secrets(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_IDS", "12345")
+    monkeypatch.delenv("TELEGRAM_STORAGE_HASH_KEY", raising=False)
+
+    with caplog.at_level("WARNING"):
+        settings = load_settings(tmp_path)
+
+    assert settings.telegram_storage_hash_key == ""
+    assert "Rotating the bot token can orphan" in caplog.text

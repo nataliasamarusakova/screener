@@ -17,6 +17,8 @@ def test_higher_low_uses_only_confirmed_swings():
     assert len(lows) >= 2
     result = higher_low(values, left=1, right=1, lookback=30)
     assert result["confirmed"] is True
+    assert result["confirmation_open_time_ms"] > result["latest_open_time_ms"]
+    assert result["confirmation_close_time_ms"] == result["confirmation_open_time_ms"] + 59_999
 
 
 def test_higher_low_is_invalidated_by_any_later_close_below_latest_pivot(monkeypatch):
@@ -54,9 +56,9 @@ def test_weak_bounce_rejection_requires_the_latest_closed_candle(monkeypatch):
 def test_weak_bounce_rejection_accepts_fresh_bearish_sweep_below_resistance(monkeypatch):
     import screener.structure as structure
 
-    values = [candle(i, 115, 110, 112) for i in range(20)]
+    values = [candle(i, 115, 100, 112) for i in range(24)]
     values[-1] = Candle(
-        open_time_ms=19 * 60_000, close_time_ms=19 * 60_000 + 59_999,
+        open_time_ms=23 * 60_000, close_time_ms=23 * 60_000 + 59_999,
         open=108.5, high=110.0, low=105.0, close=107.0,
         volume=1, quote_volume=1, trades=10,
     )
@@ -276,3 +278,21 @@ def test_higher_low_rejects_invalid_max_age_configuration():
             assert "positive integer" in str(exc)
         else:
             raise AssertionError(f"Invalid max_age_bars={invalid!r} must be rejected")
+
+
+def test_weak_bounce_rejection_is_blocked_on_a_new_24h_low(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 115, 100, 112) for i in range(24)]
+    values[-1] = Candle(
+        open_time_ms=23 * 60_000, close_time_ms=23 * 60_000 + 59_999,
+        open=108.5, high=110.0, low=99.0, close=100.0,
+        volume=1, quote_volume=1, trades=10,
+    )
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([(0, 115.0), (10, 108.0)], []))
+    monkeypatch.setattr(structure, "atr", lambda *_args, **_kwargs: 2.0)
+
+    result = weak_bounce_rejection(values, left=1, right=1)
+
+    assert result["confirmed"] is False
+    assert "new 24H low" in result["reason"]

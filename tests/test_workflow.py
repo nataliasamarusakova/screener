@@ -45,9 +45,17 @@ def test_workflow_queues_pending_runs_and_does_not_commit_per_run_journal():
     assert 'if [[ -f data/poll_state.json ]]; then' in workflow
     assert 'git add data/poll_state.json' in workflow
     assert "git add data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl data/runs.jsonl" not in workflow
-    assert "touch data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl data/runs.jsonl" in workflow
+    assert "touch data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl" in workflow
     assert "git rm --cached -f data/runs.jsonl" in workflow
     assert "data/runs.jsonl" in gitignore
+    assert "python scripts/merge_state.py --source" in workflow
+    assert "for attempt in 1 2 3 4 5" in workflow
+    assert 'git fetch --no-tags origin "$GITHUB_REF"' in workflow
+    assert 'git reset --hard FETCH_HEAD' in workflow
+    assert 'if: always()' in workflow
+    assert 'if: always() && !cancelled()' not in workflow
+    assert 'timeout-minutes: 15' in workflow
+    assert 'timeout-minutes: 25' in workflow
 
 
 

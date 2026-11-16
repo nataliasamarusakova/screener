@@ -90,7 +90,7 @@ def test_possible_long_liquidation_flush_blocks_short_even_when_flows_are_positi
     assert no_cascade.passed is False
 
 
-def test_short_e_requires_three_snapshots_and_actual_flow_turn_down():
+def test_short_e_uses_live_flow_turn_down_without_waiting_for_another_4h_snapshot():
     row = MarketRow(
         symbol="ALTUSDT_PERP", name="ALT", price=10, chg24_pct=-2,
         market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=100_000_000,
@@ -106,7 +106,7 @@ def test_short_e_requires_three_snapshots_and_actual_flow_turn_down():
     values = [
         (2, 3, 300_000, 700_000, -3),
         (1, 2, 500_000, 500_000, -1),
-        (-4, -5, 400_000, 600_000, -1),
+        (1, 2, 400_000, 600_000, -1),
     ]
     history = [
         {"snapshot_at": (base_time + timedelta(hours=4 * index)).isoformat(),
@@ -167,8 +167,11 @@ def test_pons_is_five_of_six_not_long_a_when_ranked_twelfth_in_both_flows():
 
 
 def test_grass_keeps_six_of_six_but_surfaces_funding_sign_reversal_warning():
+    from copy import deepcopy
     from screener.config import DEFAULT_P1_CONFIG
 
+    config = deepcopy(DEFAULT_P1_CONFIG)
+    config["thresholds"]["strong_flow_min_rows"] = 1  # Isolate scenario behavior from the universe-size guard.
     row = MarketRow(
         symbol="GRASSUSDT_PERP.A", name="GRASS", price=1.0, chg24_pct=5.09,
         market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=100_000_000,
@@ -180,9 +183,9 @@ def test_grass_keeps_six_of_six_but_surfaces_funding_sign_reversal_warning():
         ls_ratio_1d=1.08, futures_imbalance_4h=7.6293, spot_imbalance_4h=4.2696,
         btc_corr7d=0.88,
     )
-    enriched, stats = analyze_universe([row], DEFAULT_P1_CONFIG)
+    enriched, stats = analyze_universe([row], config)
     result = evaluate_scenarios(
-        enriched[0], stats, DEFAULT_P1_CONFIG,
+        enriched[0], stats, config,
         technical={"trend_retest_long": {"confirmed": True, "level": 0.95, "retest_open_time_ms": 1_790_000_000_000}},
     )
     long_a = next(item for item in result if item.scenario.startswith("LONG A"))
@@ -283,7 +286,8 @@ def test_long_c_preparation_is_blocked_by_market_quality_flags():
 
     assert long_c.status == "BLOCKED_QUALITY"
     assert long_c.status != "PREPARATION"
-    assert "SPOT_IMBALANCE_NA" in long_c.quality_flags
+    assert "SPOT_IMBALANCE_NA" not in long_c.quality_flags
+    assert any("SPOT_IMBALANCE_NA" in note for note in enriched[0].diagnostic_notes)
     assert any(check.name == "Quality flags" and check.passed is False for check in long_c.checks)
 
 
@@ -412,3 +416,32 @@ def test_zero_known_liquidations_mean_no_cascade_not_unknown():
     assert enriched[0].long_liq_share is None
     assert no_cascade.passed is True
 
+
+
+def test_short_d_requires_material_oi_decline_before_liquidation_coverage():
+    row = MarketRow(
+        symbol="SMALLUSDT_PERP", name="SMALL", price=1.0, chg24_pct=-1.0,
+        volume24_usd=100_000_000, oi_usd=50_000_000,
+        oi_vol_ratio=0.5, vol_mktcap_ratio=0.5,
+        oi_chg24_pct=-0.21, oi_chg24_usd=-109_000,
+        oi_chg4h_pct=-0.2, oi_chg4h_usd=-100_000,
+        futures_imbalance_4h=-5.0, spot_imbalance_4h=-6.0,
+        liq_total24_usd=1_000_000, liq_long24_usd=900_000, liq_short24_usd=100_000,
+    )
+    enriched, stats = analyze_universe([row], {"thresholds": {}})
+    results = evaluate_scenarios(enriched[0], stats, {"thresholds": {}}, technical={"weak_bounce_rejection": {"confirmed": True}})
+    short_d = next(item for item in results if item.scenario.startswith("SHORT D"))
+
+    assert enriched[0].liquidation_coverage_of_oi_drop_pct is None
+    assert short_d.status == "BLOCKED_CAUSALITY"
+    assert next(check for check in short_d.checks if check.name == "OI 24H decline material").passed is False
+
+
+def test_empty_scenario_result_is_not_a_near_candidate():
+    from screener.models import ScenarioResult
+
+    result = ScenarioResult(
+        symbol="X", name="X", scenario="LONG A", direction="LONG",
+        checks=[], quality_flags=[], status="NOT_MET",
+    )
+    assert result.near_candidate is False

@@ -26,7 +26,8 @@ def test_metrics_keep_n_a_and_calculate_derived_fields():
     assert stats.median_f is not None
     assert enriched[0].futures_buy_share_pct == (100 + rows[0].futures_imbalance_4h) / 2
     assert enriched[0].spot_buy_share_pct is None
-    assert "SPOT_IMBALANCE_NA" in enriched[0].quality_flags
+    assert not enriched[0].quality_flags
+    assert any("SPOT_IMBALANCE_NA" in note for note in enriched[0].diagnostic_notes)
     assert enriched[0].long_liq_share == 0.8
     assert enriched[0].liq_imbalance == -0.6
     assert stats.warnings
@@ -44,12 +45,13 @@ def test_rank_map_ignores_non_finite_flow_values():
     assert count == 1
 
 
-def test_unavailable_price_is_a_quality_flag_not_a_dropped_row():
+def test_unavailable_price_is_diagnostic_not_a_quality_block_or_dropped_row():
     row = mk("ZERO", 1.0, 2.0, -1.0, 1.5, 1.0)
     row.price = None
     enriched, stats = analyze_universe([row], {"thresholds": {}})
     assert len(enriched) == 1
-    assert "PRICE_UNAVAILABLE_OR_ROUNDED_ZERO" in enriched[0].quality_flags
+    assert not enriched[0].quality_flags
+    assert any("PRICE_UNAVAILABLE_OR_ROUNDED_ZERO" in note for note in enriched[0].diagnostic_notes)
 
 
 def test_equal_flow_values_receive_shared_average_rank():
@@ -132,3 +134,83 @@ def test_strk_reference_report_derived_metrics_match_p1_formulas():
     assert abs(strk.rel_strength_vs_btc_pp - 2.59) < 1e-9
     assert abs(strk.long_liq_share - 0.31) < 1e-9
     assert abs(strk.liq_imbalance - 0.38) < 1e-9
+
+
+def test_rankings_exclude_quality_flagged_rows_before_medians_and_tails():
+    rows = [mk(f"X{i}", float(i), float(i), 1.0, 1.0, 0.0) for i in range(20)]
+    contaminated = mk("BAD", 10_000.0, 10_000.0, 1.0, 1.0, 0.0)
+    contaminated.vol_mktcap_ratio = 4.0
+    rows.append(contaminated)
+
+    enriched, stats = analyze_universe(rows, {"thresholds": {"strong_flow_quantile": 0.15}})
+    bad = next(item for item in enriched if item.symbol == "BAD")
+    clean_top = next(item for item in enriched if item.symbol == "X19")
+
+    assert bad.quality_flags
+    assert bad.f_rank_desc is None
+    assert bad.f_strong_buy is False
+    assert stats.median_f == 9.5
+    assert clean_top.f_strong_buy is True
+
+
+def test_top_flow_boundary_includes_entire_tied_group():
+    rows = [mk(f"X{i}", 10.0 if i < 4 else float(10 - i), 10.0 if i < 4 else float(10 - i), 1.0, 1.0, 0.0) for i in range(20)]
+    enriched, _ = analyze_universe(rows, {"thresholds": {"strong_flow_quantile": 0.15}})
+
+    assert all(item.f_strong_buy for item in enriched[:4])
+    assert all(item.s_strong_buy for item in enriched[:4])
+    assert len([item for item in enriched if item.f_strong_buy]) == 4
+
+
+def test_analysis_does_not_mutate_source_rows_when_deriving_quality_ratios():
+    row = mk("LOCAL", 1.0, 1.0, 1.0, 1.0, 0.0)
+    row.oi_vol_ratio = None
+    row.vol_mktcap_ratio = None
+    row.oi_mktcap_ratio = None
+
+    enriched, _ = analyze_universe([row], {"thresholds": {}})
+
+    assert enriched[0].quality_flags == []
+    assert row.oi_vol_ratio is None
+    assert row.vol_mktcap_ratio is None
+    assert row.oi_mktcap_ratio is None
+    assert enriched[0].market.oi_vol_ratio == 0.5
+    assert enriched[0].market.vol_mktcap_ratio == 0.1
+    assert enriched[0].market.oi_mktcap_ratio == 0.05
+
+
+def test_strong_flow_rank_flags_are_suppressed_below_minimum_clean_population():
+    rows = [mk(f"X{i}", float(i), float(i), 1.0, 1.0, 0.0) for i in range(19)]
+    enriched, stats = analyze_universe(rows, {"thresholds": {"strong_flow_quantile": 0.15}})
+
+    assert all(item.f_strong_buy is False for item in enriched)
+    assert all(item.s_strong_buy is False for item in enriched)
+    assert any("strong-flow ranks are suppressed" in warning for warning in stats.warnings)
+
+
+def test_spot_rank_flags_are_suppressed_when_clean_spot_sample_is_too_small():
+    rows = [mk(f"X{i}", float(i), None if i < 2 else float(i), 1.0, 1.0, 0.0) for i in range(20)]
+    enriched, stats = analyze_universe(rows, {"thresholds": {"strong_flow_min_rows": 20}})
+
+    assert any(item.f_strong_buy for item in enriched)
+    assert not any(item.s_strong_buy for item in enriched)
+    assert any("strong S rank flags are suppressed" in warning for warning in stats.warnings)
+
+
+def test_percentage_only_oi_decline_does_not_fabricate_usd_liquidation_coverage():
+    row = mk("PCTONLY", -5.0, -4.0, -2.0, -1.0, -3.0)
+    row.oi_chg24_usd = None
+    row.liq_total24_usd = 2_000_000.0
+
+    enriched, _ = analyze_universe([row], {"thresholds": {}})
+
+    assert enriched[0].liquidation_coverage_of_oi_drop_pct is None
+    assert enriched[0].oi_drop_mostly_voluntary is None
+
+
+def test_missing_bitcoin_row_is_reported_when_relative_strength_cannot_be_computed():
+    row = mk("ALT", 1.0, 1.0, 1.0, 1.0, 0.0)
+    enriched, stats = analyze_universe([row], {"thresholds": {"strong_flow_min_rows": 1}})
+
+    assert enriched[0].rel_strength_vs_btc_pp is None
+    assert any("BTC row/change unavailable" in warning for warning in stats.warnings)
