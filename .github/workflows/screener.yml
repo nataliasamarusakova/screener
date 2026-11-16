@@ -15,7 +15,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: screener
+  group: screener-${{ github.ref }}
   # Cron-job.org dispatches every five minutes. Let the active scan finish,
   # while keeping only the newest pending poll to avoid stale-run backlogs.
   queue: single
@@ -24,7 +24,8 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Leave a persistence window after the scanner step times out.
+    timeout-minutes: 25
     env:
       BINANCE_BASE_URL: https://fapi.binance.com
       BINANCE_VPN_ENABLED: "true"
@@ -232,6 +233,7 @@ jobs:
             fi
           fi
           python -m screener
+        timeout-minutes: 15
 
       - name: Stop Binance-only WireProxy
         if: always()
@@ -252,31 +254,84 @@ jobs:
           fi
 
       - name: Persist scanner state on the current branch
-        if: always() && !cancelled()
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
+            echo "Dry-run requested; persistent state will not be committed"
+            exit 0
+          fi
           if [[ "$GITHUB_REF" != refs/heads/* ]]; then
             echo "::error::State persistence requires a branch ref; got $GITHUB_REF"
             exit 1
           fi
+
           mkdir -p data
-          touch data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl data/runs.jsonl
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          # runs.jsonl is invocation diagnostics, not cross-run strategy state.
-          # Do not create a Git commit on every poll just because a run completed.
-          if git ls-files --error-unmatch data/runs.jsonl >/dev/null 2>&1; then
-            git rm --cached -f data/runs.jsonl
-          fi
-          git add data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl
+          touch data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl
+          state_backup="$(mktemp -d)"
+          cleanup() { rm -rf "$state_backup"; }
+          trap cleanup EXIT
+          cp data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl "$state_backup/"
           if [[ -f data/poll_state.json ]]; then
-            git add data/poll_state.json
+            cp data/poll_state.json "$state_backup/"
           fi
-          if git diff --cached --quiet; then
-            echo "No scanner state changes to commit"
-            exit 0
+
+          # Serialize this workflow with queue: single, but also reconcile with
+          # external branch updates (manual pushes/other workflows). JSONL files
+          # are merged by record identity and validated before a commit is made.
+          pushed=false
+          for attempt in 1 2 3 4 5; do
+            echo "Persisting scanner state (attempt ${attempt}/5)"
+            if ! git fetch --no-tags origin "$GITHUB_REF"; then
+              if [[ "$attempt" -lt 5 ]]; then
+                echo "::warning::Unable to fetch branch; retrying state persistence"
+                sleep "$attempt"
+                continue
+              fi
+              echo "::error::Unable to fetch branch after five attempts"
+              exit 1
+            fi
+            git reset --hard FETCH_HEAD
+            mkdir -p data
+            python -m screener.merge_state --source "$state_backup" --target data
+
+            # runs.jsonl is invocation diagnostics, not cross-run strategy state.
+            if git ls-files --error-unmatch data/runs.jsonl >/dev/null 2>&1; then
+              git rm --cached -f data/runs.jsonl
+            fi
+            git add data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl
+            if [[ -f data/poll_state.json ]]; then
+              git add data/poll_state.json
+            fi
+            if git diff --cached --quiet; then
+              echo "Scanner state is already present on ${GITHUB_REF}; nothing to commit"
+              pushed=true
+              break
+            fi
+
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit -m "Persist screener state [skip ci]"
+            if git push origin "HEAD:${GITHUB_REF}"; then
+              echo "Persisted scanner state on ${GITHUB_REF}"
+              pushed=true
+              break
+            fi
+
+            if [[ "$attempt" -lt 5 ]]; then
+              echo "::warning::State push failed; refreshing branch and merging append-only records before retry"
+              cp data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl "$state_backup/"
+              if [[ -f data/poll_state.json ]]; then
+                cp data/poll_state.json "$state_backup/"
+              else
+                rm -f "$state_backup/poll_state.json"
+              fi
+              sleep "$attempt"
+            fi
+          done
+
+          if [[ "$pushed" != true ]]; then
+            echo "::error::Unable to persist scanner state after five attempts"
+            exit 1
           fi
-          git commit -m "Persist screener state [skip ci]"
-          git push origin "HEAD:${GITHUB_REF}"
-          echo "Persisted screener state on ${GITHUB_REF}"
