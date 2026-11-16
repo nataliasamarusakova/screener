@@ -43,18 +43,33 @@ def confirmed_pivots(
     return highs, lows
 
 
-def higher_low(candles: list[Candle], left: int = 2, right: int = 2, lookback: int = 60) -> dict[str, Any]:
+def higher_low(
+    candles: list[Candle], left: int = 2, right: int = 2, lookback: int = 60,
+    *, max_age_bars: int = 24,
+) -> dict[str, Any]:
+    """Confirm a higher low only while its latest pivot remains recent and unbroken.
+
+    ``max_age_bars`` is measured from the pivot candle to the latest closed 1H
+    candle. The default 24 bars prevents a pre-existing swing from validating a
+    fresh setup a day or more after that structure formed.
+    """
+    if isinstance(max_age_bars, bool) or not isinstance(max_age_bars, int) or max_age_bars < 1:
+        raise ValueError("max_age_bars must be a positive integer")
     _, lows = confirmed_pivots(candles, left, right, lookback)
     if len(lows) < 2:
         return {"confirmed": False, "reason": "Need at least two confirmed 1H swing lows", "pivot_lows": [x[1] for x in lows]}
     previous, latest = lows[-2], lows[-1]
     later_closes = [candle.close for candle in candles[latest[0] + 1:]]
     invalidated = any(close < latest[1] for close in later_closes)
-    confirmed = latest[1] > previous[1] and not invalidated
+    age_bars = len(candles) - 1 - latest[0]
+    stale = age_bars > max_age_bars
+    confirmed = latest[1] > previous[1] and not invalidated and not stale
     if invalidated:
         reason = "Latest confirmed swing low was invalidated by a later 1H close"
+    elif stale:
+        reason = f"Latest confirmed swing low is stale ({age_bars} bars; maximum {max_age_bars})"
     elif confirmed:
-        reason = "Latest confirmed swing low is higher and remains unbroken"
+        reason = "Latest confirmed swing low is higher, recent and remains unbroken"
     else:
         reason = "Latest confirmed swing low is not higher"
     return {
@@ -64,6 +79,11 @@ def higher_low(candles: list[Candle], left: int = 2, right: int = 2, lookback: i
         "latest_low": latest[1],
         "previous_open_time_ms": candles[previous[0]].open_time_ms,
         "latest_open_time_ms": candles[latest[0]].open_time_ms,
+        # The pivot itself is the stable event identity. The confirmation bar
+        # is the earliest time at which the right-side candles made it knowable.
+        "confirmation_open_time_ms": candles[latest[0] + right].open_time_ms,
+        "age_bars": age_bars,
+        "max_age_bars": max_age_bars,
     }
 
 

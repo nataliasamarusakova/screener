@@ -38,6 +38,8 @@ class Store:
             path.touch(exist_ok=True)
         self._manifests_cache: list[dict[str, Any]] | None = None
         self._history_cache: dict[str, list[dict[str, Any]]] | None = None
+        self._notification_cache: list[dict[str, Any]] | None = None
+        self._notification_cache_signature: tuple[int, int] | None = None
 
     @property
     def paths(self) -> tuple[Path, Path, Path, Path]:
@@ -541,11 +543,20 @@ class Store:
                 return False
         return True
 
+    def _notification_file_signature(self) -> tuple[int, int]:
+        stat = self.notifications_path.stat()
+        return stat.st_mtime_ns, stat.st_size
+
     def _current_notification_records(self) -> list[dict[str, Any]]:
-        return [
-            item for item in self._read_jsonl(self.notifications_path)
-            if self._is_current_notification_record(item)
-        ]
+        """Read current-schema notification records once per unchanged file state."""
+        signature = self._notification_file_signature()
+        if self._notification_cache is None or signature != self._notification_cache_signature:
+            self._notification_cache = [
+                item for item in self._read_jsonl(self.notifications_path)
+                if self._is_current_notification_record(item)
+            ]
+            self._notification_cache_signature = signature
+        return self._notification_cache
 
     def _notification_records(
         self, event_key: str, *, recipient_key: str, contract_type: str,
@@ -677,7 +688,19 @@ class Store:
             record["scenario_code"] = str(scenario_code).upper()
         if error:
             record["error"] = str(error)[:500]
+        cache_was_current = (
+            self._notification_cache is not None
+            and self._notification_cache_signature == self._notification_file_signature()
+        )
         self._append_jsonl(self.notifications_path, record)
+        if cache_was_current:
+            # Keep the in-memory index warm: repeated notification_exists() calls
+            # in the same scan must not re-parse the complete JSONL after every append.
+            self._notification_cache.append(record)
+            self._notification_cache_signature = self._notification_file_signature()
+        else:
+            self._notification_cache = None
+            self._notification_cache_signature = None
 
     def active_notification_states(
         self,
@@ -844,6 +867,10 @@ class Store:
         deleted_notifications = len(raw_notifications) - len(kept_notifications)
         if deleted_notifications:
             self._rewrite_jsonl(self.notifications_path, kept_notifications)
+        self._notification_cache = [
+            item for item in kept_notifications if self._is_current_notification_record(item)
+        ]
+        self._notification_cache_signature = self._notification_file_signature()
 
         return {
             "snapshots_deleted": deleted_snapshots,

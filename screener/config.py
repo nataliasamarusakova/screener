@@ -38,6 +38,8 @@ DEFAULT_P1_CONFIG: dict[str, Any] = {
         "swing_left_bars": 2,
         "swing_right_bars": 2,
         "pivot_lookback_bars": 60,
+        # A higher-low trigger must use a swing formed within the last 24 closed 1H bars.
+        "higher_low_max_age_bars": 24,
         "retest_lookback_bars": 8,
         "retest_atr_tolerance": 0.25,
         "weak_rejection_wick_body_ratio": 0.75,

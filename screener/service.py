@@ -114,7 +114,10 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
         result["context_4h"] = {"trend": f"unavailable: {exc}"}
     try:
         candles1h = client.fetch_candles(fetch_symbol, "1h", settings.binance_kline_limit)
-        result["higher_low"] = higher_low(candles1h, left, right, lookback)
+        result["higher_low"] = higher_low(
+            candles1h, left, right, lookback,
+            max_age_bars=int(structure_cfg.get("higher_low_max_age_bars", 24)),
+        )
         result["trend_retest_long"] = breakout_and_retest(
             candles1h, "LONG", left=left, right=right, lookback=lookback,
             retest_lookback=retest_lookback, atr_tolerance=atr_tolerance,
@@ -376,6 +379,29 @@ def _confirmation_anchor(result: ScenarioResult) -> int | None:
     return value if isinstance(value, int) and value > 0 else None
 
 
+def _confirmation_time(result: ScenarioResult) -> int | None:
+    """Return when the scenario became confirmable, not merely its pivot identity."""
+    technical = result.technical or {}
+    if _scenario_code(result.scenario) in {"LONG B", "LONG D"}:
+        value = (technical.get("higher_low") or {}).get("confirmation_open_time_ms")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return _confirmation_anchor(result)
+
+
+def _latest_opposite_candidate(candidates: list[tuple[ScenarioResult, EnrichedRow, tuple[str, str, str, float]]]):
+    """Choose the candidate with the newest confirmed trigger candle.
+
+    Candidate identity contains an event-key string, not a sortable timestamp;
+    lexicographical event-key ordering must never decide a reversal. For a
+    higher-low setup, ordering uses the bar that confirmed the pivot while the
+    pivot timestamp remains the stable notification identity.
+    """
+    if not candidates:
+        raise ValueError("Cannot choose a reversal from an empty candidate list")
+    return max(candidates, key=lambda item: _confirmation_time(item[0]) or 0)
+
+
 def _has_required_confirmation(result: ScenarioResult, row: EnrichedRow) -> bool:
     """Fail closed: P1 checks, a specific chart trigger and an invalidation level are mandatory."""
     if result.status not in {"CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"}:
@@ -541,6 +567,24 @@ def _record_permanent_delivery_failure(
     )
 
 
+def _has_retryable_notification_failures(outcomes: list[dict[str, Any]]) -> bool:
+    """Keep the poll uncommitted when a notification can safely be retried.
+
+    SENT, UNKNOWN and permanent FAILED outcomes are terminal for idempotency.
+    A definite transient failure (for example exhausted Telegram 429 retries)
+    is not recorded in notification history and must be retried on a later scan.
+    """
+    for outcome in outcomes:
+        if outcome.get("processing_error"):
+            return True
+        delivery = outcome.get("delivery")
+        if not isinstance(delivery, dict):
+            continue
+        if not delivery.get("sent") and not delivery.get("delivery_unknown") and not delivery.get("permanent_failure"):
+            return True
+    return False
+
+
 def _collect_notifications(
     results: list[ScenarioResult],
     rows: list[EnrichedRow],
@@ -599,6 +643,7 @@ def _collect_notifications(
     # A confirmed opposite setup is a reversal. Aggregate all previously active
     # same-side scenarios for the pair into one standalone reversal notification.
     reversed_groups: set[tuple[str, str]] = set()
+    pending_reversal_groups: set[tuple[str, str]] = set()
     outcomes: list[dict[str, Any]] = []
     active_by_pair_recipient: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for active in contract_active_states:
@@ -627,7 +672,7 @@ def _collect_notifications(
                 opposite_new.append(candidate)
         if not opposite_new:
             continue
-        new_result, new_row, new_identity = max(opposite_new, key=lambda item: item[2][1])
+        new_result, new_row, new_identity = _latest_opposite_candidate(opposite_new)
         new_group, new_event_key, new_fingerprint, new_level = new_identity
         new_direction = new_result.direction.upper()
         old_actives = [
@@ -718,7 +763,13 @@ def _collect_notifications(
                 scenario_code=_scenario_code(new_result.scenario), contract_type=contract_type,
                 delivery_status=delivery_status,
             )
-            outcomes.append({"type": "reversal", "symbol": symbol, "sent": bool(delivery.get("sent")), "delivery": delivery})
+        elif not delivery.get("permanent_failure"):
+            # Do not send a separate cancellation for the same old setup in this
+            # run after its combined reversal message hit a retryable failure.
+            pending_reversal_groups.update(
+                (str(old.get("event_group") or ""), recipient_key) for old in old_actives
+            )
+        outcomes.append({"type": "reversal", "symbol": symbol, "sent": bool(delivery.get("sent")), "delivery": delivery})
 
     # Invalidate remaining ACTIVE scenarios by the exact 1H level saved when
     # their original message was sent. Each cancellation is its own Telegram post.
@@ -726,7 +777,7 @@ def _collect_notifications(
         group = str(active.get("event_group") or "")
         symbol, scenario, direction = _event_group_parts(group)
         recipient_key = str(active["recipient_key"])
-        if (group, recipient_key) in reversed_groups:
+        if (group, recipient_key) in reversed_groups or (group, recipient_key) in pending_reversal_groups:
             continue
         current_result = results_by_group.get(group)
         technical = (current_result.technical or {}) if current_result is not None else {}
@@ -758,8 +809,7 @@ def _collect_notifications(
             _record_permanent_delivery_failure(
                 store, cancel_failure_key, recipient_key, active_contract_type, delivery
             )
-            continue
-        if delivery.get("sent") or delivery.get("delivery_unknown"):
+        elif delivery.get("sent") or delivery.get("delivery_unknown"):
             store.record_notification(
                 cancel_key, delivery.get("message_id"), recipient_key=recipient_key,
                 event_group=group, fingerprint=str(active["fingerprint"]),
@@ -768,8 +818,8 @@ def _collect_notifications(
                 delivery_status="SENT" if delivery.get("sent") else "UNKNOWN",
                 error=str(delivery.get("error") or "") or None,
             )
-        if delivery.get("sent"):
-            outcomes.append({"type": "cancellation", "symbol": symbol, "sent": True, "delivery": delivery})
+        if not delivery.get("permanent_failure"):
+            outcomes.append({"type": "cancellation", "symbol": symbol, "sent": bool(delivery.get("sent")), "delivery": delivery})
 
     # New confirmations are sent as separate Telegram posts, one signal per
     # message and recipient. An already ACTIVE group is never repeated because
@@ -812,6 +862,10 @@ def _collect_notifications(
                 message = format_alert(result, row, result.technical, fetched_at=fetched_at)
             except (TypeError, ValueError) as exc:
                 log.error("Cannot format confirmed signal %s %s: %s", result.symbol, result.scenario, exc)
+                outcomes.append({
+                    "type": "confirmed_signal", "sent": False, "symbol": result.symbol,
+                    "scenario": result.scenario, "processing_error": True, "error": str(exc),
+                })
                 continue
 
             # One call to sendMessage per signal. Do not combine messages,
@@ -867,7 +921,12 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         snapshot_interval_hours = float(snapshot_cfg.get("snapshot_interval_hours", 4.0))
         snapshot_tolerance_minutes = int(snapshot_cfg.get("snapshot_interval_tolerance_minutes", 10))
         snapshot_saved = False
-        if not unchanged and store.snapshot_due(
+        if scrape.missing_required_columns:
+            log.warning(
+                "Skipping P1 history snapshot because required columns are missing: %s",
+                ", ".join(scrape.missing_required_columns),
+            )
+        elif not unchanged and store.snapshot_due(
             scrape.fetched_at,
             interval_hours=snapshot_interval_hours,
             tolerance_minutes=snapshot_tolerance_minutes,
@@ -888,6 +947,7 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             stats.warnings.append("Missing recognized optional/required columns: " + ", ".join(scrape.missing_columns))
         if scrape.missing_required_columns:
             stats.warnings.append("Missing REQUIRED P1 columns: " + ", ".join(scrape.missing_required_columns))
+            stats.warnings.append("Snapshot not committed to P1 history because the required schema is incomplete")
         if scrape.contract_type == "UNKNOWN":
             stats.warnings.append("Perpetual vs All Contracts could not be verified")
         candidate_symbols = _preliminary_candidate_symbols(
@@ -947,14 +1007,22 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         )
         visible_results = [r for r in results if r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE", "OBSERVATION_AFTER_BOUNCE"}]
         store.finish_run(run_id, len(scrape.rows), len(visible_results), "OK")
+        retryable_delivery_failures = _has_retryable_notification_failures(notifications)
+        if retryable_delivery_failures:
+            log.warning(
+                "Last-poll marker not advanced: at least one notification has a retryable delivery failure"
+            )
+        poll_state_updated = False
         if (
             not use_dry_run
             and allowed
             and not unchanged
+            and not retryable_delivery_failures
             and settings.telegram_bot_token
             and settings.telegram_chat_ids
         ):
             store.record_poll(scrape.contract_type, scrape.rows, polled_at=scrape.fetched_at)
+            poll_state_updated = True
         log.info("Scan complete: rows=%d near-scenarios=%d contract=%s", len(scrape.rows), len(visible_results), scrape.contract_type)
         return {
             "status": "OK",
@@ -967,6 +1035,8 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             "stats": stats,
             "results": visible_results,
             "notifications": notifications,
+            "retryable_delivery_failures": retryable_delivery_failures,
+            "poll_state_updated": poll_state_updated,
             "alert_guard": guard_reason,
         }
     except IncompleteUniverseError as exc:

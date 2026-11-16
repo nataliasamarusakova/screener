@@ -121,8 +121,22 @@ REQUIRED_FOR_P1 = {
 }
 
 
-def _build_header_map(soup: BeautifulSoup) -> tuple[dict[str, int], list[str], list[int], list[int]]:
-    ths = soup.select("thead tr th")
+def _find_market_table(soup: BeautifulSoup) -> Any:
+    """Select the table that owns market rows instead of mixing page-wide tables."""
+    for table in soup.find_all("table"):
+        if table.select_one("tbody tr[data-coin], tbody tr[data-symbol]") and table.select("thead tr th"):
+            return table
+    raise CoinalyzeError("Не найдена таблица Coinalyze с data-coin/data-symbol и заголовками.")
+
+
+def _build_header_map(table: Any) -> tuple[dict[str, int], list[str], list[int], list[int]]:
+    header_rows = table.select("thead tr")
+    if not header_rows:
+        raise CoinalyzeError("Не найдена строка заголовков thead/th.")
+    # Grouped headers may add one or more short rows. Map the row with the
+    # greatest number of direct header cells (the actual column-label row).
+    header_row = max(header_rows, key=lambda row: len(row.find_all("th", recursive=False)))
+    ths = header_row.find_all("th", recursive=False)
     if not ths:
         raise CoinalyzeError("Не найдена строка заголовков thead/th.")
     headers = [_header_text(th) for th in ths]
@@ -203,10 +217,11 @@ def _disambiguate_oi(cells: list[Any], indices: list[int]) -> tuple[float | None
 
 def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[str]]:
     soup = BeautifulSoup(html, "lxml")
-    trs = soup.select("tbody tr")
+    table = _find_market_table(soup)
+    trs = table.select("tbody > tr")
     if not trs:
         raise CoinalyzeError("Таблица Coinalyze не содержит tbody/tr.")
-    index, headers, oi24_ambiguous, oi4h_ambiguous = _build_header_map(soup)
+    index, headers, oi24_ambiguous, oi4h_ambiguous = _build_header_map(table)
     available = set(index)
     # Coinalyze renders percentage and USD OI changes as duplicate visible labels.
     if len(oi24_ambiguous) >= 2:
@@ -217,11 +232,15 @@ def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[
     missing_required = sorted(REQUIRED_FOR_P1 - available)
 
     out: list[MarketRow] = []
+    seen_symbols: set[str] = set()
     for row_idx, tr in enumerate(trs, start=1):
         symbol = str(tr.get("data-coin") or tr.get("data-symbol") or "").strip().upper()
-        cells = tr.find_all("td")
+        cells = tr.find_all("td", recursive=False)
         if not symbol or not cells:
             raise CoinalyzeError(f"Invalid Coinalyze row {row_idx}: missing symbol or cells; refusing partial universe")
+        if symbol in seen_symbols:
+            raise CoinalyzeError(f"Duplicate Coinalyze symbol {symbol} on the same page; refusing ambiguous universe")
+        seen_symbols.add(symbol)
         name = symbol
         coin_cell_index = index.get("coin")
         if coin_cell_index is not None and coin_cell_index < len(cells):
@@ -308,7 +327,10 @@ def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[
                 cells, index, "spot_imbalance_4h", minimum=-100.0, maximum=100.0,
                 invalid_fields=invalid_market_fields, symbol=symbol,
             ),
-            btc_corr7d=_value(cells, index, "btc_corr7d"),
+            btc_corr7d=_validated_market_value(
+                cells, index, "btc_corr7d", minimum=-1.0, maximum=1.0,
+                invalid_fields=invalid_market_fields, symbol=symbol,
+            ),
             raw={
                 "row_number": row_idx,
                 "price_raw": price_raw,
@@ -461,6 +483,32 @@ def _pagination_urls(html: str, base_url: str) -> list[str]:
     return urls
 
 
+def _pagination_next_is_disabled(next_button: Any) -> bool:
+    """Treat hidden/disabled Bootstrap parent controls as an unavailable Next link."""
+    try:
+        if not next_button.is_visible():
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(next_button.evaluate("""(node) => {
+            const parent = node.closest('li.disabled, .page-item.disabled, [aria-disabled="true"]');
+            return Boolean(
+                node.disabled ||
+                node.hasAttribute('disabled') ||
+                node.getAttribute('aria-disabled') === 'true' ||
+                (parent && (
+                    parent.classList.contains('disabled') ||
+                    parent.getAttribute('aria-disabled') === 'true'
+                ))
+            );
+        }"""))
+    except Exception:
+        disabled = next_button.get_attribute("disabled") is not None
+        aria_disabled = (next_button.get_attribute("aria-disabled") or "").lower() == "true"
+        return disabled or aria_disabled
+
+
 def fetch_table(
     *,
     url: str,
@@ -531,7 +579,7 @@ def fetch_table(
                     next_button = pagination.locator("a[rel='next'], button[aria-label='Next'], a[aria-label='Next'], .next").first
                     if next_button.count() == 0:
                         break
-                    if next_button.get_attribute("disabled") is not None or (next_button.get_attribute("aria-disabled") or "").lower() == "true":
+                    if _pagination_next_is_disabled(next_button):
                         break
                     next_button.click()
                     page.wait_for_timeout(1200)
@@ -547,10 +595,7 @@ def fetch_table(
                     ).first
                     has_enabled_next = next_button.count() > 0
                     if has_enabled_next:
-                        has_enabled_next = (
-                            next_button.get_attribute("disabled") is None
-                            and (next_button.get_attribute("aria-disabled") or "").lower() != "true"
-                        )
+                        has_enabled_next = not _pagination_next_is_disabled(next_button)
                     if has_enabled_next:
                         raise IncompleteUniverseError(
                             f"Достигнут лимит страниц Coinalyze ({max_pages}); полнота не подтверждена."
@@ -570,10 +615,13 @@ def fetch_table(
                 missing_required = page_missing_required
                 added = 0
                 for row in page_rows:
-                    if row.symbol not in seen:
-                        rows.append(row)
-                        seen.add(row.symbol)
-                        added += 1
+                    if row.symbol in seen:
+                        raise IncompleteUniverseError(
+                            f"Duplicate Coinalyze symbol {row.symbol} across pages; refusing an ambiguous universe."
+                        )
+                    rows.append(row)
+                    seen.add(row.symbol)
+                    added += 1
                 if page_no > 1 and added == 0:
                     raise IncompleteUniverseError(
                         f"Страница Coinalyze {page_no} не добавила новых монет; пагинация могла повторить первую страницу."
