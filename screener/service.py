@@ -923,6 +923,8 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             max_pages=settings.coinalyze_max_pages,
             headless=settings.coinalyze_headless,
             timeout_ms=settings.coinalyze_timeout_ms,
+            page_attempts=getattr(settings, "coinalyze_page_attempts", 3),
+            retry_backoff_sec=getattr(settings, "coinalyze_retry_backoff_sec", 3.0),
         )
         # Dry runs retain the legacy 4H duplicate-snapshot check but never
         # mutate the new last-successful-live-poll marker.

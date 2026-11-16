@@ -24,6 +24,10 @@ class IncompleteUniverseError(CoinalyzeError):
     """A page/pagination failure means the universe is incomplete; do not analyze it."""
 
 
+class RetryableCoinalyzeError(CoinalyzeError):
+    """A temporary navigation/table-readiness failure that may succeed on retry."""
+
+
 @dataclass(slots=True)
 class ScrapeResult:
     rows: list[MarketRow]
@@ -428,24 +432,39 @@ def _apply_stealth(page: Any) -> None:
             ) from exc
 
 
+def _is_retryable_browser_exception(exc: Exception) -> bool:
+    """Only retry timeout/navigation failures emitted by the browser boundary."""
+    return isinstance(exc, TimeoutError) or type(exc).__module__.startswith("playwright.")
+
+
 def _page_content(page: Any, url: str, timeout_ms: int) -> str:
-    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-    page.wait_for_timeout(3000)
+    # Waiting for DOMContentLoaded can time out on pages with slow third-party
+    # resources even after the document and table response have been committed.
+    # Wait for the navigation commit, then for the actual data-bearing selector.
+    page.goto(url, wait_until="commit", timeout=timeout_ms)
     if "Attention Required" in page.content():
         log.warning("Coinalyze anti-bot challenge detected; waiting before table readiness check")
         page.wait_for_timeout(10_000)
     try:
         page.wait_for_selector("tbody tr", timeout=timeout_ms)
     except Exception as exc:
-        body = page.locator("body").inner_text(timeout=3000).lower()
+        if not _is_retryable_browser_exception(exc):
+            raise
+        try:
+            body = page.locator("body").inner_text(timeout=3000).lower()
+        except Exception:
+            body = ""
         if any(marker in body for marker in ("sign in", "log in", "login", "access denied")):
             raise CoinalyzeError(
                 "Coinalyze не показал таблицу: сессия не авторизована или cookies истекли. "
                 "Обнови COINALYZE_P_SID и COINALYZE_CHAT_SID в GitHub Secrets."
             ) from exc
-        raise CoinalyzeError(
-            "Coinalyze не показал tbody tr. Проверь сохранённый URL, cookies и текущую HTML-разметку сайта."
+        raise RetryableCoinalyzeError(
+            "Coinalyze navigation completed, but tbody tr was not ready before the timeout."
         ) from exc
+    # Let client-side row decoration and pagination controls settle after the
+    # first row appears; the selector above, not DOMContentLoaded, is readiness.
+    page.wait_for_timeout(1500)
     previous = page.locator("tbody tr").count()
     for attempt in range(15):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -461,21 +480,44 @@ def _page_content(page: Any, url: str, timeout_ms: int) -> str:
     return page.content()
 
 
-def _page_content_with_retry(page: Any, url: str, timeout_ms: int, attempts: int = 2) -> str:
+def _page_content_with_retry(
+    page: Any,
+    url: str,
+    timeout_ms: int,
+    attempts: int = 3,
+    retry_backoff_sec: float = 3.0,
+) -> str:
+    """Retry transient navigation failures without retrying permanent auth/config errors."""
+    attempts = max(1, min(5, int(attempts)))
+    retry_backoff_sec = max(0.0, min(30.0, float(retry_backoff_sec)))
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
             return _page_content(page, url, timeout_ms)
-        except Exception as exc:
+        except CoinalyzeError as exc:
+            # Expired cookies and invalid page state are not fixed by waiting.
+            if not isinstance(exc, RetryableCoinalyzeError):
+                raise
             last_error = exc
-            if attempt >= attempts:
-                break
-            log.warning(
-                "Coinalyze page load attempt %d/%d failed (%s); retrying",
-                attempt, attempts, type(exc).__name__,
-            )
-            time.sleep(2.0)
-    raise CoinalyzeError(f"Не удалось загрузить таблицу Coinalyze после {attempts} попыток: {last_error}") from last_error
+        except Exception as exc:
+            # Retry actual Playwright failures (including its TimeoutError) and
+            # built-in timeouts; do not conceal programming or data errors.
+            if not _is_retryable_browser_exception(exc):
+                raise
+            last_error = exc
+        if attempt >= attempts:
+            break
+        delay = retry_backoff_sec * (2 ** (attempt - 1))
+        log.warning(
+            "Coinalyze page load attempt %d/%d failed (%s); retrying in %.1fs",
+            attempt, attempts, type(last_error).__name__, delay,
+        )
+        if delay:
+            time.sleep(delay)
+    raise CoinalyzeError(
+        f"Не удалось загрузить таблицу Coinalyze после {attempts} попыток "
+        f"(timeout={timeout_ms}ms): {last_error}"
+    ) from last_error
 
 
 def _pagination_urls(html: str, base_url: str) -> list[str]:
@@ -541,7 +583,9 @@ def fetch_table(
     chat_sid: str = "",
     max_pages: int = 20,
     headless: bool = True,
-    timeout_ms: int = 30_000,
+    timeout_ms: int = 45_000,
+    page_attempts: int = 3,
+    retry_backoff_sec: float = 3.0,
 ) -> ScrapeResult:
     """Fetch the paginated Perpetual table using the saved URL and GitHub Secrets cookies."""
     parsed_url = urlparse(url)
@@ -579,7 +623,9 @@ def fetch_table(
         page = context.new_page()
         _apply_stealth(page)
         try:
-            first_html = _page_content_with_retry(page, url, timeout_ms)
+            first_html = _page_content_with_retry(
+                page, url, timeout_ms, attempts=page_attempts, retry_backoff_sec=retry_backoff_sec
+            )
             # The user-provided saved URL explicitly selects contract_type=perpetual.
             contract_type = detect_contract_type(first_html, url)
             first_urls = _pagination_urls(first_html, url)
@@ -589,7 +635,11 @@ def fetch_table(
             if len(first_urls) > 1:
                 for page_url in first_urls[1:]:
                     try:
-                        html_pages.append(_page_content_with_retry(page, page_url, timeout_ms))
+                        html_pages.append(_page_content_with_retry(
+                            page, page_url, timeout_ms,
+                            attempts=page_attempts,
+                            retry_backoff_sec=retry_backoff_sec,
+                        ))
                     except Exception as exc:
                         raise IncompleteUniverseError(f"Не удалось загрузить страницу {len(html_pages) + 1}: {exc}") from exc
             else:

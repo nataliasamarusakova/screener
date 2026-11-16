@@ -82,6 +82,8 @@ class Settings:
     dry_run: bool
     p1: dict[str, Any]
     telegram_storage_hash_key: str = ""
+    coinalyze_page_attempts: int = 3
+    coinalyze_retry_backoff_sec: float = 3.0
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -111,7 +113,7 @@ def load_settings(root: Path = ROOT) -> Settings:
         coinalyze_chat_sid=os.getenv("COINALYZE_CHAT_SID", "").strip(),
         coinalyze_max_pages=max(1, min(100, int(os.getenv("COINALYZE_MAX_PAGES", "20")))),
         coinalyze_headless=_bool_env("COINALYZE_HEADLESS", True),
-        coinalyze_timeout_ms=max(5000, int(os.getenv("COINALYZE_TIMEOUT_MS", "30000"))),
+        coinalyze_timeout_ms=max(5000, min(120_000, int(os.getenv("COINALYZE_TIMEOUT_MS", "45000")))),
         binance_base_url=os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/"),
         binance_http_proxy=os.getenv("BINANCE_HTTP_PROXY", "").strip(),
         binance_vpn_enabled=_bool_env("BINANCE_VPN_ENABLED", False),
@@ -128,6 +130,10 @@ def load_settings(root: Path = ROOT) -> Settings:
         dry_run=_bool_env("DRY_RUN", True),
         p1={section: values.copy() for section, values in strategy.items()},
         telegram_storage_hash_key=os.getenv("TELEGRAM_STORAGE_HASH_KEY", "").strip(),
+        coinalyze_page_attempts=max(1, min(5, int(os.getenv("COINALYZE_PAGE_ATTEMPTS", "3")))),
+        coinalyze_retry_backoff_sec=max(
+            0.0, min(30.0, float(os.getenv("COINALYZE_RETRY_BACKOFF_SEC", "3")))
+        ),
     )
 
     settings.p1.setdefault("scanner", {})["fetch_15m_context"] = _bool_env(
