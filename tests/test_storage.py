@@ -520,3 +520,45 @@ def test_active_notification_write_rejects_incomplete_lifecycle_state(tmp_path):
             event_group="BTCUSDT_PERP.A|LONG A", fingerprint="fingerprint",
             event_state="ACTIVE", direction="UNKNOWN", invalidation_level=70_000,
         )
+
+
+def test_notification_records_are_cached_and_updated_after_append(tmp_path):
+    store = Store(tmp_path / "data")
+    store.record_notification(
+        "event-1", 1, recipient_key="recipient-a", contract_type="PERPETUAL"
+    )
+
+    first = store._current_notification_records()
+    second = store._current_notification_records()
+    assert first is second
+    assert len(first) == 1
+
+    store.record_notification(
+        "event-2", 2, recipient_key="recipient-a", contract_type="PERPETUAL"
+    )
+    refreshed = store._current_notification_records()
+    assert refreshed is first
+    assert [item["event_key"] for item in refreshed] == ["event-1", "event-2"]
+
+
+def test_notification_cache_detects_external_file_change_and_prune_refreshes_it(tmp_path):
+    store = Store(tmp_path / "data")
+    store.record_notification(
+        "event-1", 1, recipient_key="recipient-a", contract_type="PERPETUAL"
+    )
+    cached = store._current_notification_records()
+    store._append_jsonl(store.notifications_path, {
+        "record_type": "notification", "event_key": "event-2",
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "telegram_message_id": "2", "delivery_status": "SENT",
+        "recipient_key": "recipient-a", "contract_type": "PERPETUAL",
+    })
+
+    external_refresh = store._current_notification_records()
+    assert external_refresh is not cached
+    assert len(external_refresh) == 2
+
+    store.prune()
+    after_prune = store._current_notification_records()
+    assert len(after_prune) == 2
+    assert after_prune is store._notification_cache

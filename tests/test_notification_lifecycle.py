@@ -624,3 +624,96 @@ def test_persisted_reversal_marker_recovers_partial_state_without_resending(tmp_
         recipient_keys=[_recipient_key()], contract_type="PERPETUAL"
     )
     assert len(active) == 1 and active[0]["event_group"] == new_group
+
+
+def test_retryable_reversal_failure_does_not_fall_through_to_separate_cancellation(tmp_path, monkeypatch):
+    import screener.service as service
+
+    class RetryableReversalTelegram(FakeTelegram):
+        calls = 0
+
+        def send(self, message, chat_ids=None):
+            type(self).calls += 1
+            self.sent.append((message, list(chat_ids or self.chat_ids)))
+            if type(self).calls == 1:
+                return [{
+                    "chat_id": (chat_ids or self.chat_ids)[0],
+                    "sent": False,
+                    "delivery_unknown": False,
+                    "permanent_failure": False,
+                    "error": "Telegram rate limit",
+                }]
+            return [{
+                "chat_id": (chat_ids or self.chat_ids)[0],
+                "sent": True,
+                "delivery_unknown": False,
+                "message_id": 999,
+            }]
+
+    RetryableReversalTelegram.calls = 0
+    RetryableReversalTelegram.sent = []
+    monkeypatch.setattr(service, "TelegramClient", RetryableReversalTelegram)
+    rows = _enriched()
+    row = rows[0]
+    store = Store(tmp_path / "retryable-reversal")
+    _activate_short(store, row, level=0.7659)
+    opposite = _confirmed_result(row, "LONG", "LONG A", level=0.765, close=0.766)
+
+    outcomes = _collect_notifications([opposite], rows, _settings(), store, True, False)
+
+    assert len(RetryableReversalTelegram.sent) == 1
+    assert outcomes[0]["type"] == "reversal"
+    assert outcomes[0]["delivery"]["error"] == "Telegram rate limit"
+    assert service._has_retryable_notification_failures(outcomes) is True
+    assert len(store.active_notification_states(recipient_keys=[_recipient_key()])) == 1
+    # If the cancellation loop had fallen through, the fake client would have
+    # succeeded on its second call and cleared the old ACTIVE state.
+    assert RetryableReversalTelegram.calls == 1
+
+
+def test_retryable_new_signal_delivery_is_not_persisted_as_sent_and_can_retry(tmp_path, monkeypatch):
+    import screener.service as service
+
+    class FirstAttemptRateLimitedTelegram(FakeTelegram):
+        calls = 0
+
+        def send(self, message, chat_ids=None):
+            type(self).calls += 1
+            self.sent.append((message, list(chat_ids or self.chat_ids)))
+            if type(self).calls == 1:
+                return [{
+                    "chat_id": (chat_ids or self.chat_ids)[0],
+                    "sent": False,
+                    "delivery_unknown": False,
+                    "permanent_failure": False,
+                    "error": "Telegram rate limit",
+                }]
+            return [{
+                "chat_id": (chat_ids or self.chat_ids)[0],
+                "sent": True,
+                "delivery_unknown": False,
+                "message_id": 101,
+            }]
+
+    FirstAttemptRateLimitedTelegram.calls = 0
+    FirstAttemptRateLimitedTelegram.sent = []
+    monkeypatch.setattr(service, "TelegramClient", FirstAttemptRateLimitedTelegram)
+    rows = _enriched()
+    row = rows[0]
+    store = Store(tmp_path / "retry-new-signal")
+    result = _confirmed_result(row, "LONG", "LONG A", level=0.764, close=0.766)
+    identity = service._notification_identity(result)
+    assert identity is not None
+    event_key = identity[1]
+
+    first = _collect_notifications([result], rows, _settings(), store, True, False)
+    assert first[0]["delivery"]["error"] == "Telegram rate limit"
+    assert service._has_retryable_notification_failures(first) is True
+    assert store.notification_exists(event_key, recipient_key=_recipient_key(), contract_type="PERPETUAL") is False
+    assert store.active_notification_states(recipient_keys=[_recipient_key()]) == []
+
+    second = _collect_notifications([result], rows, _settings(), store, True, False)
+    assert second[0]["sent"] is True
+    assert FirstAttemptRateLimitedTelegram.calls == 2
+    assert store.notification_exists(event_key, recipient_key=_recipient_key(), contract_type="PERPETUAL") is True
+    assert len(store.active_notification_states(recipient_keys=[_recipient_key()])) == 1

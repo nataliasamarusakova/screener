@@ -236,6 +236,40 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
     retry = service.run_scan_once(settings, dry_run=False)
     assert retry["status"] == "OK"
     assert retry["no_new_coinalyze_data"] is False
+    assert retry["poll_state_updated"] is True
+
+    # A new signal that hits an exhausted 429 must remain eligible for retry:
+    # the exact same Coinalyze poll is reprocessed on the next run.
+    retryable_delivery = [{
+        "type": "confirmed_signal", "sent": False,
+        "delivery": {
+            "sent": False, "delivery_unknown": False,
+            "permanent_failure": False, "error": "Telegram rate limit",
+        },
+    }]
+    saved_poll_state = (settings.data_dir / "poll_state.json").read_text(encoding="utf-8")
+    markets[0].price += 0.03
+    scraped.fetched_at = fixed_time + timedelta(hours=4, minutes=20)
+    monkeypatch.setattr(service_module, "_collect_notifications", lambda *_args, **_kwargs: retryable_delivery)
+    rate_limited = service.run_scan_once(settings, dry_run=False)
+    assert rate_limited["retryable_delivery_failures"] is True
+    assert rate_limited["poll_state_updated"] is False
+    assert (settings.data_dir / "poll_state.json").read_text(encoding="utf-8") == saved_poll_state
+
+    # Once the next attempt completes without a retryable delivery failure, the marker advances.
+    monkeypatch.setattr(service_module, "_collect_notifications", lambda *_args, **_kwargs: [])
+    redelivered = service.run_scan_once(settings, dry_run=False)
+    assert redelivered["no_new_coinalyze_data"] is False
+    assert redelivered["poll_state_updated"] is True
+
+    # A table missing a required P1 column must never become a committed 4H observation.
+    markets[0].price += 0.04
+    scraped.fetched_at = fixed_time + timedelta(hours=8)
+    scraped.missing_required_columns = ["oi_usd"]
+    incomplete = service.run_scan_once(settings, dry_run=True)
+    assert incomplete["snapshot_saved"] is False
+    assert any("Snapshot not committed" in warning for warning in incomplete["stats"].warnings)
+    assert len(Store(settings.data_dir).recent_symbol_history("ALT0USDT_PERP.A", limit=10)) == 2
 
 
 def test_price_oi_snapshot_classification_marks_overlapping_windows_preliminary(tmp_path):
@@ -760,3 +794,49 @@ def test_telegram_client_keeps_api_server_error_retryable(monkeypatch):
     assert result[0]["sent"] is False
     assert result[0]["delivery_unknown"] is False
     assert result[0].get("permanent_failure") is not True
+
+
+
+def test_latest_opposite_candidate_uses_confirmation_time_not_event_key_or_pivot_identity():
+    from screener.service import _latest_opposite_candidate
+
+    older_lexically_larger = ScenarioResult(
+        symbol="ALTUSDT_PERP", name="ALT", scenario="LONG D — Reversal", direction="LONG",
+        checks=[Check("x", True, "ok", "rule")], quality_flags=[], status="CONFIRMED_SIGNAL",
+        technical={"higher_low": {
+            "latest_open_time_ms": 1_700_000_000_000,
+            "confirmation_open_time_ms": 1_700_000_007_200,
+        }},
+    )
+    newer_lexically_smaller = ScenarioResult(
+        symbol="ALTUSDT_PERP", name="ALT", scenario="LONG A — Trend", direction="LONG",
+        checks=[Check("x", True, "ok", "rule")], quality_flags=[], status="CONFIRMED_SIGNAL",
+        technical={"trend_retest_long": {"retest_open_time_ms": 1_700_000_003_600}},
+    )
+    old_candidate = (older_lexically_larger, None, ("g1", "Z|LONG D|older", "f1", 1.0))
+    new_candidate = (newer_lexically_smaller, None, ("g2", "A|LONG A|newer", "f2", 1.0))
+
+    chosen = _latest_opposite_candidate([old_candidate, new_candidate])
+
+    assert chosen is old_candidate
+
+
+def test_notification_outcome_marks_only_definite_transient_failures_retryable():
+    from screener.service import _has_retryable_notification_failures
+
+    assert _has_retryable_notification_failures([{
+        "type": "confirmed_signal",
+        "delivery": {"sent": False, "delivery_unknown": False, "permanent_failure": False, "error": "429"},
+    }]) is True
+    assert _has_retryable_notification_failures([{
+        "type": "confirmed_signal",
+        "delivery": {"sent": True, "delivery_unknown": False},
+    }]) is False
+    assert _has_retryable_notification_failures([{
+        "type": "confirmed_signal",
+        "delivery": {"sent": False, "delivery_unknown": True},
+    }]) is False
+    assert _has_retryable_notification_failures([{
+        "type": "confirmed_signal",
+        "delivery": {"sent": False, "delivery_unknown": False, "permanent_failure": True},
+    }]) is False

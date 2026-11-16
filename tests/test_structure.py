@@ -234,3 +234,45 @@ def test_breakout_retest_is_not_confirmed_if_latest_close_loses_the_level(monkey
     result = structure.breakout_and_retest(values, "SHORT", left=1, right=1, lookback=30, retest_lookback=8)
 
     assert result["confirmed"] is False
+
+
+def test_higher_low_rejects_an_unbroken_but_stale_pivot(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 110, 100, 105) for i in range(60)]
+    monkeypatch.setattr(
+        structure, "confirmed_pivots",
+        lambda *_args, **_kwargs: ([], [(5, 90.0), (30, 95.0)]),
+    )
+
+    result = higher_low(values, left=2, right=2, lookback=60, max_age_bars=24)
+
+    assert result["confirmed"] is False
+    assert result["age_bars"] == 29
+    assert "stale" in result["reason"].lower()
+
+
+def test_higher_low_accepts_a_recent_unbroken_pivot(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 110, 100, 105) for i in range(60)]
+    monkeypatch.setattr(
+        structure, "confirmed_pivots",
+        lambda *_args, **_kwargs: ([], [(30, 90.0), (50, 95.0)]),
+    )
+
+    result = higher_low(values, left=2, right=2, lookback=60, max_age_bars=24)
+
+    assert result["confirmed"] is True
+    assert result["age_bars"] == 9
+
+
+def test_higher_low_rejects_invalid_max_age_configuration():
+    values = [candle(i, 110, 100, 105) for i in range(10)]
+    for invalid in (0, -1, True, 1.5):
+        try:
+            higher_low(values, max_age_bars=invalid)
+        except ValueError as exc:
+            assert "positive integer" in str(exc)
+        else:
+            raise AssertionError(f"Invalid max_age_bars={invalid!r} must be rejected")

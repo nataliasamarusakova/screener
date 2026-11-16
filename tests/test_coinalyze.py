@@ -303,3 +303,55 @@ def test_parser_rejects_imbalance_outside_physical_range():
     assert set(btc.raw["invalid_market_fields"]) == {
         "futures_imbalance_4h", "spot_imbalance_4h"
     }
+
+
+def test_parse_table_ignores_unrelated_tables_and_grouped_headers():
+    unrelated = "<table><thead><tr><th>Layout</th></tr></thead><tbody><tr><td>menu</td></tr></tbody></table>"
+    grouped_header = "<tr><th colspan='34'>Grouped market columns</th></tr>"
+    html = FIXTURE_HTML.replace("<thead><tr>", f"<thead>{grouped_header}<tr>", 1)
+    rows, headers, _, missing_required = parse_table(unrelated + html)
+
+    assert [row.symbol for row in rows] == ["BTCUSDT_PERP.A", "ETHUSDT_PERP.A"]
+    assert "Coin" in headers
+    assert missing_required == []
+
+
+def test_parse_table_rejects_duplicate_symbol_within_one_page():
+    import re
+    import pytest
+
+    row = re.search(r"<tr data-coin=\"BTCUSDT_PERP\.A\">.*?</tr>", FIXTURE_HTML, re.S).group(0)
+    html = FIXTURE_HTML.replace("</tbody>", row + "</tbody>", 1)
+
+    with pytest.raises(CoinalyzeError, match="Duplicate Coinalyze symbol BTCUSDT_PERP.A"):
+        parse_table(html)
+
+
+def test_parse_table_rejects_out_of_range_btc_correlation():
+    html = FIXTURE_HTML.replace("+1.00</td>", "1.20</td>", 1)
+    rows, _, _, _ = parse_table(html)
+
+    assert rows[0].btc_corr7d is None
+    assert "btc_corr7d" in rows[0].raw["invalid_market_fields"]
+
+
+def test_pagination_next_disabled_checks_bootstrap_parent_state():
+    from screener.coinalyze import _pagination_next_is_disabled
+
+    class FakeButton:
+        def __init__(self, *, visible=True, disabled=False):
+            self.visible = visible
+            self.disabled = disabled
+
+        def is_visible(self):
+            return self.visible
+
+        def evaluate(self, _script):
+            return self.disabled
+
+        def get_attribute(self, _name):
+            return None
+
+    assert _pagination_next_is_disabled(FakeButton(disabled=True)) is True
+    assert _pagination_next_is_disabled(FakeButton(visible=False)) is True
+    assert _pagination_next_is_disabled(FakeButton()) is False
