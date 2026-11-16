@@ -456,7 +456,13 @@ def test_run_scan_aborts_before_later_symbol_after_binance_ip_ban(tmp_path, monk
         missing_columns=[],
         source_url=settings.coinalyze_url,
     )
-    monkeypatch.setattr(service_module, "fetch_table", lambda **_kwargs: scraped)
+    fetch_kwargs = {}
+
+    def fake_fetch_table(**kwargs):
+        fetch_kwargs.update(kwargs)
+        return scraped
+
+    monkeypatch.setattr(service_module, "fetch_table", fake_fetch_table)
     monkeypatch.setattr(
         service_module,
         "_preliminary_candidate_symbols",
@@ -474,3 +480,6 @@ def test_run_scan_aborts_before_later_symbol_after_binance_ip_ban(tmp_path, monk
         service_module.run_scan_once(settings, dry_run=False)
 
     assert calls == ["AAAUSDT_PERP"]
+    assert fetch_kwargs["timeout_ms"] == settings.coinalyze_timeout_ms
+    assert fetch_kwargs["page_attempts"] == 3
+    assert fetch_kwargs["retry_backoff_sec"] == 3.0

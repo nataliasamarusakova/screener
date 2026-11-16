@@ -1,5 +1,7 @@
 from screener.coinalyze import (
     CoinalyzeError,
+    RetryableCoinalyzeError,
+    _page_content_with_retry,
     build_session_cookies,
     detect_contract_type,
     fetch_table,
@@ -183,6 +185,7 @@ def test_fetch_table_uses_session_cookies_and_reads_the_saved_page(monkeypatch):
     class FakePage:
         def goto(self, target_url, *_args, **_kwargs):
             captured["url"] = target_url
+            captured["wait_until"] = _kwargs.get("wait_until")
 
         def wait_for_timeout(self, *_args):
             pass
@@ -244,10 +247,180 @@ def test_fetch_table_uses_session_cookies_and_reads_the_saved_page(monkeypatch):
     assert result.missing_required_columns == []
     assert result.missing_columns == []
     assert captured["url"] == TEST_TABLE_URL
+    assert captured["wait_until"] == "commit"
     assert {row.symbol for row in result.rows} == {"BTCUSDT_PERP.A", "ETHUSDT_PERP.A"}
     assert [cookie["name"] for cookie in captured["cookies"]] == [
         "p_sid", "chat_sid", "cookies_accepted"
     ]
+
+
+def test_coinalyze_navigation_retries_transient_timeouts_with_exponential_backoff(monkeypatch):
+    import screener.coinalyze as coinalyze_module
+
+    calls = []
+    delays = []
+
+    def flaky_page_content(_page, _url, _timeout_ms):
+        calls.append(1)
+        if len(calls) < 3:
+            raise TimeoutError("navigation timed out")
+        return FIXTURE_HTML
+
+    monkeypatch.setattr(coinalyze_module, "_page_content", flaky_page_content)
+    monkeypatch.setattr(coinalyze_module.time, "sleep", delays.append)
+
+    html = _page_content_with_retry(
+        object(), TEST_TABLE_URL, timeout_ms=45_000, attempts=3, retry_backoff_sec=2.0
+    )
+
+    assert html == FIXTURE_HTML
+    assert len(calls) == 3
+    assert delays == [2.0, 4.0]
+
+
+def test_coinalyze_navigation_does_not_retry_unexpected_programming_errors(monkeypatch):
+    import screener.coinalyze as coinalyze_module
+
+    calls = []
+
+    def broken_page(_page, _url, _timeout_ms):
+        calls.append(1)
+        raise ValueError("unexpected parser bug")
+
+    monkeypatch.setattr(coinalyze_module, "_page_content", broken_page)
+    monkeypatch.setattr(coinalyze_module.time, "sleep", lambda _delay: None)
+
+    try:
+        _page_content_with_retry(object(), TEST_TABLE_URL, timeout_ms=45_000, attempts=4)
+    except ValueError as exc:
+        assert "parser bug" in str(exc)
+    else:
+        raise AssertionError("Unexpected programming errors must not be retried")
+
+    assert len(calls) == 1
+
+
+def test_coinalyze_navigation_does_not_retry_permanent_authentication_error(monkeypatch):
+    import screener.coinalyze as coinalyze_module
+
+    calls = []
+
+    def unauthenticated_page(_page, _url, _timeout_ms):
+        calls.append(1)
+        raise CoinalyzeError("Coinalyze session is not authenticated")
+
+    monkeypatch.setattr(coinalyze_module, "_page_content", unauthenticated_page)
+    monkeypatch.setattr(coinalyze_module.time, "sleep", lambda _delay: None)
+
+    try:
+        _page_content_with_retry(object(), TEST_TABLE_URL, timeout_ms=45_000, attempts=4)
+    except CoinalyzeError as exc:
+        assert "not authenticated" in str(exc)
+    else:
+        raise AssertionError("Expected a permanent authentication error")
+
+    assert len(calls) == 1
+
+
+def test_coinalyze_navigation_fails_closed_after_all_retry_attempts(monkeypatch):
+    import screener.coinalyze as coinalyze_module
+
+    calls = []
+
+    def always_timeout(_page, _url, _timeout_ms):
+        calls.append(1)
+        raise TimeoutError("navigation timed out")
+
+    monkeypatch.setattr(coinalyze_module, "_page_content", always_timeout)
+    monkeypatch.setattr(coinalyze_module.time, "sleep", lambda _delay: None)
+
+    try:
+        _page_content_with_retry(
+            object(), TEST_TABLE_URL, timeout_ms=12_345, attempts=3, retry_backoff_sec=0
+        )
+    except CoinalyzeError as exc:
+        assert "после 3 попыток" in str(exc)
+        assert "timeout=12345ms" in str(exc)
+    else:
+        raise AssertionError("A failed scrape must not return partial or stale market data")
+
+    assert len(calls) == 3
+
+
+def test_scan_marks_failed_and_never_analyzes_old_data_when_coinalyze_is_unavailable(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    import pytest
+    import screener.service as service_module
+
+    data_dir = tmp_path / "data"
+    settings = SimpleNamespace(
+        data_dir=data_dir,
+        dry_run=False,
+        coinalyze_url=TEST_TABLE_URL,
+        coinalyze_p_sid="p-session",
+        coinalyze_chat_sid="chat-session",
+        coinalyze_max_pages=20,
+        coinalyze_headless=True,
+        coinalyze_timeout_ms=45_000,
+    )
+
+    def unavailable_source(**_kwargs):
+        raise CoinalyzeError("Coinalyze unavailable after retries")
+
+    monkeypatch.setattr(service_module, "fetch_table", unavailable_source)
+
+    with pytest.raises(CoinalyzeError, match="unavailable after retries"):
+        service_module.run_scan_once(settings, dry_run=False)
+
+    run_records = [json.loads(line) for line in (data_dir / "runs.jsonl").read_text().splitlines()]
+    assert [record["record_type"] for record in run_records] == ["run_started", "run_finished"]
+    assert run_records[-1]["status"] == "FAILED"
+    assert run_records[-1]["row_count"] == 0
+    assert (data_dir / "notifications.jsonl").read_text() == ""
+
+
+def test_coinalyze_table_readiness_failure_is_retryable_but_login_is_not():
+    class FakeLocator:
+        def __init__(self, text):
+            self.text = text
+
+        def inner_text(self, **_kwargs):
+            return self.text
+
+    class FakePage:
+        def __init__(self, body_text):
+            self.body_text = body_text
+
+        def goto(self, *_args, **kwargs):
+            assert kwargs["wait_until"] == "commit"
+
+        def content(self):
+            return "<html></html>"
+
+        def wait_for_selector(self, *_args, **_kwargs):
+            raise TimeoutError("table not ready")
+
+        def locator(self, _selector):
+            return FakeLocator(self.body_text)
+
+    from screener.coinalyze import _page_content
+
+    try:
+        _page_content(FakePage("temporary empty response"), TEST_TABLE_URL, 1000)
+    except RetryableCoinalyzeError:
+        pass
+    else:
+        raise AssertionError("A missing table after timeout should be retryable")
+
+    try:
+        _page_content(FakePage("Please sign in to continue"), TEST_TABLE_URL, 1000)
+    except CoinalyzeError as exc:
+        assert not isinstance(exc, RetryableCoinalyzeError)
+        assert "cookies" in str(exc)
+    else:
+        raise AssertionError("An expired session should be a permanent error")
 
 
 def test_volume_24h_market_capitalization_header_alias():

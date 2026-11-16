@@ -56,6 +56,9 @@ def test_workflow_queues_pending_runs_and_does_not_commit_per_run_journal():
     assert 'if: always() && !cancelled()' not in workflow
     assert 'timeout-minutes: 15' in workflow
     assert 'timeout-minutes: 25' in workflow
+    assert 'COINALYZE_TIMEOUT_MS: "45000"' in workflow
+    assert 'COINALYZE_PAGE_ATTEMPTS: "3"' in workflow
+    assert 'COINALYZE_RETRY_BACKOFF_SEC: "3"' in workflow
 
 
 

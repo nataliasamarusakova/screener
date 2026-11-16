@@ -92,3 +92,35 @@ def test_live_telegram_configuration_warns_when_storage_hash_key_is_not_stable(t
 
     assert settings.telegram_storage_hash_key == ""
     assert "Rotating the bot token can orphan" in caplog.text
+
+
+def test_coinalyze_timeout_and_retry_settings_are_configurable(tmp_path: Path, monkeypatch):
+    _set_required_secrets(monkeypatch)
+    monkeypatch.delenv("COINALYZE_TIMEOUT_MS", raising=False)
+    monkeypatch.delenv("COINALYZE_PAGE_ATTEMPTS", raising=False)
+    monkeypatch.delenv("COINALYZE_RETRY_BACKOFF_SEC", raising=False)
+
+    defaults = load_settings(tmp_path)
+    assert defaults.coinalyze_timeout_ms == 45_000
+    assert defaults.coinalyze_page_attempts == 3
+    assert defaults.coinalyze_retry_backoff_sec == 3.0
+
+    monkeypatch.setenv("COINALYZE_TIMEOUT_MS", "60000")
+    monkeypatch.setenv("COINALYZE_PAGE_ATTEMPTS", "4")
+    monkeypatch.setenv("COINALYZE_RETRY_BACKOFF_SEC", "4.5")
+    configured = load_settings(tmp_path)
+    assert configured.coinalyze_timeout_ms == 60_000
+    assert configured.coinalyze_page_attempts == 4
+    assert configured.coinalyze_retry_backoff_sec == 4.5
+
+
+def test_coinalyze_retry_settings_are_clamped_to_safe_ranges(tmp_path: Path, monkeypatch):
+    _set_required_secrets(monkeypatch)
+    monkeypatch.setenv("COINALYZE_TIMEOUT_MS", "999999")
+    monkeypatch.setenv("COINALYZE_PAGE_ATTEMPTS", "99")
+    monkeypatch.setenv("COINALYZE_RETRY_BACKOFF_SEC", "999")
+
+    settings = load_settings(tmp_path)
+    assert settings.coinalyze_timeout_ms == 120_000
+    assert settings.coinalyze_page_attempts == 5
+    assert settings.coinalyze_retry_backoff_sec == 30.0
