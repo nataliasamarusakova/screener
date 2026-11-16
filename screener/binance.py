@@ -6,6 +6,7 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import requests
@@ -19,6 +20,22 @@ _DEPTH_LIMITS = (5, 10, 20, 50, 100, 500, 1000)
 
 class BinanceDataError(RuntimeError):
     pass
+
+
+class BinanceScanAbortError(BinanceDataError):
+    """A Binance rate-limit state where the rest of this scan must stop."""
+
+
+class BinanceIPBanError(BinanceScanAbortError):
+    """Fatal Binance IP ban; the current scan must stop issuing requests."""
+
+
+class BinanceWAFBlockError(BinanceScanAbortError):
+    """Binance WAF/HTTP 403 response; the current scan must stop."""
+
+
+class BinanceRateLimitError(BinanceScanAbortError):
+    """Repeated HTTP 429 responses; further requests in this scan are unsafe."""
 
 
 class BinanceClient:
@@ -49,6 +66,11 @@ class BinanceClient:
         self._last_request = 0.0
         self._lock = threading.Lock()
         self._symbols: set[str] | None = None
+        self._ip_banned = False
+        self._ip_ban_retry_after: float | None = None
+        self._waf_blocked = False
+        self._rate_limited = False
+        self._rate_limit_retry_after: float | None = None
 
     def _pace(self) -> None:
         with self._lock:
@@ -57,19 +79,90 @@ class BinanceClient:
                 time.sleep(wait)
             self._last_request = time.monotonic()
 
+    @staticmethod
+    def _retry_after_seconds(headers: Any, fallback: float) -> float:
+        """Parse Binance Retry-After without shortening the server's backoff."""
+        raw = headers.get("Retry-After") if hasattr(headers, "get") else None
+        if raw is None:
+            return max(0.0, float(fallback))
+        try:
+            delay = float(str(raw).strip())
+            if math.isfinite(delay) and delay >= 0:
+                return delay
+        except (TypeError, ValueError, OverflowError):
+            pass
+        try:
+            retry_at = parsedate_to_datetime(str(raw))
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            delay = (retry_at.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+            if math.isfinite(delay):
+                return max(0.0, delay)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return max(0.0, float(fallback))
+
     def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        if self._ip_banned:
+            detail = (
+                f"; Retry-After={self._ip_ban_retry_after:g}s"
+                if self._ip_ban_retry_after is not None else ""
+            )
+            raise BinanceIPBanError(
+                "Binance client is blocked after HTTP 418; refusing all further requests" + detail
+            )
+        if self._waf_blocked:
+            raise BinanceWAFBlockError(
+                "Binance client is blocked after HTTP 403; refusing all further requests in this scan"
+            )
+        if self._rate_limited:
+            detail = (
+                f"; Retry-After={self._rate_limit_retry_after:g}s"
+                if self._rate_limit_retry_after is not None else ""
+            )
+            raise BinanceRateLimitError(
+                "Binance returned repeated HTTP 429 responses; refusing further requests in this scan" + detail
+            )
+
         last_error: Exception | None = None
         for attempt in range(3):
             self._pace()
             try:
                 response = self.session.get(f"{self.base_url}{path}", params=params or {}, timeout=self.timeout_sec)
-                if response.status_code in (418, 429):
-                    retry = response.headers.get("Retry-After")
-                    delay = float(retry) if retry and retry.replace(".", "", 1).isdigit() else 2 ** attempt
+                if response.status_code == 403:
+                    self._waf_blocked = True
+                    raise BinanceWAFBlockError(
+                        "Binance returned HTTP 403 (WAF/security block); stopping the entire scan immediately."
+                    )
+                if response.status_code == 418:
+                    self._ip_banned = True
+                    self._ip_ban_retry_after = self._retry_after_seconds(response.headers, 0.0)
+                    detail = (
+                        f" Retry-After={self._ip_ban_retry_after:g}s."
+                        if self._ip_ban_retry_after > 0 else ""
+                    )
+                    raise BinanceIPBanError(
+                        "Binance returned HTTP 418 (IP ban); stopping the entire scan immediately."
+                        + detail
+                    )
+                if response.status_code == 429:
+                    delay = self._retry_after_seconds(response.headers, 2 ** attempt)
                     if attempt == 2:
-                        response.raise_for_status()
-                    time.sleep(min(max(delay, 1.0), 30.0))
+                        self._rate_limited = True
+                        self._rate_limit_retry_after = delay
+                        raise BinanceRateLimitError(
+                            "Binance returned HTTP 429 on all three attempts; stopping the entire scan to avoid escalation"
+                            + (f". Retry-After={delay:g}s" if delay > 0 else "")
+                        )
+                    log.warning(
+                        "Binance rate limit HTTP 429 for %s; waiting %.3fs before retry %d/3",
+                        path, delay, attempt + 2,
+                    )
+                    if delay > 0:
+                        time.sleep(delay)
                     continue
+                if 400 <= response.status_code < 500:
+                    raise BinanceDataError(f"Binance rejected {path} with HTTP {response.status_code}; not retrying a client error")
                 response.raise_for_status()
                 return response.json()
             except (requests.RequestException, ValueError) as exc:
@@ -99,21 +192,32 @@ class BinanceClient:
 
     @staticmethod
     def _base_symbol(coinalyze_symbol: str) -> str:
-        value = str(coinalyze_symbol or "").upper().strip()
-        # Examples: BTCUSDT_PERP.A, BTCUSDT_PERP, BTCUSDT.A
-        value = value.split(".", 1)[0]
-        value = re.sub(r"[_-](PERP|SWAP)$", "", value)
+        value = str(coinalyze_symbol or "").upper().strip().split(".", 1)[0]
+        value = re.sub(r"[_-]?(PERPETUAL|PERP|SWAP)$", "", value)
         value = value.replace("/", "").replace("-", "").replace("_", "")
+        # Historical Coinalyze market labels may use USD/USDC/BUSD quote suffixes;
+        # P1 runs on Binance USD-M USDT perpetuals, so map the base only.
+        for quote in ("USDT", "USDC", "BUSD", "USD"):
+            if value.endswith(quote):
+                value = value[:-len(quote)]
+                break
         return value
 
     def resolve_symbol(self, coinalyze_symbol: str) -> str | None:
-        candidate = self._base_symbol(coinalyze_symbol)
+        raw = str(coinalyze_symbol or "").upper().strip().split(".", 1)[0]
+        raw = re.sub(r"[_-]?(PERPETUAL|PERP|SWAP)$", "", raw).replace("/", "").replace("-", "").replace("_", "")
         symbols = self._load_symbols()
+        if raw in symbols:
+            return raw
+        base = self._base_symbol(coinalyze_symbol)
+        candidate = base + "USDT"
         if candidate in symbols:
             return candidate
-        if not candidate.endswith("USDT"):
-            candidate += "USDT"
-        return candidate if candidate in symbols else None
+        # Binance uses multiplier-prefixed contracts for some small-denomination
+        # assets (e.g. 1000PEPEUSDT). Use only an unambiguous active listing.
+        aliases = {prefix + candidate for prefix in ("1000", "10000", "100000", "1000000", "1M")}
+        matches = sorted(aliases & symbols)
+        return matches[0] if len(matches) == 1 else None
 
     def fetch_candles(self, coinalyze_symbol: str, interval: str, limit: int = 300) -> list[Candle]:
         resolved = self.resolve_symbol(coinalyze_symbol)
@@ -159,17 +263,22 @@ class BinanceClient:
                 and candle.close_time_ms == candle.open_time_ms + duration_ms - 1
             )
             # The last API row may still be forming. Invalid rows are discarded,
-            # then any resulting gap is rejected below rather than compressed.
+            # malformed rows are omitted; continuity is evaluated on the latest tail below.
             if sane and candle.close_time_ms < now_ms:
                 candles.append(candle)
         candles.sort(key=lambda c: c.open_time_ms)
         unique = {c.open_time_ms: c for c in candles}
         result = [unique[k] for k in sorted(unique)]
+        # Older history can contain exchange/data-provider gaps. Keep only the
+        # latest continuous segment: a gap before this segment must not discard
+        # otherwise valid recent chart data, but no gap inside the analysis tail
+        # may be silently compressed.
+        last_gap = next((idx for idx in range(len(result) - 1, 0, -1)
+                         if result[idx].open_time_ms - result[idx - 1].open_time_ms != duration_ms), None)
+        if last_gap is not None:
+            result = result[last_gap:]
         if len(result) < 20:
-            raise BinanceDataError(f"Only {len(result)} valid closed {interval} candles for {resolved}; need at least 20")
-        for previous, current in zip(result, result[1:]):
-            if current.open_time_ms - previous.open_time_ms != duration_ms:
-                raise BinanceDataError(f"Non-consecutive {interval} candles for {resolved}; chart structure is not trusted on a gapped series")
+            raise BinanceDataError(f"Only {len(result)} consecutive valid closed {interval} candles for {resolved}; need at least 20")
         latest_age = now_ms - result[-1].close_time_ms
         if latest_age > duration_ms + 120_000:
             raise BinanceDataError(f"Stale {interval} candles for {resolved}: latest closed candle is {latest_age / 60_000:.1f} minutes old")

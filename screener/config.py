@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+log = logging.getLogger(__name__)
 
 
 # P1 thresholds are kept with runtime code so GitHub Actions needs no external config file.
@@ -16,6 +18,7 @@ DEFAULT_P1_CONFIG: dict[str, Any] = {
     },
     "thresholds": {
         "strong_flow_quantile": 0.15,
+        "strong_flow_min_rows": 20,
         "oi_4h_alt_pct": 1.0,
         "oi_4h_major_pct": 0.3,
         "oi_4h_small_usd": 2_000_000.0,
@@ -26,6 +29,9 @@ DEFAULT_P1_CONFIG: dict[str, Any] = {
         "quality_vol_mktcap_max": 2.0,
         "quality_oi_vol_min": 0.1,
         "quality_oi_min_usd": 40_000_000.0,
+        # Guardrail only: do not treat liquidation coverage as causal on tiny OI changes.
+        "oi_24h_min_drop_usd_for_liq_coverage": 1_000_000.0,
+        "oi_24h_min_drop_pct_for_short_d": -1.0,
     },
     "scenario": {
         # P1 does not quantify "significant" short liquidations; keep trigger UNKNOWN.
@@ -47,7 +53,7 @@ DEFAULT_P1_CONFIG: dict[str, Any] = {
     },
     "scanner": {
         "max_chart_candidates": 100,
-        "fetch_15m_context": True,
+        "fetch_15m_context": False,
     },
 }
 
@@ -111,7 +117,7 @@ def load_settings(root: Path = ROOT) -> Settings:
         binance_vpn_enabled=_bool_env("BINANCE_VPN_ENABLED", False),
         binance_kline_limit=max(100, min(1500, int(os.getenv("BINANCE_KLINE_LIMIT", "300")))),
         binance_request_interval_sec=max(0.0, float(os.getenv("BINANCE_REQUEST_INTERVAL_SEC", "0.12"))),
-        binance_fetch_orderbook=_bool_env("BINANCE_FETCH_ORDERBOOK", True),
+        binance_fetch_orderbook=_bool_env("BINANCE_FETCH_ORDERBOOK", False),
         binance_orderbook_limit=max(5, min(1000, int(os.getenv("BINANCE_ORDERBOOK_LIMIT", "100")))),
         execution_notional_usd=max(0.0, float(os.getenv("EXECUTION_NOTIONAL_USD", "0"))),
         trading_fee_bps_per_side=max(0.0, float(fee_value)) if fee_value else None,
@@ -124,6 +130,14 @@ def load_settings(root: Path = ROOT) -> Settings:
         telegram_storage_hash_key=os.getenv("TELEGRAM_STORAGE_HASH_KEY", "").strip(),
     )
 
+    settings.p1.setdefault("scanner", {})["fetch_15m_context"] = _bool_env(
+        "BINANCE_FETCH_15M_CONTEXT", False
+    )
+    if settings.telegram_bot_token and settings.telegram_chat_ids and not settings.telegram_storage_hash_key:
+        log.warning(
+            "TELEGRAM_STORAGE_HASH_KEY is unset; recipient identity falls back to TELEGRAM_BOT_TOKEN. "
+            "Rotating the bot token can orphan persisted active-notification state; configure a stable dedicated key."
+        )
     if not settings.coinalyze_url:
         raise ValueError("Missing GitHub Secret COINALYZE_URL")
     if not settings.coinalyze_p_sid or not settings.coinalyze_chat_sid:

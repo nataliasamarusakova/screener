@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -36,13 +37,29 @@ class ScrapeResult:
 
 
 def parse_number(value: Any) -> float | None:
-    """Parse Coinalyze compact values without turning n/a into zero."""
+    """Parse compact numeric values with conservative decimal/thousands handling."""
     if value is None:
         return None
-    text = str(value).strip().replace("\u2212", "-").replace(",", "")
-    if not text or text.lower() in {"n/a", "na", "nan", "none", "null", "-", "—"}:
+    text = str(value).strip().replace("\u2212", "-").replace("−", "-")
+    if not text or text.lower() in {"n/a", "na", "nan", "none", "null", "-", "—", "–", "−"}:
         return None
-    text = text.replace("$", "").replace("%", "").replace(" ", "")
+    text = text.replace("$", "").replace("€", "").replace("£", "").replace("%", "")
+    text = re.sub(r"\s+", "", text)
+
+    # Infer decimal punctuation only when separators provide enough evidence.
+    if "." in text and "," in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        # A comma followed by exactly three digits is conventionally a thousands
+        # separator; other group lengths are treated as a decimal separator.
+        if not re.fullmatch(r"[+-]?\d{1,3}(?:,\d{3})+", text):
+            text = text.replace(",", ".")
+        else:
+            text = text.replace(",", "")
+
     multiplier = 1.0
     if text[-1:].upper() in {"K", "M", "B", "T"}:
         multiplier = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}[text[-1].upper()]
@@ -51,7 +68,7 @@ def parse_number(value: Any) -> float | None:
         number = float(text) * multiplier
     except ValueError:
         return None
-    return number if number == number and abs(number) != float("inf") else None
+    return number if math.isfinite(number) else None
 
 
 def normalize_header(value: str) -> str:
@@ -116,7 +133,7 @@ REQUIRED_FOR_P1 = {
     "oi_chg24_pct", "oi_chg24_usd", "oi_chg4h_pct", "oi_chg4h_usd",
     "oi_vol_ratio", "oi_mktcap_ratio", "vol_mktcap_ratio",
     "fr_avg_pct", "fr_oiw_pct", "pfr_oiw_pct", "liq_total24_usd",
-    "liq_long24_usd", "liq_short24_usd", "ls_ratio_1h", "ls_ratio_1d",
+    "liq_long24_usd", "liq_short24_usd", "ls_ratio_1d",
     "futures_imbalance_4h", "spot_imbalance_4h",
 }
 
@@ -210,8 +227,12 @@ def _disambiguate_oi(cells: list[Any], indices: list[int]) -> tuple[float | None
             continue
         if "%" in raw:
             pct = parsed
-        else:
+        elif "$" in raw or re.search(r"[KMBT]\s*$", raw, re.IGNORECASE) or re.search(r"\bUSD\b", raw, re.IGNORECASE):
             usd = parsed
+        else:
+            # A bare scalar is ambiguous (e.g. 1.58 could be % or USD-scale).
+            # Do not silently assign it to the dollar field.
+            log.warning("Ambiguous Coinalyze OI change value %r: missing %%, currency, or compact USD suffix", raw)
     return pct, usd
 
 
@@ -472,7 +493,11 @@ def _pagination_urls(html: str, base_url: str) -> list[str]:
         if not href or href.startswith("#"):
             continue
         target = urlparse(urljoin(base_url, href))
-        if target.scheme not in {"http", "https"} or target.netloc != base_parsed.netloc:
+        base_host = (base_parsed.hostname or "").lower().removeprefix("www.")
+        target_host = (target.hostname or "").lower().removeprefix("www.")
+        base_port = base_parsed.port or (443 if base_parsed.scheme == "https" else 80)
+        target_port = target.port or (443 if target.scheme == "https" else 80)
+        if target.scheme not in {"http", "https"} or target_host != base_host or target_port != base_port:
             continue
         target_query = parse_qs(target.query, keep_blank_values=True)
         for key, value in base_query.items():

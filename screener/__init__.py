@@ -1,3 +1,3 @@
 """Coinalyze perpetual-market screener and Telegram observer."""
 
-__version__ = "1.0.17"
+__version__ = "1.0.20"

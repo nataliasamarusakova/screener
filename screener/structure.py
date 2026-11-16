@@ -79,9 +79,11 @@ def higher_low(
         "latest_low": latest[1],
         "previous_open_time_ms": candles[previous[0]].open_time_ms,
         "latest_open_time_ms": candles[latest[0]].open_time_ms,
-        # The pivot itself is the stable event identity. The confirmation bar
-        # is the earliest time at which the right-side candles made it knowable.
+        # Keep the pivot's open time for structure diagnostics. The setup is not
+        # knowable until the right-side confirmation candle closes, so the close
+        # timestamp is the event anchor used for identity and re-entry cooldown.
         "confirmation_open_time_ms": candles[latest[0] + right].open_time_ms,
+        "confirmation_close_time_ms": candles[latest[0] + right].close_time_ms,
         "age_bars": age_bars,
         "max_age_bars": max_age_bars,
     }
@@ -318,6 +320,17 @@ def weak_bounce_rejection(
     wick_body_ratio: float = 0.75,
     atr_tolerance: float = 0.5,
 ) -> dict[str, Any]:
+    if len(candles) < 24:
+        return {"confirmed": False, "reason": "Need 24 closed 1H candles to rule out a fresh 24H low"}
+    latest_low_24h = min(candle.low for candle in candles[-24:])
+    prior_low_24h = min(candle.low for candle in candles[-24:-1])
+    if candles[-1].low < prior_low_24h:
+        return {
+            "confirmed": False,
+            "reason": "Latest closed 1H candle is making a new 24H low; do not short the low",
+            "latest_low_24h": latest_low_24h,
+            "prior_low_24h": prior_low_24h,
+        }
     highs, _ = confirmed_pivots(candles, left, right, lookback)
     if len(highs) < 2:
         return {"confirmed": False, "reason": "Need two confirmed swing highs to identify a lower high", "candidate_resistance": highs[-1][1] if highs else None}

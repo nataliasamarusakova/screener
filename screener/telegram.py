@@ -115,8 +115,8 @@ def _confirmation_anchor(result: ScenarioResult) -> int | None:
     code = _scenario_code(result.scenario).upper()
     source_field = {
         "LONG A": ("trend_retest_long", "retest_open_time_ms"),
-        "LONG B": ("higher_low", "latest_open_time_ms"),
-        "LONG D": ("higher_low", "latest_open_time_ms"),
+        "LONG B": ("higher_low", "confirmation_close_time_ms"),
+        "LONG D": ("higher_low", "confirmation_close_time_ms"),
         "SHORT A": ("trend_retest_short", "retest_open_time_ms"),
         "SHORT B": ("trend_retest_short", "retest_open_time_ms"),
         "SHORT C": ("bearish_structure_break", "break_open_time_ms"),
@@ -126,7 +126,7 @@ def _confirmation_anchor(result: ScenarioResult) -> int | None:
     if not source_field:
         return None
     value = (technical.get(source_field[0]) or {}).get(source_field[1])
-    return value if isinstance(value, int) and value > 0 else None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
 def _trigger_description(result: ScenarioResult) -> str:
@@ -271,10 +271,44 @@ def format_reversal_message(
 
 
 class TelegramClient:
-    def __init__(self, token: str, chat_ids: list[str], timeout_sec: float = 15.0) -> None:
+    def __init__(
+        self, token: str, chat_ids: list[str], timeout_sec: float = 15.0,
+        min_interval_per_chat_sec: float = 3.05,
+        min_interval_global_sec: float = 0.04,
+    ) -> None:
+        if not math.isfinite(float(min_interval_per_chat_sec)) or min_interval_per_chat_sec < 0:
+            raise ValueError("min_interval_per_chat_sec must be finite and non-negative")
+        if not math.isfinite(float(min_interval_global_sec)) or min_interval_global_sec < 0:
+            raise ValueError("min_interval_global_sec must be finite and non-negative")
         self.token = token
         self.chat_ids = chat_ids
         self.timeout_sec = timeout_sec
+        # 3.05s is deliberately conservative: it stays below Telegram's
+        # documented 20 messages/minute group limit and below one/second for DMs.
+        self.min_interval_per_chat_sec = float(min_interval_per_chat_sec)
+        # 40ms caps this client at 25 messages/sec, leaving headroom below the
+        # Telegram bot-wide ~30 messages/sec free-broadcast limit.
+        self.min_interval_global_sec = float(min_interval_global_sec)
+        self._last_chat_request_at: dict[str, float] = {}
+        self._last_global_request_at: float | None = None
+        self._global_blocked_until = 0.0
+
+    def _pace_chat(self, chat_id: str) -> None:
+        now = time.monotonic()
+        last_chat = self._last_chat_request_at.get(str(chat_id))
+        last_global = self._last_global_request_at
+        waits = []
+        if last_chat is not None:
+            waits.append(self.min_interval_per_chat_sec - (now - last_chat))
+        if last_global is not None:
+            waits.append(self.min_interval_global_sec - (now - last_global))
+        waits.append(self._global_blocked_until - now)
+        wait = max(waits, default=0.0)
+        if wait > 0:
+            time.sleep(wait)
+        sent_at = time.monotonic()
+        self._last_chat_request_at[str(chat_id)] = sent_at
+        self._last_global_request_at = sent_at
 
     @property
     def configured(self) -> bool:
@@ -294,6 +328,7 @@ class TelegramClient:
             attempts = 0
             while attempts < 3:
                 attempts += 1
+                self._pace_chat(str(chat_id))
                 try:
                     response = requests.post(
                         url,
@@ -317,10 +352,19 @@ class TelegramClient:
                 if response.status_code == 429:
                     try:
                         retry_after = float((response.json().get("parameters") or {}).get("retry_after", 1))
-                    except (ValueError, TypeError, AttributeError):
+                        if not math.isfinite(retry_after) or retry_after < 0:
+                            raise ValueError("invalid retry_after")
+                    except (ValueError, TypeError, AttributeError, OverflowError):
                         retry_after = 1.0
+                    # Treat retry_after as a bot-wide cooldown because the Bot API
+                    # does not identify whether this 429 is chat-scoped or global.
+                    # This also prevents messages to other recipients from leaking
+                    # through while the server-mandated wait is still active.
+                    self._global_blocked_until = max(
+                        self._global_blocked_until, time.monotonic() + retry_after
+                    )
                     if attempts < 3:
-                        time.sleep(min(max(retry_after, 1.0), 30.0))
+                        # _pace_chat applies the exact server cooldown before retry.
                         continue
                     results.append({
                         "chat_id": chat_id, "sent": False, "delivery_unknown": False,

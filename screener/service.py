@@ -9,7 +9,7 @@ import statistics
 from datetime import datetime, timezone
 from typing import Any
 
-from .binance import BinanceClient
+from .binance import BinanceClient, BinanceScanAbortError
 from .coinalyze import IncompleteUniverseError, ScrapeResult, fetch_table
 from .config import Settings
 from .metrics import EnrichedRow, analyze_universe
@@ -98,6 +98,8 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
     result: dict[str, Any] = {}
     try:
         result["binance_symbol"] = client.resolve_symbol(symbol)
+    except BinanceScanAbortError:
+        raise
     except Exception as exc:
         result["binance_symbol"] = None
         result["binance_symbol_error"] = str(exc)
@@ -110,6 +112,8 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
     try:
         candles4h = client.fetch_candles(fetch_symbol, "4h", settings.binance_kline_limit)
         result["context_4h"] = _context_4h(candles4h, left=left, right=right, lookback=lookback)
+    except BinanceScanAbortError:
+        raise
     except Exception as exc:
         result["context_4h"] = {"trend": f"unavailable: {exc}"}
     try:
@@ -176,6 +180,8 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
                 "distance_from_high_pct": ((high_24h / last_close) - 1.0) * 100.0 if last_close > 0 else None,
                 "source": "last 24 closed Binance 1H candles",
             }
+    except BinanceScanAbortError:
+        raise
     except Exception as exc:
         result["candle_error_1h"] = str(exc)
         result["higher_low"] = {"confirmed": False, "reason": f"1H candle data unavailable: {exc}"}
@@ -186,6 +192,8 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
                 limit=settings.binance_orderbook_limit,
                 notional_usd=settings.execution_notional_usd,
             )
+        except BinanceScanAbortError:
+            raise
         except Exception as exc:
             result["orderbook"] = {"error": str(exc)}
     result["execution_cost_assumptions"] = {"taker_fee_bps_per_side": settings.trading_fee_bps_per_side}
@@ -206,6 +214,8 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
                 "source": "last closed Binance 15m candle",
                 "use": "entry-timing context only; P1 defines no separate numeric 15m trigger threshold",
             }
+        except BinanceScanAbortError:
+            raise
         except Exception as exc:
             result["context_15m"] = {"error": str(exc)}
     return result
@@ -230,6 +240,7 @@ def _preliminary_candidate_symbols(
     # Active alerts remain chart candidates even when a coin disappears from
     # the current Coinalyze universe. Absence from that table is not cancellation.
     symbols.update(active_symbols)
+    candidate_priority: dict[str, tuple[int, float, int, float]] = {}
     for row in enriched:
         history = store.recent_symbol_history(row.symbol, limit=100, contract_type=contract_type)
         if contract_type and not store.symbol_history_is_current(row.symbol, contract_type=contract_type):
@@ -248,17 +259,35 @@ def _preliminary_candidate_symbols(
             history=history,
             as_of=as_of,
         )
-        if any(r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE"} for r in draft):
+        qualifying = [r for r in draft if r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE"}]
+        if qualifying:
             symbols.add(row.symbol)
+            best = max(
+                qualifying,
+                key=lambda result: (
+                    int(result.complete),
+                    result.passed_count / result.total_count if result.total_count else 0.0,
+                    result.passed_count,
+                ),
+            )
+            candidate_priority[row.symbol] = (
+                int(best.complete),
+                best.passed_count / best.total_count if best.total_count else 0.0,
+                best.passed_count,
+                float(row.market.oi_usd or 0.0),
+            )
     max_candidates = int(settings.p1.get("scanner", {}).get("max_chart_candidates", 40))
     if len(symbols) > max_candidates:
         # Active positions/events must stay monitored; only draft candidates are
         # subject to the cap.
         active_present = symbols & active_symbols
         remaining = symbols - active_present
-        oi_by_symbol = {r.symbol: (r.market.oi_usd or 0.0) for r in enriched}
         room = max(0, max_candidates - len(active_present))
-        selected = set(sorted(remaining, key=lambda s: oi_by_symbol.get(s, 0.0), reverse=True)[:room])
+        selected = set(sorted(
+            remaining,
+            key=lambda symbol: candidate_priority.get(symbol, (0, 0.0, 0, 0.0)),
+            reverse=True,
+        )[:room])
         symbols = active_present | selected
         log.warning("Chart candidates capped: %d -> %d (active setups prioritized)", len(active_present | remaining), len(symbols))
     return symbols
@@ -365,8 +394,8 @@ def _confirmation_anchor(result: ScenarioResult) -> int | None:
     code = _scenario_code(result.scenario)
     fields = {
         "LONG A": ("trend_retest_long", "retest_open_time_ms"),
-        "LONG B": ("higher_low", "latest_open_time_ms"),
-        "LONG D": ("higher_low", "latest_open_time_ms"),
+        "LONG B": ("higher_low", "confirmation_close_time_ms"),
+        "LONG D": ("higher_low", "confirmation_close_time_ms"),
         "SHORT A": ("trend_retest_short", "retest_open_time_ms"),
         "SHORT B": ("trend_retest_short", "retest_open_time_ms"),
         "SHORT C": ("bearish_structure_break", "break_open_time_ms"),
@@ -376,14 +405,14 @@ def _confirmation_anchor(result: ScenarioResult) -> int | None:
     if fields is None:
         return None
     value = (technical.get(fields[0]) or {}).get(fields[1])
-    return value if isinstance(value, int) and value > 0 else None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
 def _confirmation_time(result: ScenarioResult) -> int | None:
     """Return when the scenario became confirmable, not merely its pivot identity."""
     technical = result.technical or {}
     if _scenario_code(result.scenario) in {"LONG B", "LONG D"}:
-        value = (technical.get("higher_low") or {}).get("confirmation_open_time_ms")
+        value = (technical.get("higher_low") or {}).get("confirmation_close_time_ms")
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             return value
     return _confirmation_anchor(result)
@@ -394,8 +423,9 @@ def _latest_opposite_candidate(candidates: list[tuple[ScenarioResult, EnrichedRo
 
     Candidate identity contains an event-key string, not a sortable timestamp;
     lexicographical event-key ordering must never decide a reversal. For a
-    higher-low setup, ordering uses the bar that confirmed the pivot while the
-    pivot timestamp remains the stable notification identity.
+    higher-low setup, both ordering and notification identity use the first
+    closed bar that made the pivot confirmable. The pivot candle time remains
+    available separately for structural diagnostics.
     """
     if not candidates:
         raise ValueError("Cannot choose a reversal from an empty candidate list")
@@ -462,40 +492,8 @@ def _has_required_confirmation(result: ScenarioResult, row: EnrichedRow) -> bool
     if breached:
         return False
 
-    context = technical.get("context_4h") or {}
-    close_4h = context.get("last_close")
-    close_4h_ms = context.get("last_close_time_ms")
-    if (
-        not isinstance(close_4h, (int, float))
-        or isinstance(close_4h, bool)
-        or not math.isfinite(float(close_4h))
-        or float(close_4h) <= 0
-        or not isinstance(close_4h_ms, int)
-        or isinstance(close_4h_ms, bool)
-    ):
-        return False
-    if close_4h_ms > now_ms + 5_000 or now_ms - close_4h_ms > 4 * 60 * 60_000 + 15 * 60_000:
-        return False
-    if result.direction.upper() == "LONG":
-        support = context.get("last_confirmed_support")
-        if (
-            not isinstance(support, (int, float))
-            or isinstance(support, bool)
-            or not math.isfinite(float(support))
-            or float(support) <= 0
-            or float(close_4h) < float(support)
-        ):
-            return False
-    else:
-        resistance = context.get("last_confirmed_resistance")
-        if (
-            not isinstance(resistance, (int, float))
-            or isinstance(resistance, bool)
-            or not math.isfinite(float(resistance))
-            or float(resistance) <= 0
-            or float(close_4h) > float(resistance)
-        ):
-            return False
+    # 4H context is descriptive only; requiring a 4H pivot here creates an
+    # undocumented delivery veto on scenarios already confirmed on closed 1H data.
     return True
 
 
@@ -839,6 +837,20 @@ def _collect_notifications(
                     event_key, recipient_key=recipient_key, contract_type=contract_type
                 ):
                     continue
+                last_cancelled_close = store.latest_cancelled_close_time_ms(
+                    symbol, result.direction, recipient_key=recipient_key, contract_type=contract_type
+                )
+                confirmation_anchor = _confirmation_anchor(result)
+                if (
+                    last_cancelled_close is not None
+                    and confirmation_anchor is not None
+                    and confirmation_anchor <= last_cancelled_close
+                ):
+                    log.info(
+                        "Suppressing %s %s re-entry: trigger confirmation %s is not newer than cancelled 1H close %s",
+                        symbol, result.direction, confirmation_anchor, last_cancelled_close,
+                    )
+                    continue
                 if (group, recipient_key) in active_groups_by_recipient or (group, recipient_key) in reversed_groups:
                     continue
                 has_opposite_active = any(
@@ -895,12 +907,14 @@ def _collect_notifications(
     return outcomes
 
 def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[str, Any]:
-    store = Store(settings.data_dir)
-    pruned = store.prune(snapshot_retention_days=30, run_retention_days=90, notification_retention_days=180)
-    if any(pruned.values()):
-        log.info("Persistent state pruned: %s", pruned)
-    run_id = store.start_run()
     use_dry_run = settings.dry_run if dry_run is None else dry_run
+    store = Store(settings.data_dir, create_files=not use_dry_run)
+    run_id = None
+    if not use_dry_run:
+        pruned = store.prune(snapshot_retention_days=30, run_retention_days=90, notification_retention_days=180)
+        if any(pruned.values()):
+            log.info("Persistent state pruned: %s", pruned)
+        run_id = store.start_run()
     try:
         scrape = fetch_table(
             url=settings.coinalyze_url,
@@ -926,7 +940,7 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
                 "Skipping P1 history snapshot because required columns are missing: %s",
                 ", ".join(scrape.missing_required_columns),
             )
-        elif not unchanged and store.snapshot_due(
+        elif not use_dry_run and not unchanged and store.snapshot_due(
             scrape.fetched_at,
             interval_hours=snapshot_interval_hours,
             tolerance_minutes=snapshot_tolerance_minutes,
@@ -989,9 +1003,13 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             results.extend(scenario_results)
 
         allowed, guard_reason = _can_send_alerts(scrape, settings)
-        entry_allowed = allowed and not unchanged
+        # A fresh closed Binance 1H candle can confirm a new trigger even when
+        # Coinalyze ratios are unchanged. Event identity and active lifecycle
+        # state provide idempotency; unchanged polls still do not create 4H
+        # history snapshots or advance the last-successful-poll marker.
+        entry_allowed = allowed
         if unchanged:
-            guard_reason = f"{guard_reason}; unchanged Coinalyze table: new position openings blocked"
+            stats.warnings.append("Coinalyze values unchanged; fresh 1H Binance confirmations remain eligible, event deduplication is active")
         if not entry_allowed:
             log.warning("New position-entry notifications blocked: %s", guard_reason)
         notifications = _collect_notifications(
@@ -1006,7 +1024,8 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             technical_by_symbol=technical_by_symbol,
         )
         visible_results = [r for r in results if r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE", "OBSERVATION_AFTER_BOUNCE"}]
-        store.finish_run(run_id, len(scrape.rows), len(visible_results), "OK")
+        if run_id is not None:
+            store.finish_run(run_id, len(scrape.rows), len(visible_results), "OK")
         retryable_delivery_failures = _has_retryable_notification_failures(notifications)
         if retryable_delivery_failures:
             log.warning(
@@ -1040,10 +1059,12 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             "alert_guard": guard_reason,
         }
     except IncompleteUniverseError as exc:
-        store.finish_run(run_id, 0, 0, "INCOMPLETE_UNIVERSE", str(exc))
+        if run_id is not None:
+            store.finish_run(run_id, 0, 0, "INCOMPLETE_UNIVERSE", str(exc))
         log.exception("Coinalyze universe incomplete; no analysis/notifications sent")
         raise
     except Exception as exc:
-        store.finish_run(run_id, 0, 0, "FAILED", str(exc))
+        if run_id is not None:
+            store.finish_run(run_id, 0, 0, "FAILED", str(exc))
         log.exception("P1 scan failed")
         raise

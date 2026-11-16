@@ -26,16 +26,18 @@ class Store:
     workflow's current branch, so no dedicated state branch is required.
     """
 
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, *, create_files: bool = True) -> None:
         self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        if create_files:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
         self.snapshots_path = self.data_dir / "snapshots.jsonl"
         self.market_rows_path = self.data_dir / "market_rows.jsonl"
         self.notifications_path = self.data_dir / "notifications.jsonl"
         self.poll_state_path = self.data_dir / "poll_state.json"
         self.runs_path = self.data_dir / "runs.jsonl"
-        for path in self.paths:
-            path.touch(exist_ok=True)
+        if create_files:
+            for path in self.paths:
+                path.touch(exist_ok=True)
         self._manifests_cache: list[dict[str, Any]] | None = None
         self._history_cache: dict[str, list[dict[str, Any]]] | None = None
         self._notification_cache: list[dict[str, Any]] | None = None
@@ -544,6 +546,8 @@ class Store:
         return True
 
     def _notification_file_signature(self) -> tuple[int, int]:
+        if not self.notifications_path.exists():
+            return (0, 0)
         stat = self.notifications_path.stat()
         return stat.st_mtime_ns, stat.st_size
 
@@ -592,6 +596,50 @@ class Store:
             and str(item.get("contract_type")).upper() == expected_contract
         ]
         return matching[-1] if matching else None
+
+    def latest_cancelled_close_time_ms(
+        self, symbol: str, direction: str, *, recipient_key: str, contract_type: str,
+    ) -> int | None:
+        """Return the latest cancellation candle close for a pair/direction.
+
+        The cancellation event key is persisted as ``CANCEL|<event>|<close_ms>``.
+        Re-entry is allowed only when the Higher Low confirmation candle closes
+        strictly after that cancelled candle, preventing an intrabar/old pivot
+        confirmation from being treated as a post-cancellation trigger.
+        """
+        expected_symbol = str(symbol).upper()
+        expected_direction = str(direction).upper()
+        expected_recipient = str(recipient_key)
+        expected_contract = str(contract_type).upper()
+        latest_by_group: dict[str, dict[str, Any]] = {}
+        for item in self._current_notification_records():
+            group = str(item.get("event_group") or "")
+            if not group or group.split("|", 1)[0].upper() != expected_symbol:
+                continue
+            if str(item.get("direction") or "").upper() != expected_direction:
+                continue
+            if str(item.get("recipient_key") or "") != expected_recipient:
+                continue
+            if str(item.get("contract_type") or "").upper() != expected_contract:
+                continue
+            if not item.get("event_state"):
+                continue
+            latest_by_group[group] = item
+
+        close_times: list[int] = []
+        for item in latest_by_group.values():
+            if str(item.get("event_state") or "").upper() != "CANCELLED":
+                continue
+            parts = str(item.get("event_key") or "").rsplit("|", 1)
+            if len(parts) != 2:
+                continue
+            try:
+                close_time_ms = int(parts[1])
+            except (TypeError, ValueError):
+                continue
+            if close_time_ms > 0:
+                close_times.append(close_time_ms)
+        return max(close_times) if close_times else None
 
     def notification_due(
         self, event_key: str, cooldown_hours: float, *,
