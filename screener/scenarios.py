@@ -66,6 +66,13 @@ def _result(row: EnrichedRow, scenario: str, direction: str, checks: list[Check]
     futures_flow = row.market.futures_imbalance_4h
     spot_flow = row.market.spot_imbalance_4h
     scenario_code = str(scenario or "").split(" — ", 1)[0].strip().upper()
+    if scenario_code == "LONG C" and status in {"TRIGGER", "CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"}:
+        status = "OBSERVATION"
+        warning = (
+            "LONG C has no defined structural entry anchor or notification gate in P1; "
+            "keep it observation only until those rules are specified and validated."
+        )
+        reason = f"{reason}; {warning}" if reason else warning
     opposed_flow_oi = (
         oi_4h is not None
         and futures_flow is not None
@@ -355,7 +362,8 @@ def evaluate_scenarios(
         "trend_retest_short": technical.get("trend_retest_short"),
     }))
 
-    # SHORT D — Long Liquidation Cascade. Wait status only; never alert as an entry.
+    # SHORT D — Long liquidation pressure is context-only in P1. USD OI change
+    # is price-sensitive and cannot prove that liquidations caused the decline.
     coverage = row.liquidation_coverage_of_oi_drop_pct
     min_oi_drop_usd = max(0.0, float(t.get("oi_24h_min_drop_usd_for_liq_coverage", 1_000_000.0)))
     min_oi_drop_pct = float(t.get("oi_24h_min_drop_pct_for_short_d", -1.0))
@@ -371,26 +379,27 @@ def evaluate_scenarios(
         _check("F negative", _lt(m.futures_imbalance_4h), str(m.futures_imbalance_4h), "< 0"),
         _check("S negative", _lt(m.spot_imbalance_4h), str(m.spot_imbalance_4h), "< 0"),
         _check("OI 24H decline material", material_oi_decline, f"{m.oi_chg24_pct}% / {m.oi_chg24_usd} USD", f"<= {min_oi_drop_pct:g}% or <= -${min_oi_drop_usd:,.0f}"),
-        _check("Liquidations cover OI decline", _ge(coverage, 10.0), f"{coverage:.2f}%" if coverage is not None else "n/a", ">= 10% per P1"),
         _check("Quality flags", no_flags, ", ".join(row.quality_flags) or "none", "none"),
     ]
     core_pattern = all(c.passed is True for c in checks[:5])
-    core_cascade = core_pattern and checks[5].passed is True
+    core_pressure = core_pattern and checks[5].passed is True
     if core_pattern and checks[5].passed is not True:
-        status, reason = "BLOCKED_CAUSALITY", "OI 24H decline is below the materiality floor; a liquidation/OI ratio on this move would be unstable"
-    elif core_cascade and checks[6].passed is not True:
-        status, reason = "BLOCKED_CAUSALITY", "Liquidations cover less than 10% of a material OI decline or coverage is unavailable; P1 does not support calling this a liquidation cascade"
-    elif core_cascade and not no_flags:
+        status, reason = "BLOCKED_CAUSALITY", "OI 24H decline is below the configured materiality floor"
+    elif core_pressure and not no_flags:
         status, reason = "BLOCKED_QUALITY", "Cascade pattern present but quality flags exclude this market"
     elif all(c.passed is True for c in checks):
         rejection = technical.get("weak_bounce_rejection", {})
         if rejection.get("confirmed") is True:
-            status, reason = "CONFIRMED_SIGNAL", "Liquidation cascade, weak bounce and 1H rejection at resistance are confirmed; never short the low"
+            status, reason = "OBSERVATION", "Long-liquidation pressure and a 1H rejection are present; P1 treats SHORT D as context only, not an entry signal"
         else:
-            status, reason = "WAIT_BOUNCE", "Cascade conditions present; SHORT is prohibited at the low. Wait for weak bounce and rejection at resistance."
+            status, reason = "WAIT_BOUNCE", "Long-liquidation pressure context is present; SHORT is prohibited at the low. Wait for a weak bounce and rejection at resistance."
     else:
         status, reason = "NOT_MET", ""
-    out.append(_result(row, "SHORT D — Long Liquidation Cascade", "SHORT", checks, status, reason, {"weak_bounce_rejection": technical.get("weak_bounce_rejection"), "liq_coverage_of_oi_drop_pct": row.liquidation_coverage_of_oi_drop_pct}))
+    out.append(_result(row, "SHORT D — Long Liquidation Pressure", "SHORT", checks, status, reason, {
+        "weak_bounce_rejection": technical.get("weak_bounce_rejection"),
+        "liq_to_usd_oi_change_ratio_pct_diagnostic_only": coverage,
+        "entry_alert_enabled": False,
+    }))
 
     # SHORT E — Failed Short Squeeze. Three distinct, recent saved table
     # observations are required. The rolling 4H windows must not overlap, so

@@ -276,7 +276,7 @@ def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[
             units = {
                 unit
                 for tr in trs
-                if (cells := tr.find_all("td", recursive=False))
+                if (cells := tr.find_all(["th", "td"], recursive=False))
                 and (raw := (_cell_text(cells, indices[0]) or ""))
                 and (unit := _oi_value_unit(raw)) is not None
             }
@@ -289,7 +289,10 @@ def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[
     seen_symbols: set[str] = set()
     for row_idx, tr in enumerate(trs, start=1):
         symbol = str(tr.get("data-coin") or tr.get("data-symbol") or "").strip().upper()
-        cells = tr.find_all("td", recursive=False)
+        # Row headers are legitimate table cells. Dropping a leading <th
+        # scope="row"> shifts every subsequent value against the header map.
+        # Preserve DOM column order and parse both cell types consistently.
+        cells = tr.find_all(["th", "td"], recursive=False)
         if not symbol or not cells:
             raise CoinalyzeError(f"Invalid Coinalyze row {row_idx}: missing symbol or cells; refusing partial universe")
         if not re.fullmatch(r"[A-Z0-9][A-Z0-9._/-]{0,63}", symbol):
@@ -499,17 +502,30 @@ def _page_content(page: Any, url: str, timeout_ms: int) -> str:
     # first row appears; the selector above, not DOMContentLoaded, is readiness.
     page.wait_for_timeout(1500)
     previous = page.locator("tbody tr").count()
+    pagination_detected = False
     for attempt in range(15):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(700)
         current = page.locator("tbody tr").count()
         if page.locator(".pagination").count() > 0:
+            pagination_detected = True
+            log.info(
+                "Coinalyze pagination detected after scroll %d; rows=%d",
+                attempt + 1, current,
+            )
             break
+        if current != previous:
+            log.info("Coinalyze scroll %d: rows %d -> %d", attempt + 1, previous, current)
         if current == previous and attempt >= 3:
             break
         previous = current
     page.evaluate("window.scrollTo(0, 0)")
     page.wait_for_timeout(500)
+    final_count = page.locator("tbody tr").count()
+    log.info(
+        "Coinalyze page rows=%d (pagination=%s)",
+        final_count, pagination_detected,
+    )
     return page.content()
 
 
@@ -603,6 +619,21 @@ def _pagination_urls(html: str, base_url: str) -> list[str]:
     return urls
 
 
+def _pagination_current_page_number(html: str, current_url: str) -> int:
+    """Read the active page number, falling back to the page query parameter."""
+    soup = BeautifulSoup(html, "lxml")
+    pagination = soup.select_one(".pagination")
+    active_page = pagination.select_one("li.active, .page-item.active") if pagination else None
+    active_label = active_page.get_text(" ", strip=True) if active_page else ""
+    query = parse_qs(urlparse(current_url).query, keep_blank_values=True)
+    try:
+        return int(active_label) if active_label.isdigit() else int(query.get("page", ["1"])[0] or "1")
+    except (TypeError, ValueError) as exc:
+        raise IncompleteUniverseError(
+            f"Invalid current Coinalyze page number in URL: {current_url}"
+        ) from exc
+
+
 def _pagination_next_url(html: str, current_url: str) -> str | None:
     """Find exactly the next page, never jumping over Bootstrap ellipsis pages."""
     soup = BeautifulSoup(html, "lxml")
@@ -631,14 +662,7 @@ def _pagination_next_url(html: str, current_url: str) -> str | None:
                 )
             return target
 
-    query = parse_qs(urlparse(current_url).query, keep_blank_values=True)
-    active_page = pagination.select_one("li.active, .page-item.active")
-    active_label = active_page.get_text(" ", strip=True) if active_page else ""
-    try:
-        current_page = int(active_label) if active_label.isdigit() else int(query.get("page", ["1"])[0] or "1")
-    except (TypeError, ValueError):
-        raise IncompleteUniverseError(f"Invalid current Coinalyze page number in URL: {current_url}")
-
+    current_page = _pagination_current_page_number(html, current_url)
     numeric_links: dict[int, str] = {}
     for anchor in pagination.select("a[href]"):
         label = anchor.get_text(" ", strip=True)
@@ -658,11 +682,28 @@ def _pagination_next_url(html: str, current_url: str) -> str | None:
     immediate = numeric_links.get(current_page + 1)
     if immediate is not None:
         return immediate
+    # A numbered JavaScript control has no usable page URL. Defer it to the
+    # browser click path before treating a following ellipsis as unreachable.
+    immediate_label = str(current_page + 1)
+    for control in pagination.select("a, button"):
+        if control.get_text(" ", strip=True) != immediate_label:
+            continue
+        href = str(control.get("href") or "").strip()
+        parent = control.find_parent("li")
+        disabled = (
+            control.has_attr("disabled")
+            or (control.get("aria-disabled") or "").lower() == "true"
+            or (parent is not None and "disabled" in (parent.get("class") or []))
+        )
+        if not disabled and (control.name == "button" or not href or href.startswith("#")):
+            return None
+
     if numeric_links:
         raise IncompleteUniverseError(
             "Coinalyze pagination exposes a later page but not the immediate next page; "
             "refusing to skip hidden pages"
         )
+
     # An ellipsis after the current page means there are hidden forward pages.
     # An ellipsis before it is normal on the final Bootstrap page and is safe.
     descendants = list(pagination.descendants)
@@ -693,6 +734,106 @@ def _pagination_next_url(html: str, current_url: str) -> str | None:
                 "Coinalyze pagination contains hidden forward pages without a usable Next link"
             )
     return None
+
+
+def _sequential_pagination_urls(html: str, base_url: str) -> list[str]:
+    """Return all initially visible page URLs only when they form a safe sequence.
+
+    Coinalyze often exposes every page link in the first response. Loading those
+    URLs directly avoids depending on the pagination widget's active-page state.
+    A visible gap (typically caused by an ellipsis) is deliberately not treated
+    as a complete page list; the normal next-page walker handles that case and
+    fails closed if hidden pages cannot be reached safely.
+    """
+    urls = _pagination_urls(html, base_url)
+    if len(urls) <= 1:
+        return []
+
+    base_query = parse_qs(urlparse(base_url).query, keep_blank_values=True)
+    try:
+        base_page = int(base_query.get("page", ["1"])[0] or "1")
+    except (TypeError, ValueError):
+        return []
+    if base_page < 1:
+        return []
+
+    page_urls: dict[int, str] = {}
+    for target_url in urls[1:]:
+        target_query = parse_qs(urlparse(target_url).query, keep_blank_values=True)
+        page_values = target_query.get("page")
+        # Only query-based page numbers are supported by this direct-load path.
+        # Other URL shapes remain available to the ordinary next-link walker.
+        if not page_values or len(page_values) != 1:
+            return []
+        try:
+            page_number = int(page_values[0])
+        except (TypeError, ValueError):
+            return []
+        if page_number <= base_page:
+            continue
+        existing = page_urls.get(page_number)
+        if existing is not None and _canonical_page_url(existing) != _canonical_page_url(target_url):
+            raise IncompleteUniverseError(
+                f"Coinalyze pagination contains conflicting URLs for page {page_number}"
+            )
+        page_urls[page_number] = target_url
+
+    if not page_urls:
+        return []
+    expected = list(range(base_page + 1, max(page_urls) + 1))
+    if sorted(page_urls) != expected:
+        return []
+    return [page_urls[number] for number in expected]
+
+
+def _find_js_pagination_next_button(page: Any, html: str, current_url: str) -> Any | None:
+    """Find a usable Next control or the exact numeric button for current_page + 1."""
+    pagination = page.locator(".pagination")
+    if pagination.count() == 0:
+        return None
+
+    next_button = pagination.locator(
+        "a[rel~='next'], button[aria-label*='next' i], a[aria-label*='next' i], .next"
+    ).first
+    if next_button.count() > 0 and not _pagination_next_is_disabled(next_button):
+        return next_button
+
+    # Some Coinalyze views render numbered page buttons without hrefs or a
+    # dedicated Next element. Click only the immediate next number; never use
+    # the distant final-page button to jump over hidden pages.
+    next_page_number = _pagination_current_page_number(html, current_url) + 1
+    try:
+        candidates = page.query_selector_all(".pagination a, .pagination button")
+    except Exception:
+        return None
+    for candidate in candidates:
+        try:
+            label = (candidate.inner_text() or "").strip()
+        except Exception:
+            continue
+        if label == str(next_page_number) and not _pagination_next_is_disabled(candidate):
+            return candidate
+    return None
+
+
+def _wait_for_table_transition(
+    page: Any,
+    previous_symbol: str | None,
+    *,
+    attempts: int = 10,
+    interval_ms: int = 500,
+) -> bool:
+    """Wait for the first market row to change after a JavaScript page click."""
+    for _ in range(max(1, attempts)):
+        page.wait_for_timeout(max(1, interval_ms))
+        first_row = page.locator("tbody tr").first
+        current_symbol = (
+            first_row.get_attribute("data-coin")
+            or first_row.get_attribute("data-symbol")
+        )
+        if current_symbol and current_symbol != previous_symbol:
+            return True
+    return False
 
 
 def _pagination_next_is_disabled(next_button: Any) -> bool:
@@ -777,6 +918,44 @@ def fetch_table(
             current_html = first_html
             current_url = url
             visited_pages = {_canonical_page_url(url)}
+
+            # Prefer the complete URL list when the first page exposes a
+            # consecutive range (as in Coinalyze's numbered pagination). This
+            # is only an optimization: hidden/gapped ranges fall back to the
+            # guarded next-page walker below.
+            discovered_urls = _sequential_pagination_urls(first_html, url)
+            if discovered_urls:
+                log.info(
+                    "Coinalyze pagination: %d consecutive page URLs discovered (cap=%d)",
+                    len(discovered_urls) + 1, max_pages,
+                )
+                if len(discovered_urls) + 1 > max_pages:
+                    raise IncompleteUniverseError(
+                        f"Доступно не менее {len(discovered_urls) + 1} страниц Coinalyze, "
+                        f"что превышает лимит ({max_pages}); полнота не подтверждена."
+                    )
+                base_page = int(parse_qs(urlparse(url).query).get("page", ["1"])[0] or "1")
+                for page_number, next_url in enumerate(discovered_urls, start=base_page + 1):
+                    canonical_next = _canonical_page_url(next_url)
+                    if canonical_next in visited_pages:
+                        raise IncompleteUniverseError(
+                            f"Coinalyze pagination loop detected at {next_url}"
+                        )
+                    try:
+                        current_html = _page_content_with_retry(
+                            page, next_url, timeout_ms,
+                            attempts=page_attempts,
+                            retry_backoff_sec=retry_backoff_sec,
+                        )
+                    except Exception as exc:
+                        raise IncompleteUniverseError(
+                            f"Не удалось загрузить страницу {page_number}: {exc}"
+                        ) from exc
+                    current_url = next_url
+                    visited_pages.add(canonical_next)
+                    html_pages.append(current_html)
+                    log.info("Coinalyze page %d URL loaded", page_number)
+
             while len(html_pages) < max_pages:
                 next_url = _pagination_next_url(current_html, current_url)
                 if next_url is not None:
@@ -801,23 +980,16 @@ def fetch_table(
                     continue
 
                 # Fallback for JavaScript pagination without a usable href.
-                pagination = page.locator(".pagination")
-                if pagination.count() == 0:
-                    break
-                next_button = pagination.locator(
-                    "a[rel='next'], button[aria-label='Next'], a[aria-label='Next'], .next"
-                ).first
-                if next_button.count() == 0 or _pagination_next_is_disabled(next_button):
+                next_button = _find_js_pagination_next_button(page, current_html, current_url)
+                if next_button is None:
                     break
                 first_row = page.locator("tbody tr").first
                 before = first_row.get_attribute("data-coin") or first_row.get_attribute("data-symbol")
                 next_button.click()
-                page.wait_for_timeout(1200)
-                first_row = page.locator("tbody tr").first
-                after = first_row.get_attribute("data-coin") or first_row.get_attribute("data-symbol")
-                if not after or after == before:
+                if not _wait_for_table_transition(page, before, attempts=10, interval_ms=500):
                     raise IncompleteUniverseError(
-                        f"Переход на страницу {len(html_pages) + 1} не подтвердил смену таблицы."
+                        f"Переход на страницу {len(html_pages) + 1} не подтвердил смену таблицы "
+                        "после ожидания обновления строк."
                     )
                 current_html = page.content()
                 current_url = str(getattr(page, "url", current_url) or current_url)
@@ -825,15 +997,9 @@ def fetch_table(
 
             if len(html_pages) == max_pages:
                 next_url = _pagination_next_url(current_html, current_url)
-                pagination = page.locator(".pagination")
-                next_button = pagination.locator(
-                    "a[rel='next'], button[aria-label='Next'], a[aria-label='Next'], .next"
-                ).first if pagination.count() else None
-                has_enabled_js_next = (
-                    next_button is not None
-                    and next_button.count() > 0
-                    and not _pagination_next_is_disabled(next_button)
-                )
+                has_enabled_js_next = _find_js_pagination_next_button(
+                    page, current_html, current_url
+                ) is not None
                 if next_url is not None or has_enabled_js_next:
                     raise IncompleteUniverseError(
                         f"Достигнут лимит страниц Coinalyze ({max_pages}); полнота не подтверждена."

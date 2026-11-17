@@ -214,7 +214,21 @@ def _merge_poll_state(remote_path: Path, local_path: Path) -> str:
                 )
             if new_at > old_at:
                 contracts[str(contract)] = dict(state)
-    return _canonical({"schema_version": 1, "contracts": contracts}) + "\n"
+    merged: dict[str, Any] = {"schema_version": 1, "contracts": contracts}
+    cooldowns = [
+        state["binance_cooldown_until"]
+        for state in (remote, local)
+        if state.get("binance_cooldown_until")
+    ]
+    if cooldowns:
+        latest = max(
+            cooldowns,
+            key=lambda raw: _record_time(
+                {"binance_cooldown_until": raw}, "binance_cooldown_until", "poll_state.json"
+            ),
+        )
+        merged["binance_cooldown_until"] = latest
+    return _canonical(merged) + "\n"
 
 
 def merge_state(source_dir: Path, target_dir: Path) -> None:

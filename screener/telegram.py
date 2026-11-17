@@ -221,7 +221,10 @@ def format_alert(
         f"Long Liq: <code>{_percent(row.long_liq_share * 100 if row.long_liq_share is not None else None, 2, signed=False)}</code>",
     ]
     if _scenario_code(result.scenario).upper() == "SHORT D" and row.liquidation_coverage_of_oi_drop_pct is not None:
-        lines.append(f"Liqs / OI drop: <code>{_number(row.liquidation_coverage_of_oi_drop_pct, 2)}%</code>")
+        lines.append(
+            "Liqs / USD OI change (diagnostic only): "
+            f"<code>{_number(row.liquidation_coverage_of_oi_drop_pct, 2)}%</code>"
+        )
     lines.extend([
         "",
         "<b>MARKET CONTEXT</b>",
@@ -346,6 +349,21 @@ class TelegramClient:
                         },
                         timeout=self.timeout_sec,
                     )
+                except requests.exceptions.ConnectTimeout as exc:
+                    # Requests documents ConnectTimeout as safe to retry: the
+                    # TCP connection was not established, so the POST was not
+                    # delivered to Telegram. Keep it retryable across scans if
+                    # all local attempts are exhausted.
+                    safe_error = _safe_telegram_error(exc, self.token, chat_id)
+                    if attempts < 3:
+                        log.warning("Telegram connection timed out before POST delivery; retrying recipient")
+                        continue
+                    results.append({
+                        "chat_id": chat_id, "sent": False, "delivery_unknown": False,
+                        "permanent_failure": False, "error": safe_error,
+                    })
+                    log.warning("Telegram connection could not be established after retries: %s", safe_error)
+                    break
                 except requests.RequestException as exc:
                     # Telegram may have accepted a POST before the connection
                     # failed. A blind retry can duplicate a cancellation/reversal.

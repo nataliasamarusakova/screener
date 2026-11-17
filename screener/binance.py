@@ -26,6 +26,10 @@ class BinanceDataError(RuntimeError):
 class BinanceScanAbortError(BinanceDataError):
     """A Binance rate-limit state where the rest of this scan must stop."""
 
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
 
 class BinanceIPBanError(BinanceScanAbortError):
     """Fatal Binance IP ban; the current scan must stop issuing requests."""
@@ -37,6 +41,14 @@ class BinanceWAFBlockError(BinanceScanAbortError):
 
 class BinanceRateLimitError(BinanceScanAbortError):
     """Repeated HTTP 429 responses; further requests in this scan are unsafe."""
+
+
+class BinanceGeoRestrictionError(BinanceScanAbortError):
+    """HTTP 451 means the API is unavailable from this network/region."""
+
+
+class BinanceCooldownActiveError(BinanceScanAbortError):
+    """A previously persisted Binance Retry-After window is still active."""
 
 
 class BinanceClient:
@@ -144,7 +156,13 @@ class BinanceClient:
                     )
                     raise BinanceIPBanError(
                         "Binance returned HTTP 418 (IP ban); stopping the entire scan immediately."
-                        + detail
+                        + detail,
+                        retry_after_seconds=self._ip_ban_retry_after,
+                    )
+                if response.status_code == 451:
+                    raise BinanceGeoRestrictionError(
+                        "Binance returned HTTP 451 (Unavailable For Legal Reasons); "
+                        "stopping the entire scan because market data is unavailable from this network/region."
                     )
                 if response.status_code == 429:
                     delay = self._retry_after_seconds(response.headers, 2 ** attempt)
@@ -153,7 +171,8 @@ class BinanceClient:
                         self._rate_limit_retry_after = delay
                         raise BinanceRateLimitError(
                             "Binance returned HTTP 429 on all three attempts; stopping the entire scan to avoid escalation"
-                            + (f". Retry-After={delay:g}s" if delay > 0 else "")
+                            + (f". Retry-After={delay:g}s" if delay > 0 else ""),
+                            retry_after_seconds=delay,
                         )
                     log.warning(
                         "Binance rate limit HTTP 429 for %s; waiting %.3fs before retry %d/3",

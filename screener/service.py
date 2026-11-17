@@ -9,7 +9,7 @@ import statistics
 from datetime import datetime, timezone
 from typing import Any
 
-from .binance import BinanceClient, BinanceScanAbortError
+from .binance import BinanceClient, BinanceCooldownActiveError, BinanceScanAbortError
 from .coinalyze import IncompleteUniverseError, ScrapeResult, fetch_table
 from .config import Settings
 from .metrics import EnrichedRow, analyze_universe
@@ -154,7 +154,10 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
             wick_body_ratio=float(structure_cfg.get("weak_rejection_wick_body_ratio", 0.75)),
             atr_tolerance=float(structure_cfg.get("weak_rejection_atr_tolerance", 0.5)),
         )
-        result["failed_breakout_rejection"] = failed_breakout_rejection(candles1h, left, right, lookback)
+        result["failed_breakout_rejection"] = failed_breakout_rejection(
+            candles1h, left, right, lookback,
+            max_age_bars=int(structure_cfg.get("failed_breakout_max_age_bars", 3)),
+        )
         result["rising_1h"] = rising_1h(candles1h)
         result["last_closed_1h"] = {
             "open_time_ms": candles1h[-1].open_time_ms,
@@ -464,7 +467,6 @@ def _has_required_confirmation(result: ScenarioResult, row: EnrichedRow) -> bool
         "SHORT A": ("trend_retest_short", "confirmed"),
         "SHORT B": ("trend_retest_short", "confirmed"),
         "SHORT C": ("bearish_structure_break", "confirmed"),
-        "SHORT D": ("weak_bounce_rejection", "confirmed"),
         "SHORT E": ("failed_breakout_rejection", "confirmed"),
     }
     gate = gates.get(code)
@@ -479,11 +481,6 @@ def _has_required_confirmation(result: ScenarioResult, row: EnrichedRow) -> bool
         return False
     if code == "SHORT C" and (technical.get("trend_retest_short") or {}).get("confirmed") is not True:
         return False
-    if code == "SHORT D":
-        coverage = row.liquidation_coverage_of_oi_drop_pct
-        if coverage is None or coverage < 10.0:
-            return False
-
     invalidation = scenario_invalidation(result.direction, result.scenario, technical)
     level = invalidation.get("level")
     if not isinstance(level, (int, float)) or isinstance(level, bool) or not math.isfinite(float(level)) or level <= 0:
@@ -1040,6 +1037,13 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             log.info("Persistent state pruned: %s", pruned)
         run_id = store.start_run()
     try:
+        cooldown_remaining = store.binance_cooldown_remaining()
+        if cooldown_remaining > 0:
+            raise BinanceCooldownActiveError(
+                f"Persisted Binance Retry-After cooldown is active for another {cooldown_remaining:.1f}s; "
+                "skipping the scan to avoid extending an IP ban.",
+                retry_after_seconds=cooldown_remaining,
+            )
         scrape = fetch_table(
             url=settings.coinalyze_url,
             p_sid=settings.coinalyze_p_sid,
@@ -1103,6 +1107,18 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         for index, symbol in enumerate(sorted(candidate_symbols), start=1):
             log.info("Fetching candles for chart candidate %d/%d: %s", index, len(candidate_symbols), symbol)
             technical_by_symbol[symbol] = _technical_for_symbol(binance, symbol, settings)
+        chart_ready = sum(
+            isinstance(item.get("last_closed_1h"), dict)
+            and isinstance((context := item.get("context_4h")), dict)
+            and isinstance(context.get("ema20"), (int, float))
+            and isinstance(context.get("ema50"), (int, float))
+            for item in technical_by_symbol.values()
+        )
+        if chart_ready < len(candidate_symbols):
+            stats.warnings.append(
+                f"Incomplete Binance chart coverage: {chart_ready}/{len(candidate_symbols)} candidates "
+                "have both 1H and 4H context; candidates without a fresh closed 1H candle cannot trigger entry alerts"
+            )
 
         results: list[ScenarioResult] = []
         for row in enriched:
@@ -1188,6 +1204,22 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         if run_id is not None:
             store.finish_run(run_id, 0, 0, "INCOMPLETE_UNIVERSE", str(exc))
         log.exception("Coinalyze universe incomplete; no analysis/notifications sent")
+        raise
+    except BinanceScanAbortError as exc:
+        if run_id is not None:
+            store.finish_run(run_id, 0, 0, "BINANCE_ABORT", str(exc))
+        if (
+            not isinstance(exc, BinanceCooldownActiveError)
+            and exc.retry_after_seconds is not None
+            and exc.retry_after_seconds > 0
+        ):
+            try:
+                until = store.record_binance_cooldown(exc.retry_after_seconds)
+                if until is not None:
+                    log.error("Persisted Binance cooldown until %s", until.isoformat())
+            except Exception:
+                log.exception("Could not persist Binance cooldown; manual review is required")
+        log.error("Binance scan aborted: %s", exc)
         raise
     except Exception as exc:
         if run_id is not None:

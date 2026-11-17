@@ -386,19 +386,44 @@ def rising_1h(candles: list[Candle]) -> bool | None:
     return candles[-1].close > candles[-2].close
 
 
-def failed_breakout_rejection(candles: list[Candle], left: int = 2, right: int = 2, lookback: int = 60) -> dict[str, Any]:
-    """Detect a recent push above a confirmed 1H swing high that closed back below it."""
+def failed_breakout_rejection(
+    candles: list[Candle], left: int = 2, right: int = 2, lookback: int = 60,
+    max_age_bars: int = 3,
+) -> dict[str, Any]:
+    """Detect a fresh break above a confirmed 1H swing high followed by rejection.
+
+    A level that price accepted for many candles is no longer a fresh failed
+    breakout. Require a recent transition from a close at/below the level to a
+    wick above it, then require the latest candle to reject that same level.
+    Intermediate closes must remain above the level until the rejection.
+    """
     highs, _ = confirmed_pivots(candles, left, right, lookback)
     if not highs or len(candles) < 2:
         return {"confirmed": False, "reason": "No confirmed 1H swing high or insufficient candles"}
     last = candles[-1]
+    max_age_bars = max(1, int(max_age_bars))
+    first_recent_index = max(1, len(candles) - max_age_bars)
     for _pivot_idx, level in reversed(highs):
-        # The sweep/rejection must occur on the latest closed 1H candle.
-        # A high from several bars ago cannot keep this trigger alive while
-        # price continues drifting lower.
-        if last.high > level and last.close < level:
-            return {"confirmed": True, "reason": "Latest closed 1H candle swept a prior swing high and closed back below it", "failed_level": level, "last_close": last.close, "failure_open_time_ms": last.open_time_ms}
-    return {"confirmed": False, "reason": "Latest closed 1H candle did not reject a prior swing high"}
+        breakout_indices = [
+            index for index in range(first_recent_index, len(candles))
+            if candles[index - 1].close <= level and candles[index].high > level
+        ]
+        if not breakout_indices:
+            continue
+        breakout_idx = breakout_indices[-1]
+        accepted_above_until_rejection = all(
+            candle.close >= level for candle in candles[breakout_idx:-1]
+        )
+        if last.high > level and last.close < level and accepted_above_until_rejection:
+            return {
+                "confirmed": True,
+                "reason": "Fresh 1H break above a prior swing high was rejected back below it",
+                "failed_level": level,
+                "last_close": last.close,
+                "breakout_open_time_ms": candles[breakout_idx].open_time_ms,
+                "failure_open_time_ms": last.open_time_ms,
+            }
+    return {"confirmed": False, "reason": "No fresh swing-high break followed by a latest-candle rejection"}
 
 
 def scenario_invalidation(direction: str, scenario: str, technical: dict[str, Any]) -> dict[str, Any]:

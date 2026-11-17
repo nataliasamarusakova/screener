@@ -50,6 +50,9 @@ DEFAULT_P1_CONFIG: dict[str, Any] = {
         "retest_atr_tolerance": 0.25,
         "weak_rejection_wick_body_ratio": 0.75,
         "weak_rejection_atr_tolerance": 0.5,
+        # A failed breakout is a short-lived event, not a level that can remain
+        # valid after the market has accepted price above resistance.
+        "failed_breakout_max_age_bars": 3,
     },
     "scanner": {
         "max_chart_candidates": 100,

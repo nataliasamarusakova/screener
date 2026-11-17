@@ -358,7 +358,21 @@ class Store:
             "snapshot_hash": current_hash,
             "polled_at": self._utc_iso(timestamp),
         }
-        payload = {"schema_version": 1, "contracts": contracts}
+        payload = {**state, "schema_version": 1, "contracts": contracts}
+        self._write_poll_state(payload)
+
+    def _read_poll_state_strict(self) -> dict[str, Any]:
+        if not self.poll_state_path.exists():
+            return {"schema_version": 1, "contracts": {}}
+        try:
+            state = json.loads(self.poll_state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Unreadable critical poll state: {self.poll_state_path}") from exc
+        if not isinstance(state, dict) or not isinstance(state.get("contracts"), dict):
+            raise ValueError(f"Invalid critical poll state schema: {self.poll_state_path}")
+        return state
+
+    def _write_poll_state(self, payload: dict[str, Any]) -> None:
         fd, temporary_name = tempfile.mkstemp(
             prefix=f".{self.poll_state_path.name}.", suffix=".tmp", dir=self.data_dir
         )
@@ -375,6 +389,50 @@ class Store:
             except FileNotFoundError:
                 pass
             raise
+
+    def binance_cooldown_remaining(self, *, now: datetime | None = None) -> float:
+        """Return remaining persisted Binance Retry-After seconds, failing closed on corrupt state."""
+        state = self._read_poll_state_strict()
+        raw = state.get("binance_cooldown_until")
+        if not raw:
+            return 0.0
+        try:
+            until = datetime.fromisoformat(str(raw))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid binance_cooldown_until in {self.poll_state_path}: {raw!r}") from exc
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        return max(0.0, (until.astimezone(timezone.utc) - current.astimezone(timezone.utc)).total_seconds())
+
+    def record_binance_cooldown(
+        self, retry_after_seconds: float, *, now: datetime | None = None
+    ) -> datetime | None:
+        """Persist the server-mandated cooldown without overwriting poll hashes."""
+        delay = float(retry_after_seconds)
+        if not math.isfinite(delay) or delay <= 0:
+            return None
+        state = self._read_poll_state_strict()
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        proposed = current.astimezone(timezone.utc) + timedelta(seconds=delay)
+        existing_raw = state.get("binance_cooldown_until")
+        if existing_raw:
+            try:
+                existing = datetime.fromisoformat(str(existing_raw))
+                if existing.tzinfo is None:
+                    existing = existing.replace(tzinfo=timezone.utc)
+                proposed = max(proposed, existing.astimezone(timezone.utc))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid binance_cooldown_until in {self.poll_state_path}: {existing_raw!r}") from exc
+        state["binance_cooldown_until"] = self._utc_iso(proposed)
+        state.setdefault("schema_version", 1)
+        state.setdefault("contracts", {})
+        self._write_poll_state(state)
+        return proposed
 
     def symbol_history_is_current(self, symbol: str, *, contract_type: str) -> bool:
         """Whether a symbol was present in the latest committed universe snapshot."""

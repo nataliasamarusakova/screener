@@ -177,7 +177,9 @@ def analyze_universe(rows: list[MarketRow], p1: dict[str, Any]) -> tuple[list[En
             row.oi_chg24_pct is not None and row.oi_chg24_pct <= min_oi_drop_pct
         )
         liq_coverage = None
-        voluntary = None
+        # This USD ratio is descriptive only: USD OI changes also reflect
+        # mark-price movement, so it cannot identify the voluntary share of
+        # position closures. Keep the legacy field explicitly unknown.
         # A percentage-only OI move cannot produce a USD liquidation-coverage
         # ratio. Never substitute an artificial denominator: that would create
         # a mathematically valid but economically fabricated cascade signal.
@@ -188,7 +190,6 @@ def analyze_universe(rows: list[MarketRow], p1: dict[str, Any]) -> tuple[list[En
             and min_oi_drop_usd > 0
         ):
             liq_coverage = liq_total / abs(row.oi_chg24_usd)
-            voluntary = liq_coverage < 0.10
 
         f_r = f_rank.get(row.symbol)
         s_r = s_rank.get(row.symbol)
@@ -205,6 +206,11 @@ def analyze_universe(rows: list[MarketRow], p1: dict[str, Any]) -> tuple[list[En
         s_strong_sell = bool(is_quality_clean and s_rank_reliable and s is not None and s < 0 and s_bottom_cutoff is not None and s <= s_bottom_cutoff)
 
         notes = list(base_notes)
+        if liq_coverage is not None:
+            notes.append(
+                "USD_LIQUIDATION_TO_USD_OI_CHANGE_RATIO_IS_DESCRIPTIVE_ONLY: "
+                "USD OI change includes mark-price effects; this ratio is not a causal liquidation-coverage estimate"
+            )
         if delta_funding is not None:
             if row.fr_oiw_pct is not None and row.pfr_oiw_pct is not None and row.fr_oiw_pct * row.pfr_oiw_pct < 0:
                 notes.append("PFR OI_W changes sign versus current FR OI_W; P1 has no numeric divergence threshold, warning only")
@@ -216,10 +222,8 @@ def analyze_universe(rows: list[MarketRow], p1: dict[str, Any]) -> tuple[list[En
             notes.append("BTC Correlation 7D > 0.7: treat as BTC-correlated exposure, not an independent position")
         if row.oi_chg4h_usd is not None and abs(row.oi_chg4h_usd) < float(thresholds.get("oi_4h_small_usd", 2_000_000.0)):
             notes.append("OI 4H change is small in USD")
-        if voluntary is True:
-            notes.append("Liquidations explain <10% of absolute OI 24H decline; decline likely mostly voluntary")
         if row.oi_chg24_usd is not None and row.oi_chg24_usd < 0 and not oi_drop_material:
-            notes.append("OI 24H decline is below the materiality floor; liquidation coverage is not used for SHORT D")
+            notes.append("OI 24H USD decline is below the materiality floor")
         if f is not None and s is not None and f * s < 0:
             notes.append("Futures and Spot Imbalance have opposite signs; F/S divergence, no mutual flow confirmation")
         if row.chg24_pct is not None and s is not None:
@@ -258,7 +262,7 @@ def analyze_universe(rows: list[MarketRow], p1: dict[str, Any]) -> tuple[list[En
             liq_imbalance=liq_imb,
             rel_strength_vs_btc_pp=rel_strength,
             liquidation_coverage_of_oi_drop_pct=liq_coverage * 100.0 if liq_coverage is not None else None,
-            oi_drop_mostly_voluntary=voluntary,
+            oi_drop_mostly_voluntary=None,
             f_adj=(f - median_f) if f is not None and median_f is not None else None,
             s_adj=(s - median_s) if s is not None and median_s is not None else None,
             f_rank_desc=f_r,
@@ -300,4 +304,12 @@ def analyze_universe(rows: list[MarketRow], p1: dict[str, Any]) -> tuple[list[En
                if btc is None or btc_change is None else [])
         ),
     )
+    if stats.f_count < stats.row_count or stats.s_count < stats.row_count:
+        f_pct = 100.0 * stats.f_count / stats.row_count if stats.row_count else 0.0
+        s_pct = 100.0 * stats.s_count / stats.row_count if stats.row_count else 0.0
+        stats.warnings.append(
+            f"Incomplete Coinalyze flow coverage: Futures F {stats.f_count}/{stats.row_count} "
+            f"({f_pct:.1f}%), Spot S {stats.s_count}/{stats.row_count} ({s_pct:.1f}%); "
+            "rank statistics use available quality-clean observations only"
+        )
     return enriched, stats
