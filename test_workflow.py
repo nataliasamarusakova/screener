@@ -94,3 +94,13 @@ def test_workflow_runs_regressions_before_scanning_and_skips_persistence_if_test
     persist_at = workflow.index("- name: Persist scanner state on the current branch")
     assert tests_at < scan_at < persist_at
     assert "if: always() && steps.tests.outcome == 'success'" in workflow[persist_at:]
+
+def test_persist_step_python_heredoc_terminator_is_at_shell_column_zero():
+    workflow = (Path(__file__).resolve().parent / ".github/workflows/screener.yml").read_text()
+    persist = workflow.split("- name: Persist scanner state on the current branch", 1)[1]
+    lines = persist.splitlines()
+    command_index = next(i for i, line in enumerate(lines) if line.strip() == "python - <<'PY'")
+    command_indent = len(lines[command_index]) - len(lines[command_index].lstrip(" "))
+    terminator_index = next(i for i in range(command_index + 1, len(lines)) if lines[i].strip() == "PY")
+    terminator_indent = len(lines[terminator_index]) - len(lines[terminator_index].lstrip(" "))
+    assert terminator_indent == command_indent
