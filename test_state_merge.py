@@ -86,6 +86,25 @@ def test_merge_state_preserves_concurrent_snapshots_notifications_and_latest_pol
     assert (target / "notifications.jsonl").read_bytes() == first_notification_bytes
 
 
+def test_merge_state_keeps_latest_binance_cooldown_from_either_runner(tmp_path):
+    remote, local, target = tmp_path / "remote", tmp_path / "local", tmp_path / "target"
+    remote.mkdir()
+    local.mkdir()
+    target.mkdir()
+    for folder, cooldown in ((remote, "2026-11-17T09:10:00+00:00"), (local, "2026-11-17T09:15:00+00:00")):
+        (folder / "poll_state.json").write_text(json.dumps({
+            "schema_version": 1,
+            "contracts": {},
+            "binance_cooldown_until": cooldown,
+        }))
+    (target / "poll_state.json").write_bytes((remote / "poll_state.json").read_bytes())
+
+    merge_state(local, target)
+
+    merged = json.loads((target / "poll_state.json").read_text())
+    assert merged["binance_cooldown_until"] == "2026-11-17T09:15:00+00:00"
+
+
 def test_merge_state_rejects_conflicting_duplicate_snapshot_manifest(tmp_path):
     remote, local, target = tmp_path / "remote", tmp_path / "local", tmp_path / "target"
     manifest, row = _snapshot("same-id", "2026-11-16T10:00:00+00:00", "BTCUSDT_PERP", "Bitcoin")

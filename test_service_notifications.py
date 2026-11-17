@@ -41,6 +41,44 @@ def test_waiting_and_observation_scenarios_are_not_delivered():
         assert _collect_notifications([result], enriched, settings, store, True, False) == []
 
 
+def test_short_d_is_context_only_and_cannot_become_an_entry_notification():
+    from datetime import datetime, timezone
+    from screener.service import _has_required_confirmation
+
+    market = MarketRow(
+        symbol="BTCUSDT_PERP", name="Bitcoin", price=100.0,
+        volume24_usd=100_000_000, oi_usd=50_000_000,
+        oi_vol_ratio=0.5, vol_mktcap_ratio=0.5,
+        oi_chg24_pct=-2.0, oi_chg24_usd=-2_000_000,
+        oi_chg4h_pct=-0.5, oi_chg4h_usd=-500_000,
+        futures_imbalance_4h=-5.0, spot_imbalance_4h=-6.0,
+        liq_total24_usd=1_000_000, liq_long24_usd=900_000, liq_short24_usd=100_000,
+    )
+    enriched, _ = analyze_universe([market], {"thresholds": {}})
+    close_ms = (int(datetime.now(timezone.utc).timestamp() * 1000) // 3_600_000) * 3_600_000 - 1
+    open_ms = close_ms - 3_599_999
+    result = ScenarioResult(
+        symbol=market.symbol, name=market.name, scenario="SHORT D — Long Liquidation Pressure",
+        direction="SHORT", checks=[Check("context", True, "present", "diagnostic")],
+        quality_flags=[], status="CONFIRMED_SIGNAL",
+        technical={
+            "binance_symbol": "BTCUSDT",
+            "last_closed_1h": {
+                "open_time_ms": open_ms,
+                "close_time_ms": close_ms,
+                "open": 100.0, "close": 99.0,
+            },
+            "weak_bounce_rejection": {
+                "confirmed": True,
+                "resistance": 101.0,
+                "rejection_open_time_ms": open_ms,
+            },
+        },
+    )
+
+    assert _has_required_confirmation(result, enriched[0]) is False
+
+
 def test_telegram_header_uses_direction_emoji_and_full_contract_ticker_for_short():
     from screener.telegram import format_alert
 
@@ -361,11 +399,12 @@ def test_funding_sign_reversal_is_warning_only_after_chart_confirmation(tmp_path
     assert "PFR OI_W меняет знак относительно FR OI_W" in message
 
 
-def test_short_d_is_blocked_when_liquidations_cover_less_than_ten_percent_of_oi_drop():
+def test_short_d_keeps_usd_liquidation_ratio_diagnostic_but_never_marks_entry_confirmed():
     from screener.scenarios import evaluate_scenarios
 
     market = MarketRow(
         symbol="XRPUSDT_PERP.A", name="XRP", price=0.5, chg24_pct=-0.68,
+        market_cap_usd=1_000_000_000, volume24_usd=200_000_000,
         oi_usd=1_052_513_986, oi_chg24_pct=-5.72, oi_chg24_usd=-60_203_800,
         oi_chg4h_pct=-0.64, oi_chg4h_usd=-1_000_000,
         fr_oiw_pct=0.0093, pfr_oiw_pct=0.0090, ls_ratio_1d=3.39,
@@ -380,9 +419,10 @@ def test_short_d_is_blocked_when_liquidations_cover_less_than_ten_percent_of_oi_
     )
     short_d = next(item for item in results if item.scenario.startswith("SHORT D"))
     assert abs(enriched[0].liquidation_coverage_of_oi_drop_pct - 5.79) < 0.01
-    assert short_d.status == "BLOCKED_CAUSALITY"
-    coverage = next(check for check in short_d.checks if check.name == "Liquidations cover OI decline")
-    assert coverage.passed is False
+    assert enriched[0].oi_drop_mostly_voluntary is None
+    assert short_d.status == "OBSERVATION"
+    assert short_d.technical["entry_alert_enabled"] is False
+    assert abs(short_d.technical["liq_to_usd_oi_change_ratio_pct_diagnostic_only"] - 5.79) < 0.01
 
 
 def test_market_summary_formatter_is_not_part_of_telegram_runtime():
@@ -523,6 +563,38 @@ def test_telegram_client_retries_rate_limit_once_then_succeeds(monkeypatch):
     assert len(calls) == 2
     assert sleeps == [1.0]
     assert result == [{"chat_id": "chat-1", "sent": True, "delivery_unknown": False, "message_id": 77}]
+
+
+def test_telegram_client_retries_connect_timeout_as_definitely_not_delivered(monkeypatch):
+    from screener.telegram import TelegramClient
+    import screener.telegram as telegram_module
+
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"ok": True, "result": {"message_id": 88}}
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise telegram_module.requests.exceptions.ConnectTimeout("connect timed out")
+        return Response()
+
+    monkeypatch.setattr(telegram_module.requests, "post", fake_post)
+    client = TelegramClient(
+        "token", ["chat-1"], min_interval_per_chat_sec=0, min_interval_global_sec=0,
+    )
+
+    result = client.send("test")
+
+    assert len(calls) == 2
+    assert result == [{"chat_id": "chat-1", "sent": True, "delivery_unknown": False, "message_id": 88}]
 
 
 def test_safe_truncation_fails_closed_instead_of_silently_cutting_a_message():

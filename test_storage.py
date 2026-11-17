@@ -63,6 +63,24 @@ def test_first_live_poll_is_not_assumed_processed_from_a_four_hour_snapshot(tmp_
     assert not (data_dir / "poll_state.json").exists()
 
 
+def test_binance_cooldown_is_persisted_and_survives_successful_poll_updates(tmp_path):
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    now = datetime(2026, 11, 17, 9, 0, tzinfo=timezone.utc)
+
+    until = store.record_binance_cooldown(300, now=now)
+    assert until == now + timedelta(seconds=300)
+    assert store.binance_cooldown_remaining(now=now) == 300
+
+    store.record_poll("PERPETUAL", [_row()], polled_at=now)
+
+    assert store.binance_cooldown_remaining(now=now + timedelta(seconds=120)) == 180
+    state = __import__("json").loads((data_dir / "poll_state.json").read_text())
+    assert state["contracts"]["PERPETUAL"]["snapshot_hash"]
+    assert state["binance_cooldown_until"] == until.isoformat()
+    assert store.binance_cooldown_remaining(now=until + timedelta(seconds=1)) == 0
+
+
 def test_spot_sequence_is_unknown_if_symbol_is_missing_from_latest_universe_snapshot(tmp_path):
     store = Store(tmp_path / "data")
     base = datetime.now(timezone.utc) - timedelta(hours=8)

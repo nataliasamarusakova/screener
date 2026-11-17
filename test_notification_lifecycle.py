@@ -290,7 +290,7 @@ def test_old_event_is_cancelled_by_its_saved_level_not_a_new_pivot(tmp_path, mon
 
 
 
-def test_two_new_confirmed_scenarios_are_sent_as_two_separate_telegram_messages(tmp_path, monkeypatch):
+def test_short_d_is_not_sent_as_entry_but_confirmed_long_signal_is_sent(tmp_path, monkeypatch):
     import screener.service as service
 
     FakeTelegram.sent = []
@@ -314,28 +314,27 @@ def test_two_new_confirmed_scenarios_are_sent_as_two_separate_telegram_messages(
         contract_alerts_allowed=True, dry_run=False,
     )
 
-    # Exactly two sendMessage calls, each containing one complete signal card.
+    # SHORT D is explicitly context-only; only the confirmed LONG A is sent.
     from screener import telegram as telegram_module
     assert not hasattr(telegram_module, "format_alert_batch")
-    assert len(FakeTelegram.sent) == 2
-    assert len(outcomes) == 2
-    assert all(item["type"] == "confirmed_signal" and item["sent"] for item in outcomes)
+    assert len(FakeTelegram.sent) == 1
+    assert len(outcomes) == 1
+    assert outcomes[0]["type"] == "confirmed_signal" and outcomes[0]["sent"]
     messages = [message for message, recipients in FakeTelegram.sent]
     assert all(recipients == ["chat-1"] for _, recipients in FakeTelegram.sent)
-    assert any("FILUSDT" in message and "SHORT D" in message for message in messages)
     assert any("ONDOUSDT" in message and "LONG A" in message for message in messages)
     assert all("НОВЫЕ ПОДТВЕРЖДЁННЫЕ СЦЕНАРИИ" not in message for message in messages)
     assert all("────────────" not in message for message in messages)
     assert all("P1 · НОВЫЕ СЦЕНАРИИ" not in message for message in messages)
-    assert len(store.active_notification_states(recipient_keys=[_recipient_key()])) == 2
+    assert len(store.active_notification_states(recipient_keys=[_recipient_key()])) == 1
 
-    # A following cron run must not resend either of the two separately posted cards.
+    # A following cron run must not resend the already-posted LONG A card.
     repeated = _collect_notifications(
         [short_d, long_a], rows, _settings(), store,
         contract_alerts_allowed=True, dry_run=False,
     )
     assert repeated == []
-    assert len(FakeTelegram.sent) == 2
+    assert len(FakeTelegram.sent) == 1
 
 
 def test_active_signal_is_monitored_and_cancelled_when_symbol_disappears_from_coinalyze(tmp_path, monkeypatch):

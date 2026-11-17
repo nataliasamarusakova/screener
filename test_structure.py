@@ -149,6 +149,34 @@ def test_failed_breakout_rejection_does_not_survive_after_price_moves_away(monke
     assert result["confirmed"] is False
 
 
+def test_failed_breakout_rejection_rejects_level_accepted_for_many_bars(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 103, 101, 102) for i in range(40)]
+    values[4] = candle(4, 105, 100, 103)  # first break above resistance 100
+    values[-1] = candle(39, 102, 98, 99)   # rejection after 35 closes above it
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([(2, 100.0)], []))
+
+    result = failed_breakout_rejection(values, left=1, right=1, lookback=60, max_age_bars=3)
+
+    assert result["confirmed"] is False
+
+
+def test_failed_breakout_rejection_accepts_fresh_break_then_rejection(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 99, 97, 98) for i in range(12)]
+    values[-2] = candle(10, 103, 100, 102)  # fresh break and close above 100
+    values[-1] = candle(11, 103, 98, 99)    # immediate rejection back below 100
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([(2, 100.0)], []))
+
+    result = failed_breakout_rejection(values, left=1, right=1, lookback=30, max_age_bars=3)
+
+    assert result["confirmed"] is True
+    assert result["breakout_open_time_ms"] == values[-2].open_time_ms
+    assert result["failure_open_time_ms"] == values[-1].open_time_ms
+
+
 def test_breakout_retest_expires_when_first_retest_is_too_late(monkeypatch):
     import screener.structure as structure
 

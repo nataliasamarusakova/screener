@@ -208,6 +208,20 @@ def test_percentage_only_oi_decline_does_not_fabricate_usd_liquidation_coverage(
     assert enriched[0].oi_drop_mostly_voluntary is None
 
 
+def test_incomplete_futures_and_spot_flow_coverage_is_reported_in_market_stats():
+    rows = [
+        MarketRow(symbol="AAAUSDT", name="AAA", futures_imbalance_4h=1.0, spot_imbalance_4h=2.0),
+        MarketRow(symbol="BBBUSDT", name="BBB", futures_imbalance_4h=None, spot_imbalance_4h=1.0),
+        MarketRow(symbol="CCCUSDT", name="CCC", futures_imbalance_4h=-1.0, spot_imbalance_4h=None),
+    ]
+
+    _, stats = analyze_universe(rows, {"thresholds": {}})
+
+    warning = next(item for item in stats.warnings if item.startswith("Incomplete Coinalyze flow coverage"))
+    assert "F 2/3 (66.7%)" in warning
+    assert "S 2/3 (66.7%)" in warning
+
+
 def test_missing_bitcoin_row_is_reported_when_relative_strength_cannot_be_computed():
     row = mk("ALT", 1.0, 1.0, 1.0, 1.0, 0.0)
     enriched, stats = analyze_universe([row], {"thresholds": {"strong_flow_min_rows": 1}})

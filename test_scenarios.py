@@ -372,6 +372,25 @@ def test_unlisted_opposed_flow_oi_signature_remains_observation_only():
     assert "observation only" in result.reason.lower()
 
 
+def test_long_c_trigger_is_always_labeled_observation_without_entry_gate():
+    from screener.models import Check
+    from screener.scenarios import _result
+
+    market = MarketRow(
+        symbol="TESTUSDT_PERP", name="TEST", oi_chg4h_pct=0.2,
+        futures_imbalance_4h=2.0, spot_imbalance_4h=3.0,
+    )
+    enriched, _ = analyze_universe([market], {"thresholds": {}})
+    result = _result(
+        enriched[0], "LONG C — Short Squeeze", "LONG",
+        [Check("all trigger predicates", True, "passed", "configured thresholds")],
+        status="TRIGGER",
+    )
+
+    assert result.status == "OBSERVATION"
+    assert "no defined structural entry anchor" in result.reason
+
+
 def test_known_non_cascade_oi_direction_overrides_missing_liquidation_side():
     from screener.scenarios import _is_cascade
 

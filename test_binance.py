@@ -306,6 +306,46 @@ def test_binance_http_418_permanently_blocks_client_and_preserves_retry_after(mo
     assert calls == [1]
 
 
+def test_binance_http_451_aborts_the_entire_scan(monkeypatch):
+    import pytest
+    from screener.binance import BinanceGeoRestrictionError
+
+    client = BinanceClient("https://fapi.binance.com", min_interval_sec=0)
+
+    class Response:
+        status_code = 451
+        headers = {}
+
+    calls = []
+    monkeypatch.setattr(client.session, "get", lambda *_args, **_kwargs: calls.append(1) or Response())
+
+    with pytest.raises(BinanceGeoRestrictionError, match="HTTP 451"):
+        client._get_json("/fapi/v1/klines")
+
+    assert calls == [1]
+
+
+def test_run_scan_honours_persisted_binance_cooldown_before_fetching_coinalyze(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import pytest
+    import screener.service as service_module
+    from screener.binance import BinanceCooldownActiveError
+    from screener.storage import Store
+
+    data_dir = tmp_path / "data"
+    Store(data_dir).record_binance_cooldown(600)
+    monkeypatch.setattr(
+        service_module, "fetch_table",
+        lambda **_kwargs: pytest.fail("Coinalyze fetch must not run while Binance cooldown is active"),
+    )
+
+    with pytest.raises(BinanceCooldownActiveError, match="Persisted Binance Retry-After cooldown"):
+        service_module.run_scan_once(SimpleNamespace(data_dir=data_dir, dry_run=False), dry_run=False)
+
+    run_records = list(Store(data_dir, create_files=False)._read_jsonl(Store(data_dir, create_files=False).runs_path))
+    assert run_records[-1]["status"] == "BINANCE_ABORT"
+
+
 def test_binance_ip_ban_propagates_out_of_technical_symbol_pipeline():
     import pytest
     from types import SimpleNamespace
@@ -427,6 +467,7 @@ def test_run_scan_aborts_before_later_symbol_after_binance_ip_ban(tmp_path, monk
     from screener.coinalyze import ScrapeResult
     from screener.config import DEFAULT_P1_CONFIG
     from screener.models import MarketRow
+    from screener.storage import Store
 
     settings = SimpleNamespace(
         data_dir=tmp_path / "data",
@@ -472,7 +513,7 @@ def test_run_scan_aborts_before_later_symbol_after_binance_ip_ban(tmp_path, monk
 
     def abort_on_first_symbol(_client, symbol, _settings):
         calls.append(symbol)
-        raise BinanceIPBanError("HTTP 418")
+        raise BinanceIPBanError("HTTP 418", retry_after_seconds=300)
 
     monkeypatch.setattr(service_module, "_technical_for_symbol", abort_on_first_symbol)
 
@@ -483,3 +524,4 @@ def test_run_scan_aborts_before_later_symbol_after_binance_ip_ban(tmp_path, monk
     assert fetch_kwargs["timeout_ms"] == settings.coinalyze_timeout_ms
     assert fetch_kwargs["page_attempts"] == 3
     assert fetch_kwargs["retry_backoff_sec"] == 3.0
+    assert Store(settings.data_dir).binance_cooldown_remaining() > 0

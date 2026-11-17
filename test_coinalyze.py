@@ -71,6 +71,19 @@ def test_parse_table_maps_duplicate_oi_change_columns_and_custom_imbalance():
     assert "FUTURES IMBALANCE 4H" in headers
 
 
+def test_parse_table_keeps_leading_row_header_in_column_alignment():
+    html = FIXTURE_HTML.replace('<td></td><td><span>Bitcoin</span>', '<th scope="row"></th><td><span>Bitcoin</span>', 1)
+
+    rows, _, _, missing_required = parse_table(html)
+
+    assert not missing_required
+    assert rows[0].name == "Bitcoin"
+    assert rows[0].price == 74_790.08
+    assert rows[0].chg24_pct == -1.47
+    assert rows[0].oi_usd == 26_500_000_000
+    assert rows[0].futures_imbalance_4h == 4.958
+
+
 def test_zero_rounded_price_does_not_drop_the_market_row():
     html = FIXTURE_HTML.replace("$74,790.08", "$0.0000")
     rows, _, _, _ = parse_table(html)
@@ -253,6 +266,152 @@ def test_fetch_table_uses_session_cookies_and_reads_the_saved_page(monkeypatch):
     assert [cookie["name"] for cookie in captured["cookies"]] == [
         "p_sid", "chat_sid", "cookies_accepted"
     ]
+
+
+def test_fetch_table_loads_all_contiguous_pagination_urls_from_first_page(monkeypatch):
+    import sys
+    import types
+
+    page_urls = [
+        TEST_TABLE_URL,
+        TEST_TABLE_URL + "&page=2",
+        TEST_TABLE_URL + "&page=3",
+    ]
+    page_rows = [
+        ("BTCUSDT_PERP.A", "ETHUSDT_PERP.A"),
+        ("BNBUSDT_PERP.A", "SOLUSDT_PERP.A"),
+        ("XRPUSDT_PERP.A", "DOGEUSDT_PERP.A"),
+    ]
+    pagination = (
+        '<ul class="pagination">'
+        '<li><a href="?page=1">1</a></li>'
+        '<li><a href="?page=2">2</a></li>'
+        '<li><a href="?page=3">3</a></li>'
+        '</ul>'
+    )
+    html_by_url = {}
+    for url, symbols in zip(page_urls, page_rows):
+        html = FIXTURE_HTML
+        replacements = {
+            "BTCUSDT_PERP.A": symbols[0],
+            "ETHUSDT_PERP.A": symbols[1],
+            "Bitcoin": symbols[0].replace("USDT_PERP.A", ""),
+            "Ethereum": symbols[1].replace("USDT_PERP.A", ""),
+        }
+        for old, new in replacements.items():
+            html = html.replace(old, new)
+        html = html.replace("</body>", pagination + "</body>")
+        html_by_url[url] = html
+
+    captured = {"visited": []}
+
+    class FakeLocator:
+        def __init__(self, selector):
+            self.selector = selector
+            self.first = self
+
+        def count(self):
+            if self.selector == "tbody tr":
+                return 2
+            if self.selector == ".pagination":
+                return 1
+            return 0
+
+        def locator(self, selector):
+            return FakeLocator(selector)
+
+    class FakePage:
+        def __init__(self):
+            self.url = ""
+
+        def goto(self, target_url, *_args, **_kwargs):
+            self.url = target_url
+            captured["visited"].append(target_url)
+
+        def wait_for_timeout(self, *_args):
+            pass
+
+        def wait_for_selector(self, *_args, **_kwargs):
+            pass
+
+        def locator(self, selector):
+            return FakeLocator(selector)
+
+        def evaluate(self, *_args):
+            pass
+
+        def content(self):
+            from urllib.parse import parse_qs, urlparse
+            page_number = parse_qs(urlparse(self.url).query).get("page", ["1"])[0]
+            canonical_test_url = TEST_TABLE_URL if page_number == "1" else TEST_TABLE_URL + f"&page={page_number}"
+            return html_by_url[canonical_test_url]
+
+    class FakeContext:
+        def add_cookies(self, _cookies):
+            pass
+
+        def new_page(self):
+            return FakePage()
+
+        def close(self):
+            pass
+
+    class FakeBrowser:
+        def new_context(self, **_kwargs):
+            return FakeContext()
+
+        def close(self):
+            pass
+
+    class FakePlaywright:
+        chromium = types.SimpleNamespace(launch=lambda **_kwargs: FakeBrowser())
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    sync_api = types.ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = lambda: FakePlaywright()
+    playwright_pkg = types.ModuleType("playwright")
+    playwright_pkg.sync_api = sync_api
+    monkeypatch.setitem(sys.modules, "playwright", playwright_pkg)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+    monkeypatch.setattr("screener.coinalyze._apply_stealth", lambda _page: None)
+
+    result = fetch_table(
+        url=TEST_TABLE_URL,
+        p_sid="session-p",
+        chat_sid="session-chat",
+        max_pages=5,
+    )
+
+    from urllib.parse import parse_qs, urlparse
+    visited_pages = [parse_qs(urlparse(item).query).get("page", ["1"])[0] for item in captured["visited"]]
+    assert visited_pages == ["1", "2", "3"]
+    assert all("columns=test-columns" in item and "filter=test-filter" in item for item in captured["visited"])
+    assert result.pages_loaded == 3
+    assert len(result.rows) == 6
+    assert {row.symbol for row in result.rows} == {
+        "BTCUSDT_PERP.A", "ETHUSDT_PERP.A",
+        "BNBUSDT_PERP.A", "SOLUSDT_PERP.A",
+        "XRPUSDT_PERP.A", "DOGEUSDT_PERP.A",
+    }
+
+    # A known page count beyond the configured cap must fail closed before
+    # returning a partial market universe.
+    import pytest
+    from screener.coinalyze import IncompleteUniverseError
+    captured["visited"].clear()
+    with pytest.raises(IncompleteUniverseError, match="превышает лимит"):
+        fetch_table(
+            url=TEST_TABLE_URL,
+            p_sid="session-p",
+            chat_sid="session-chat",
+            max_pages=2,
+        )
+    assert len(captured["visited"]) == 1
 
 
 def test_coinalyze_navigation_retries_transient_timeouts_with_exponential_backoff(monkeypatch):
@@ -576,6 +735,141 @@ def test_parse_number_extracts_compact_suffix_before_thousands_separator():
     assert parse_number("1.2M USD") == 1_200_000
     assert parse_number("1,234 USDT") == 1_234
     assert parse_number("-1.17%") == -1.17
+
+
+def test_sequential_pagination_url_discovery_reuses_all_contiguous_links():
+    from screener.coinalyze import _sequential_pagination_urls
+
+    html = (
+        '<div class="pagination">'
+        '<a href="?page=1">1</a>'
+        '<a href="?page=2">2</a>'
+        '<a href="?page=3">3</a>'
+        '</div>'
+    )
+    urls = _sequential_pagination_urls(html, TEST_TABLE_URL)
+
+    assert len(urls) == 2
+    assert "page=2" in urls[0]
+    assert "page=3" in urls[1]
+    assert all("columns=test-columns" in url for url in urls)
+    assert all("filter=test-filter" in url for url in urls)
+    assert all("contract_type=perpetual" in url for url in urls)
+
+
+def test_sequential_pagination_url_discovery_rejects_hidden_page_gaps():
+    from screener.coinalyze import _sequential_pagination_urls
+
+    html = (
+        '<div class="pagination">'
+        '<a href="?page=2">2</a>'
+        '<a href="?page=3">3</a>'
+        '<span class="ellipsis">...</span>'
+        '<a href="?page=8">8</a>'
+        '</div>'
+    )
+
+    assert _sequential_pagination_urls(html, TEST_TABLE_URL) == []
+
+
+def test_javascript_pagination_finds_only_the_immediate_numeric_page_button():
+    from screener.coinalyze import _find_js_pagination_next_button
+
+    class FakeCandidate:
+        def __init__(self, label):
+            self.label = label
+
+        def inner_text(self):
+            return self.label
+
+        def is_visible(self):
+            return True
+
+        def evaluate(self, _script):
+            return False
+
+        def get_attribute(self, _name):
+            return None
+
+    class FakeLocator:
+        def __init__(self, count=0):
+            self.first = self
+            self._count = count
+
+        def count(self):
+            return self._count
+
+        def locator(self, _selector):
+            return FakeLocator()
+
+    class FakePage:
+        def __init__(self, candidates):
+            self.candidates = candidates
+
+        def locator(self, _selector):
+            return FakeLocator(count=1)
+
+        def query_selector_all(self, _selector):
+            return self.candidates
+
+    html = (
+        '<ul class="pagination">'
+        '<li class="active">1</li>'
+        '<li><button>2</button></li>'
+        '<li><span class="ellipsis">...</span></li>'
+        '<li><a href="?page=8">8</a></li>'
+        '</ul>'
+    )
+    from screener.coinalyze import _pagination_next_url
+    assert _pagination_next_url(html, TEST_TABLE_URL) is None
+
+    immediate = FakeCandidate("2")
+    distant = FakeCandidate("8")
+
+    selected = _find_js_pagination_next_button(
+        FakePage([distant, immediate]), html, TEST_TABLE_URL
+    )
+    assert selected is immediate
+
+    assert _find_js_pagination_next_button(
+        FakePage([distant]), html, TEST_TABLE_URL
+    ) is None
+
+    disabled_next_html = html.replace("<button>2</button>", '<button disabled="disabled">2</button>')
+    import pytest
+    from screener.coinalyze import IncompleteUniverseError
+    with pytest.raises(IncompleteUniverseError, match="refusing to skip hidden pages"):
+        _pagination_next_url(disabled_next_html, TEST_TABLE_URL)
+
+
+def test_wait_for_javascript_pagination_transition_polls_until_first_row_changes():
+    from screener.coinalyze import _wait_for_table_transition
+
+    class FakeRows:
+        def __init__(self, page):
+            self.page = page
+            self.first = self
+
+        def get_attribute(self, name):
+            self.page.reads += 1
+            symbol = "OLD" if self.page.reads < 2 else "NEW"
+            return symbol if name in {"data-coin", "data-symbol"} else None
+
+    class FakePage:
+        def __init__(self):
+            self.reads = 0
+            self.waits = []
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+        def locator(self, _selector):
+            return FakeRows(self)
+
+    page = FakePage()
+    assert _wait_for_table_transition(page, "OLD", attempts=5, interval_ms=250) is True
+    assert len(page.waits) == 2
+    assert page.waits == [250, 250]
 
 
 def test_pagination_ignores_page_one_alias_of_base_url():
