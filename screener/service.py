@@ -686,7 +686,18 @@ def _collect_notifications(
         ):
             continue
         if store.notification_exists(reversal_key, recipient_key=recipient_key, contract_type=contract_type):
+            marker_group = f"REVERSAL|{symbol}|{old_direction}|{new_direction}"
+            marker = store.latest_notification_state(
+                marker_group, recipient_key=recipient_key, contract_type=contract_type
+            ) or {}
+            related_event_keys = set(marker.get("related_event_keys") or [])
+            marker_sent_at = str(marker.get("sent_at") or "")
             for old in old_actives:
+                if related_event_keys:
+                    if str(old.get("event_key") or "") not in related_event_keys:
+                        continue
+                elif marker_sent_at and str(old.get("sent_at") or "") > marker_sent_at:
+                    continue
                 old_group = str(old.get("event_group") or "")
                 latest_old = store.latest_notification_state(
                     old_group, recipient_key=recipient_key, contract_type=contract_type
@@ -709,14 +720,20 @@ def _collect_notifications(
             latest_new = store.latest_notification_state(
                 new_group, recipient_key=recipient_key, contract_type=contract_type
             )
-            if latest_new is None or str(latest_new["event_state"]).upper() != "ACTIVE":
+            # Only a missing new-state record is a partial-write recovery case.
+            # Never resurrect a setup whose later lifecycle was CANCELLED/REVERSED.
+            if latest_new is None:
+                marker_status = str((marker or {}).get("delivery_status") or "UNKNOWN").upper()
+                if marker_status not in {"SENT", "UNKNOWN"}:
+                    marker_status = "UNKNOWN"
                 store.record_notification(
-                    new_event_key, None, recipient_key=recipient_key,
-                    event_group=new_group, fingerprint=new_fingerprint,
-                    event_state="ACTIVE", direction=new_direction,
-                    invalidation_level=new_level, pair=str((new_result.technical or {}).get("binance_symbol") or symbol),
+                    new_event_key, (marker or {}).get("telegram_message_id"),
+                    recipient_key=recipient_key, event_group=new_group,
+                    fingerprint=new_fingerprint, event_state="ACTIVE", direction=new_direction,
+                    invalidation_level=new_level,
+                    pair=str((new_result.technical or {}).get("binance_symbol") or symbol),
                     scenario_code=_scenario_code(new_result.scenario), contract_type=contract_type,
-                    delivery_status="UNKNOWN",
+                    delivery_status=marker_status,
                 )
             continue
         if len(old_codes) > 1:
@@ -740,8 +757,11 @@ def _collect_notifications(
                 reversal_key, delivery.get("message_id"), recipient_key=recipient_key,
                 event_group=f"REVERSAL|{symbol}|{old_direction}|{new_direction}",
                 fingerprint=new_fingerprint, event_state="SENT", direction=new_direction,
-                pair=pair, scenario_code=_scenario_code(new_result.scenario), contract_type=contract_type,
-                delivery_status=delivery_status, error=str(delivery.get("error") or "") or None,
+                invalidation_level=new_level, pair=pair,
+                scenario_code=_scenario_code(new_result.scenario),
+                related_event_keys=[str(old["event_key"]) for old in old_actives],
+                contract_type=contract_type, delivery_status=delivery_status,
+                error=str(delivery.get("error") or "") or None,
             )
             for old in old_actives:
                 old_group = str(old.get("event_group") or "")
@@ -768,6 +788,110 @@ def _collect_notifications(
                 (str(old.get("event_group") or ""), recipient_key) for old in old_actives
             )
         outcomes.append({"type": "reversal", "symbol": symbol, "sent": bool(delivery.get("sent")), "delivery": delivery})
+
+    # Reconcile durable reversal markers independently of the current candidate
+    # list. A process may die after Telegram accepted the reversal and after all
+    # old states were marked REVERSED, but before the new ACTIVE record was saved.
+    # The marker stores enough identity/level data to finish that transaction on
+    # a later run even if the 1H trigger is no longer fresh.
+    for marker in store.reversal_markers(recipient_keys=recipients):
+        parts = str(marker.get("event_key") or "").split("|", 4)
+        if len(parts) != 5 or parts[0] != "REVERSAL":
+            continue
+        _, symbol, old_direction, new_direction, new_event_key = parts
+        if old_direction not in {"LONG", "SHORT"} or new_direction not in {"LONG", "SHORT"}:
+            continue
+        if old_direction == new_direction or not new_event_key:
+            continue
+        recipient_key = str(marker.get("recipient_key") or "")
+        marker_contract = str(marker.get("contract_type") or "").upper()
+        new_group = new_event_key.rsplit("|", 1)[0]
+        marker_status = str(marker.get("delivery_status") or "UNKNOWN").upper()
+        if marker_status not in {"SENT", "UNKNOWN"}:
+            marker_status = "UNKNOWN"
+        marker_level = marker.get("invalidation_level")
+        try:
+            marker_level = float(marker_level)
+        except (TypeError, ValueError):
+            marker_level = None
+        if marker_level is not None and (not math.isfinite(marker_level) or marker_level <= 0):
+            marker_level = None
+        # Markers written by pre-1.0.22 builds did not persist the new level.
+        # If the same trigger is still present, its current identity is a safe
+        # fallback for completing that legacy partial transition.
+        if marker_level is None:
+            candidate = next((
+                item for item in confirmed_opposite.get(symbol, [])
+                if item[2][1] == new_event_key
+            ), None)
+            if candidate is not None:
+                marker_level = candidate[2][3]
+
+        latest_new = store.latest_notification_state(
+            new_group, recipient_key=recipient_key, contract_type=marker_contract
+        )
+        marker_sent_at = str(marker.get("sent_at") or "")
+        related_event_keys = set(marker.get("related_event_keys") or [])
+        newer_opposite_active = any(
+            item.get("recipient_key") == recipient_key
+            and str(item.get("contract_type") or "").upper() == marker_contract
+            and str(item.get("direction") or "").upper() == old_direction
+            and str(item.get("event_group") or "").startswith(f"{symbol}|")
+            and str(item.get("event_key") or "") not in related_event_keys
+            and str(item.get("sent_at") or "") > marker_sent_at
+            for item in normalized_active
+        )
+        if newer_opposite_active:
+            # A later setup on the old side supersedes this marker. Do not
+            # resurrect an older opposite event alongside that newer ACTIVE.
+            continue
+        can_finish_new_state = latest_new is not None or marker_level is not None
+        if can_finish_new_state and related_event_keys:
+            for old_active in normalized_active:
+                old_group = str(old_active.get("event_group") or "")
+                if (
+                    old_active.get("recipient_key") != recipient_key
+                    or str(old_active.get("contract_type") or "").upper() != marker_contract
+                    or str(old_active.get("direction") or "").upper() != old_direction
+                    or (
+                        str(old_active.get("event_key") or "") not in related_event_keys
+                        if related_event_keys
+                        else not marker_sent_at or str(old_active.get("sent_at") or "") > marker_sent_at
+                    )
+                    or not old_group.startswith(f"{symbol}|")
+                ):
+                    continue
+                latest_old = store.latest_notification_state(
+                    old_group, recipient_key=recipient_key, contract_type=marker_contract
+                )
+                reversed_groups.add((old_group, recipient_key))
+                if latest_old is None or str(latest_old.get("event_state") or "").upper() != "ACTIVE":
+                    continue
+                old_level = latest_old.get("invalidation_level")
+                if not isinstance(old_level, (int, float)) or isinstance(old_level, bool):
+                    continue
+                store.record_notification(
+                    f"OLD_STATE|{latest_old['event_key']}|REVERSED|{new_event_key}",
+                    marker.get("telegram_message_id"), recipient_key=recipient_key,
+                    event_group=old_group, fingerprint=str(latest_old["fingerprint"]),
+                    event_state="REVERSED", direction=old_direction,
+                    invalidation_level=float(old_level),
+                    pair=str(latest_old.get("pair") or symbol),
+                    scenario_code=str(latest_old.get("scenario_code") or "UNKNOWN"),
+                    contract_type=marker_contract, delivery_status=marker_status,
+                )
+
+        if latest_new is None and marker_level is not None:
+            store.record_notification(
+                new_event_key, marker.get("telegram_message_id"),
+                recipient_key=recipient_key, event_group=new_group,
+                fingerprint=str(marker.get("fingerprint") or ""),
+                event_state="ACTIVE", direction=new_direction,
+                invalidation_level=marker_level,
+                pair=str(marker.get("pair") or symbol),
+                scenario_code=str(marker.get("scenario_code") or "UNKNOWN"),
+                contract_type=marker_contract, delivery_status=marker_status,
+            )
 
     # Invalidate remaining ACTIVE scenarios by the exact 1H level saved when
     # their original message was sent. Each cancellation is its own Telegram post.

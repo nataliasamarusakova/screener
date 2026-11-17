@@ -16,6 +16,12 @@ from .structure import scenario_invalidation
 
 log = logging.getLogger(__name__)
 
+# Telegram Bot API embeds the bot token in the URL path. urllib3 DEBUG logs
+# request targets verbatim, so keep its transport logger quiet even when the
+# application itself runs with LOG_LEVEL=DEBUG.
+logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
+logging.getLogger("requests.packages.urllib3.connectionpool").setLevel(logging.WARNING)
+
 
 def _safe_telegram_truncate(message: str, limit: int = 3900) -> str:
     """Compact alerts are not silently truncated; fail closed on oversized content."""
@@ -396,14 +402,24 @@ class TelegramClient:
                         "error": _safe_telegram_error(exc, self.token, chat_id),
                     })
                     break
-                if not payload.get("ok"):
+                if not isinstance(payload, dict):
+                    # A successful HTTP status with an unexpected JSON shape does
+                    # not prove whether Telegram accepted the POST. Do not crash
+                    # the whole scan or classify this as a permanent rejection.
+                    results.append({
+                        "chat_id": chat_id, "sent": False, "delivery_unknown": True,
+                        "error": "Telegram returned a non-object JSON response",
+                    })
+                    break
+                if payload.get("ok") is not True:
                     error_code = payload.get("error_code")
                     try:
                         error_status = int(error_code)
                     except (TypeError, ValueError):
                         error_status = None
                     result = {
-                        "chat_id": chat_id, "sent": False, "delivery_unknown": False,
+                        "chat_id": chat_id, "sent": False,
+                        "delivery_unknown": "ok" not in payload,
                         "error": _safe_telegram_error(payload.get("description", "Telegram API returned ok=false"), self.token, chat_id),
                     }
                     if (
@@ -414,9 +430,16 @@ class TelegramClient:
                         result["permanent_failure"] = True
                     results.append(result)
                     break
+                result_payload = payload.get("result")
+                if not isinstance(result_payload, dict):
+                    results.append({
+                        "chat_id": chat_id, "sent": False, "delivery_unknown": True,
+                        "error": "Telegram success response omitted the result object",
+                    })
+                    break
                 results.append({
                     "chat_id": chat_id, "sent": True, "delivery_unknown": False,
-                    "message_id": (payload.get("result") or {}).get("message_id"),
+                    "message_id": result_payload.get("message_id"),
                 })
                 break
         return results

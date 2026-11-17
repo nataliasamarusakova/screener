@@ -341,7 +341,17 @@ def weak_bounce_rejection(
     if volatility is None:
         return {"confirmed": False, "reason": "Insufficient candles to calculate ATR", "candidate_resistance": latest[1]}
     tolerance = volatility * atr_tolerance
-    resistance = latest[1]
+    pivot_idx, resistance = latest
+    # A swing high stops being valid resistance after any later candle closes
+    # above it. A fresh wick rejection cannot resurrect an already-broken level.
+    if any(candle.close > resistance for candle in candles[pivot_idx + 1:-1]):
+        return {
+            "confirmed": False,
+            "reason": "Selected lower-high resistance was invalidated by an intervening close above it",
+            "candidate_resistance": resistance,
+            "previous_swing_high": previous[1],
+            "latest_swing_high": resistance,
+        }
     # Only the latest closed candle can confirm a fresh entry. A rejection
     # from candles[-3] must not survive two subsequent candles that have
     # already moved price materially away from resistance.

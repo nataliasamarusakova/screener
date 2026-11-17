@@ -38,7 +38,7 @@ def rearm_failed_notification(
     path = Path(data_dir) / "notifications.jsonl"
     if not path.is_file():
         raise FileNotFoundError(f"Notification history does not exist: {path}")
-    records = _read_jsonl(path)
+    records = _read_jsonl(path, strict_tail=True)
     matching_indices = [
         index for index, record in enumerate(records)
         if record.get("event_key") == event_key

@@ -11,6 +11,7 @@ from typing import Any
 
 import requests
 
+from . import __version__
 from .models import Candle
 
 log = logging.getLogger(__name__)
@@ -62,7 +63,7 @@ class BinanceClient:
         self.session.trust_env = False
         if vpn_enabled:
             self.session.proxies.update({"http": http_proxy, "https": http_proxy})
-        self.session.headers.update({"Accept": "application/json", "User-Agent": "Market-Screener/1.0"})
+        self.session.headers.update({"Accept": "application/json", "User-Agent": f"Market-Screener/{__version__}"})
         self._last_request = 0.0
         self._lock = threading.Lock()
         self._symbols: set[str] | None = None

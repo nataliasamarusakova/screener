@@ -26,7 +26,7 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+def _read_jsonl(path: Path, *, strict_tail: bool = False) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     raw = path.read_bytes()
@@ -38,12 +38,12 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         try:
             item = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            # Storage appends a JSONL record in one batch but a process can be
-            # killed during the final write. Match Store._repair_trailing_line:
-            # discard only a malformed, unterminated tail; corruption in the
-            # middle of a file must still stop persistence.
+            # Snapshot/row tails can be discarded because the snapshot manifest
+            # and hash validate the complete observation. Notification tails are
+            # critical external-side-effect markers: a partial final record may
+            # follow a Telegram-accepted POST, so strict_tail must fail closed.
             is_unterminated_tail = index == len(lines) and not raw.endswith(b"\n")
-            if is_unterminated_tail:
+            if is_unterminated_tail and not strict_tail:
                 break
             raise ValueError(f"Invalid JSONL record {path}:{index}: {exc}") from exc
         if not isinstance(item, dict):
@@ -228,8 +228,8 @@ def merge_state(source_dir: Path, target_dir: Path) -> None:
     target_rows = _read_jsonl(target_dir / "market_rows.jsonl")
     market_rows = _merge_market_rows(target_rows, source_rows, manifests)
 
-    source_notifications = _read_jsonl(source_dir / "notifications.jsonl")
-    target_notifications = _read_jsonl(target_dir / "notifications.jsonl")
+    source_notifications = _read_jsonl(source_dir / "notifications.jsonl", strict_tail=True)
+    target_notifications = _read_jsonl(target_dir / "notifications.jsonl", strict_tail=True)
     notifications = _merge_notifications(target_notifications, source_notifications)
 
     source_poll = source_dir / "poll_state.json"

@@ -15,6 +15,9 @@ from .models import MarketRow
 
 log = logging.getLogger(__name__)
 
+_NOTIFICATION_LIFECYCLE_STATES = {"ACTIVE", "CANCELLED", "CANCELED", "REVERSED"}
+_NOTIFICATION_QUERY_STATES = _NOTIFICATION_LIFECYCLE_STATES | {"SENT"}
+
 
 class Store:
     """Persistent storage for snapshots, market rows, notifications and poll state.
@@ -78,6 +81,32 @@ class Store:
                     continue
                 if isinstance(item, dict):
                     yield item
+
+    @staticmethod
+    def _read_jsonl_strict(path: Path) -> list[dict[str, Any]]:
+        """Read critical state without silently dropping a corrupt middle record.
+
+        Any malformed notification line, including an unterminated tail, stops
+        processing. A partial tail may be a notification accepted by Telegram
+        before the process died while persisting its local marker; discarding it
+        would silently permit a duplicate send.
+        """
+        if not path.exists():
+            return []
+        raw = path.read_bytes()
+        lines = raw.splitlines()
+        records: list[dict[str, Any]] = []
+        for index, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Invalid critical JSONL record {path}:{index}: {exc}") from exc
+            if not isinstance(item, dict):
+                raise ValueError(f"Critical JSONL record must be an object: {path}:{index}")
+            records.append(item)
+        return records
 
     @staticmethod
     def _repair_trailing_line(path: Path) -> None:
@@ -556,7 +585,7 @@ class Store:
         signature = self._notification_file_signature()
         if self._notification_cache is None or signature != self._notification_cache_signature:
             self._notification_cache = [
-                item for item in self._read_jsonl(self.notifications_path)
+                item for item in self._read_jsonl_strict(self.notifications_path)
                 if self._is_current_notification_record(item)
             ]
             self._notification_cache_signature = signature
@@ -591,11 +620,35 @@ class Store:
             item for item in self._current_notification_records()
             if item.get("event_group") == event_group
             and item.get("fingerprint")
-            and item.get("event_state")
+            and str(item.get("event_state") or "").upper() in _NOTIFICATION_QUERY_STATES
             and item.get("recipient_key") == expected_recipient
             and str(item.get("contract_type")).upper() == expected_contract
         ]
         return matching[-1] if matching else None
+
+    def reversal_markers(
+        self, *, recipient_keys: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Return the latest durable reversal marker per event/recipient/contract."""
+        allowed_recipients = set(recipient_keys) if recipient_keys is not None else None
+        latest: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for item in self._current_notification_records():
+            if not str(item.get("event_group") or "").startswith("REVERSAL|"):
+                continue
+            if str(item.get("event_state") or "").upper() != "SENT":
+                continue
+            if str(item.get("delivery_status") or "").upper() not in {"SENT", "UNKNOWN"}:
+                continue
+            recipient = str(item.get("recipient_key") or "")
+            if allowed_recipients is not None and recipient not in allowed_recipients:
+                continue
+            key = (
+                str(item.get("event_key") or ""),
+                recipient,
+                str(item.get("contract_type") or "").upper(),
+            )
+            latest[key] = item
+        return list(latest.values())
 
     def latest_cancelled_close_time_ms(
         self, symbol: str, direction: str, *, recipient_key: str, contract_type: str,
@@ -622,13 +675,13 @@ class Store:
                 continue
             if str(item.get("contract_type") or "").upper() != expected_contract:
                 continue
-            if not item.get("event_state"):
+            if str(item.get("event_state") or "").upper() not in _NOTIFICATION_LIFECYCLE_STATES:
                 continue
             latest_by_group[group] = item
 
         close_times: list[int] = []
         for item in latest_by_group.values():
-            if str(item.get("event_state") or "").upper() != "CANCELLED":
+            if str(item.get("event_state") or "").upper() not in {"CANCELLED", "CANCELED"}:
                 continue
             parts = str(item.get("event_key") or "").rsplit("|", 1)
             if len(parts) != 2:
@@ -681,6 +734,7 @@ class Store:
         invalidation_level: float | None = None,
         pair: str | None = None,
         scenario_code: str | None = None,
+        related_event_keys: list[str] | None = None,
         delivery_status: str = "SENT",
         error: str | None = None,
     ) -> None:
@@ -734,6 +788,8 @@ class Store:
             record["pair"] = str(pair).upper()
         if scenario_code is not None:
             record["scenario_code"] = str(scenario_code).upper()
+        if related_event_keys is not None:
+            record["related_event_keys"] = [str(value) for value in related_event_keys if str(value)]
         if error:
             record["error"] = str(error)[:500]
         cache_was_current = (
@@ -768,7 +824,10 @@ class Store:
             state = str(item.get("event_state") or "").upper()
             recipient = str(item.get("recipient_key") or "")
             stored_contract = str(item.get("contract_type") or "").upper()
-            if not group or not fingerprint or not state or not recipient or not stored_contract:
+            if (
+                not group or not fingerprint or state not in _NOTIFICATION_LIFECYCLE_STATES
+                or not recipient or not stored_contract
+            ):
                 continue
             if allowed_recipients and recipient not in allowed_recipients:
                 continue
@@ -874,7 +933,7 @@ class Store:
         if deleted_runs:
             self._rewrite_jsonl(self.runs_path, kept_runs)
 
-        raw_notifications = list(self._read_jsonl(self.notifications_path))
+        raw_notifications = self._read_jsonl_strict(self.notifications_path)
         notifications = [
             item for item in raw_notifications if self._is_current_notification_record(item)
         ]
@@ -889,7 +948,10 @@ class Store:
             state = str(item.get("event_state") or "").upper()
             recipient = str(item.get("recipient_key") or "")
             contract_scope = str(item.get("contract_type") or "").upper()
-            if not group or not fingerprint or not state or not recipient or not contract_scope:
+            if (
+                not group or not fingerprint or state not in _NOTIFICATION_LIFECYCLE_STATES
+                or not recipient or not contract_scope
+            ):
                 continue
             latest_state[(group, recipient, contract_scope)] = item
         protected_ids = {
@@ -902,6 +964,27 @@ class Store:
             and math.isfinite(float(item["invalidation_level"]))
             and float(item["invalidation_level"]) > 0
         }
+        # A reversal marker is a durable transaction journal entry. Keep it
+        # beyond normal notification retention until its new event lifecycle
+        # state exists; otherwise a long outage could prune the only recovery
+        # record after the old event was already marked REVERSED.
+        for item in notifications:
+            if (
+                str(item.get("event_state") or "").upper() != "SENT"
+                or not str(item.get("event_group") or "").startswith("REVERSAL|")
+            ):
+                continue
+            parts = str(item.get("event_key") or "").split("|", 4)
+            if len(parts) != 5 or parts[0] != "REVERSAL":
+                continue
+            new_group = parts[4].rsplit("|", 1)[0]
+            state_key = (
+                new_group,
+                str(item.get("recipient_key") or ""),
+                str(item.get("contract_type") or "").upper(),
+            )
+            if state_key not in latest_state:
+                protected_ids.add(id(item))
         kept_notifications: list[dict[str, Any]] = []
         for item in notifications:
             try:

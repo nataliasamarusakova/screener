@@ -48,7 +48,18 @@ def parse_number(value: Any) -> float | None:
     if not text or text.lower() in {"n/a", "na", "nan", "none", "null", "-", "—", "–", "−"}:
         return None
     text = text.replace("$", "").replace("€", "").replace("£", "").replace("%", "")
+    text = re.sub(r"(?i)\s*(?:USD|USDT|USDC)\s*$", "", text)
     text = re.sub(r"\s+", "", text)
+
+    # Extract the compact suffix before interpreting punctuation. Otherwise
+    # values such as 1,234M are mistaken for decimal 1.234M (a 1,000x error).
+    multiplier = 1.0
+    suffix = text[-1:].upper()
+    if suffix in {"K", "M", "B", "T"}:
+        multiplier = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}[suffix]
+        text = text[:-1]
+    if not text:
+        return None
 
     # Infer decimal punctuation only when separators provide enough evidence.
     if "." in text and "," in text:
@@ -64,10 +75,6 @@ def parse_number(value: Any) -> float | None:
         else:
             text = text.replace(",", "")
 
-    multiplier = 1.0
-    if text[-1:].upper() in {"K", "M", "B", "T"}:
-        multiplier = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}[text[-1].upper()]
-        text = text[:-1]
     try:
         number = float(text) * multiplier
     except ValueError:
@@ -102,9 +109,9 @@ ALIASES: dict[str, set[str]] = {
     "volume24_usd": {"vol 24h", "volume 24h", "24h volume"},
     "oi_usd": {"open interest", "oi"},
     "oi_chg24_pct": {"oi chg 24h %", "oi change 24h %", "open interest change % 24h", "open interest change 24h %"},
-    "oi_chg24_usd": {"oi chg 24h usd", "oi change 24h usd", "open interest change 24h usd", "open interest change 24h"},
+    "oi_chg24_usd": {"oi chg 24h usd", "oi change 24h usd", "open interest change 24h usd"},
     "oi_chg4h_pct": {"oi chg 4h %", "oi change 4h %", "open interest change % 4h", "open interest change 4h %"},
-    "oi_chg4h_usd": {"oi chg 4h usd", "oi change 4h usd", "open interest change 4h usd", "open interest change 4h"},
+    "oi_chg4h_usd": {"oi chg 4h usd", "oi change 4h usd", "open interest change 4h usd"},
     "oi_share_pct": {"oi share", "open interest share"},
     "oi_vol_ratio": {"oi / vol24h", "oi / volume 24h", "open interest / volume 24h", "open interest / volume24h"},
     "oi_mktcap_ratio": {"oi / mktcap", "oi / market cap", "open interest / market capitalization", "open interest / market capitalisation"},
@@ -222,6 +229,14 @@ def _validated_market_value(
     return value
 
 
+def _oi_value_unit(raw: str) -> str | None:
+    if "%" in raw:
+        return "pct"
+    if "$" in raw or re.search(r"[KMBT]\s*$", raw, re.IGNORECASE) or re.search(r"\bUSD\b", raw, re.IGNORECASE):
+        return "usd"
+    return None
+
+
 def _disambiguate_oi(cells: list[Any], indices: list[int]) -> tuple[float | None, float | None]:
     pct = usd = None
     for idx in indices:
@@ -229,13 +244,14 @@ def _disambiguate_oi(cells: list[Any], indices: list[int]) -> tuple[float | None
         parsed = parse_number(raw)
         if parsed is None:
             continue
-        if "%" in raw:
+        unit = _oi_value_unit(raw)
+        if unit == "pct":
             pct = parsed
-        elif "$" in raw or re.search(r"[KMBT]\s*$", raw, re.IGNORECASE) or re.search(r"\bUSD\b", raw, re.IGNORECASE):
+        elif unit == "usd":
             usd = parsed
         else:
             # A bare scalar is ambiguous (e.g. 1.58 could be % or USD-scale).
-            # Do not silently assign it to the dollar field.
+            # Do not silently assign it to either field.
             log.warning("Ambiguous Coinalyze OI change value %r: missing %%, currency, or compact USD suffix", raw)
     return pct, usd
 
@@ -248,11 +264,24 @@ def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[
         raise CoinalyzeError("Таблица Coinalyze не содержит tbody/tr.")
     index, headers, oi24_ambiguous, oi4h_ambiguous = _build_header_map(table)
     available = set(index)
-    # Coinalyze renders percentage and USD OI changes as duplicate visible labels.
-    if len(oi24_ambiguous) >= 2:
-        available.update({"oi_chg24_pct", "oi_chg24_usd"})
-    if len(oi4h_ambiguous) >= 2:
-        available.update({"oi_chg4h_pct", "oi_chg4h_usd"})
+    # Duplicate generic labels contain both units. A single generic label can
+    # identify at most one field, and only when its cell values carry a unit.
+    for indices, pct_field, usd_field in (
+        (oi24_ambiguous, "oi_chg24_pct", "oi_chg24_usd"),
+        (oi4h_ambiguous, "oi_chg4h_pct", "oi_chg4h_usd"),
+    ):
+        if len(indices) >= 2:
+            available.update({pct_field, usd_field})
+        elif len(indices) == 1:
+            units = {
+                unit
+                for tr in trs
+                if (cells := tr.find_all("td", recursive=False))
+                and (raw := (_cell_text(cells, indices[0]) or ""))
+                and (unit := _oi_value_unit(raw)) is not None
+            }
+            if len(units) == 1:
+                available.add(pct_field if next(iter(units)) == "pct" else usd_field)
     missing_columns = sorted(set(ALIASES) - available)
     missing_required = sorted(REQUIRED_FOR_P1 - available)
 
@@ -263,6 +292,10 @@ def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[
         cells = tr.find_all("td", recursive=False)
         if not symbol or not cells:
             raise CoinalyzeError(f"Invalid Coinalyze row {row_idx}: missing symbol or cells; refusing partial universe")
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9._/-]{0,63}", symbol):
+            raise CoinalyzeError(
+                f"Invalid Coinalyze symbol {symbol!r} on row {row_idx}; refusing unsafe event identity"
+            )
         if symbol in seen_symbols:
             raise CoinalyzeError(f"Duplicate Coinalyze symbol {symbol} on the same page; refusing ambiguous universe")
         seen_symbols.add(symbol)
@@ -272,8 +305,8 @@ def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[
             coin_cell = cells[coin_cell_index]
             spans = coin_cell.find_all("span")
             name = spans[0].get_text(strip=True) if spans else (coin_cell.get_text(" ", strip=True) or symbol)
-        oi24_pct, oi24_usd = _disambiguate_oi(cells, oi24_ambiguous) if len(oi24_ambiguous) >= 2 else (None, None)
-        oi4h_pct, oi4h_usd = _disambiguate_oi(cells, oi4h_ambiguous) if len(oi4h_ambiguous) >= 2 else (None, None)
+        oi24_pct, oi24_usd = _disambiguate_oi(cells, oi24_ambiguous) if oi24_ambiguous else (None, None)
+        oi4h_pct, oi4h_usd = _disambiguate_oi(cells, oi4h_ambiguous) if oi4h_ambiguous else (None, None)
         if oi24_pct is None:
             oi24_pct = _value(cells, index, "oi_chg24_pct")
         if oi24_usd is None:
@@ -520,34 +553,146 @@ def _page_content_with_retry(
     ) from last_error
 
 
+def _canonical_page_url(url: str) -> str:
+    """Canonicalize pagination identity; an omitted page and page=1 are equal."""
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if query.get("page", ["1"])[0] in {"", "1"}:
+        query.pop("page", None)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    port = parsed.port
+    netloc = host if port is None else f"{host}:{port}"
+    return urlunparse(parsed._replace(netloc=netloc, query=urlencode(query, doseq=True), fragment=""))
+
+
+def _complete_pagination_url(href: str, base_url: str) -> str | None:
+    base_parsed = urlparse(base_url)
+    target = urlparse(urljoin(base_url, href))
+    base_host = (base_parsed.hostname or "").lower().removeprefix("www.")
+    target_host = (target.hostname or "").lower().removeprefix("www.")
+    base_port = base_parsed.port or (443 if base_parsed.scheme == "https" else 80)
+    target_port = target.port or (443 if target.scheme == "https" else 80)
+    if target.scheme not in {"http", "https"} or target_host != base_host or target_port != base_port:
+        return None
+    target_query = parse_qs(target.query, keep_blank_values=True)
+    for key, value in parse_qs(base_parsed.query, keep_blank_values=True).items():
+        target_query.setdefault(key, value)
+    return urlunparse(target._replace(query=urlencode(target_query, doseq=True), fragment=""))
+
+
 def _pagination_urls(html: str, base_url: str) -> list[str]:
-    """Discover page links while retaining saved columns/filter/contract query values."""
+    """Return visible page links, excluding aliases of the current page."""
     soup = BeautifulSoup(html, "lxml")
     pagination = soup.select_one(".pagination")
     if not pagination:
         return [base_url]
 
-    base_parsed = urlparse(base_url)
-    base_query = parse_qs(base_parsed.query, keep_blank_values=True)
     urls = [base_url]
+    seen = {_canonical_page_url(base_url)}
     for anchor in pagination.select("a[href]"):
         href = str(anchor.get("href") or "").strip()
         if not href or href.startswith("#"):
             continue
-        target = urlparse(urljoin(base_url, href))
-        base_host = (base_parsed.hostname or "").lower().removeprefix("www.")
-        target_host = (target.hostname or "").lower().removeprefix("www.")
-        base_port = base_parsed.port or (443 if base_parsed.scheme == "https" else 80)
-        target_port = target.port or (443 if target.scheme == "https" else 80)
-        if target.scheme not in {"http", "https"} or target_host != base_host or target_port != base_port:
+        full = _complete_pagination_url(href, base_url)
+        if full is None:
             continue
-        target_query = parse_qs(target.query, keep_blank_values=True)
-        for key, value in base_query.items():
-            target_query.setdefault(key, value)
-        full = urlunparse(target._replace(query=urlencode(target_query, doseq=True), fragment=""))
-        if full != base_url and full not in urls:
+        canonical = _canonical_page_url(full)
+        if canonical not in seen:
             urls.append(full)
+            seen.add(canonical)
     return urls
+
+
+def _pagination_next_url(html: str, current_url: str) -> str | None:
+    """Find exactly the next page, never jumping over Bootstrap ellipsis pages."""
+    soup = BeautifulSoup(html, "lxml")
+    pagination = soup.select_one(".pagination")
+    if pagination is None:
+        return None
+
+    next_anchor = pagination.select_one(
+        'a[rel~="next"], a[aria-label*="next" i], li.next a, a.next'
+    )
+    if next_anchor is not None:
+        parent = next_anchor.find_parent("li")
+        disabled = (
+            "disabled" in (parent.get("class") or []) if parent else False
+        ) or (next_anchor.get("aria-disabled") or "").lower() == "true"
+        if not disabled:
+            href = str(next_anchor.get("href") or "").strip()
+            if not href or href.startswith("#"):
+                # JavaScript-driven Next control: let fetch_table click it instead
+                # of interpreting a distant numeric link as the immediate page.
+                return None
+            target = _complete_pagination_url(href, current_url)
+            if target is None:
+                raise IncompleteUniverseError(
+                    "Coinalyze Next link points outside the selected table host"
+                )
+            return target
+
+    query = parse_qs(urlparse(current_url).query, keep_blank_values=True)
+    active_page = pagination.select_one("li.active, .page-item.active")
+    active_label = active_page.get_text(" ", strip=True) if active_page else ""
+    try:
+        current_page = int(active_label) if active_label.isdigit() else int(query.get("page", ["1"])[0] or "1")
+    except (TypeError, ValueError):
+        raise IncompleteUniverseError(f"Invalid current Coinalyze page number in URL: {current_url}")
+
+    numeric_links: dict[int, str] = {}
+    for anchor in pagination.select("a[href]"):
+        label = anchor.get_text(" ", strip=True)
+        if not label.isdigit():
+            continue
+        target = _complete_pagination_url(str(anchor.get("href") or ""), current_url)
+        if target is None:
+            continue
+        target_query = parse_qs(urlparse(target).query, keep_blank_values=True)
+        try:
+            page_number = int(target_query.get("page", ["1"])[0] or "1")
+        except (TypeError, ValueError):
+            continue
+        if page_number > current_page:
+            numeric_links[page_number] = target
+
+    immediate = numeric_links.get(current_page + 1)
+    if immediate is not None:
+        return immediate
+    if numeric_links:
+        raise IncompleteUniverseError(
+            "Coinalyze pagination exposes a later page but not the immediate next page; "
+            "refusing to skip hidden pages"
+        )
+    # An ellipsis after the current page means there are hidden forward pages.
+    # An ellipsis before it is normal on the final Bootstrap page and is safe.
+    descendants = list(pagination.descendants)
+    current_nodes = []
+    for node in pagination.select("a[href], li.active, .page-item.active"):
+        if node.name == "a":
+            target = _complete_pagination_url(str(node.get("href") or ""), current_url)
+            if target is None:
+                continue
+            target_query = parse_qs(urlparse(target).query, keep_blank_values=True)
+            try:
+                node_page = int(target_query.get("page", ["1"])[0] or "1")
+            except (TypeError, ValueError):
+                continue
+            if node_page == current_page:
+                current_nodes.append(node)
+        elif "active" in (node.get("class") or []):
+            current_nodes.append(node)
+    ellipsis_nodes = [
+        node for node in descendants
+        if getattr(node, "name", None)
+        and ("ellipsis" in (node.get("class") or []) or node.get_text(" ", strip=True) in {"...", "…"})
+    ]
+    if current_nodes and ellipsis_nodes:
+        current_position = max(descendants.index(node) for node in current_nodes if node in descendants)
+        if any(descendants.index(node) > current_position for node in ellipsis_nodes if node in descendants):
+            raise IncompleteUniverseError(
+                "Coinalyze pagination contains hidden forward pages without a usable Next link"
+            )
+    return None
 
 
 def _pagination_next_is_disabled(next_button: Any) -> bool:
@@ -628,53 +773,71 @@ def fetch_table(
             )
             # The user-provided saved URL explicitly selects contract_type=perpetual.
             contract_type = detect_contract_type(first_html, url)
-            first_urls = _pagination_urls(first_html, url)
-            if len(first_urls) > max_pages:
-                raise IncompleteUniverseError(f"Пагинация Coinalyze содержит больше {max_pages} страниц; выборка обрезана.")
             html_pages: list[str] = [first_html]
-            if len(first_urls) > 1:
-                for page_url in first_urls[1:]:
+            current_html = first_html
+            current_url = url
+            visited_pages = {_canonical_page_url(url)}
+            while len(html_pages) < max_pages:
+                next_url = _pagination_next_url(current_html, current_url)
+                if next_url is not None:
+                    canonical_next = _canonical_page_url(next_url)
+                    if canonical_next in visited_pages:
+                        raise IncompleteUniverseError(
+                            f"Coinalyze pagination loop detected at {next_url}"
+                        )
                     try:
-                        html_pages.append(_page_content_with_retry(
-                            page, page_url, timeout_ms,
+                        current_html = _page_content_with_retry(
+                            page, next_url, timeout_ms,
                             attempts=page_attempts,
                             retry_backoff_sec=retry_backoff_sec,
-                        ))
-                    except Exception as exc:
-                        raise IncompleteUniverseError(f"Не удалось загрузить страницу {len(html_pages) + 1}: {exc}") from exc
-            else:
-                # Fallback for JS pagination without href links. A clicked but unchanged
-                # table is treated as an error; it is not silently considered last page.
-                for page_number in range(1, max_pages):
-                    pagination = page.locator(".pagination")
-                    if pagination.count() == 0:
-                        break
-                    first_row = page.locator("tbody tr").first
-                    before = first_row.get_attribute("data-coin") or first_row.get_attribute("data-symbol")
-                    next_button = pagination.locator("a[rel='next'], button[aria-label='Next'], a[aria-label='Next'], .next").first
-                    if next_button.count() == 0:
-                        break
-                    if _pagination_next_is_disabled(next_button):
-                        break
-                    next_button.click()
-                    page.wait_for_timeout(1200)
-                    first_row = page.locator("tbody tr").first
-                    after = first_row.get_attribute("data-coin") or first_row.get_attribute("data-symbol")
-                    if not after or after == before:
-                        raise IncompleteUniverseError(f"Переход на страницу {page_number + 1} не подтвердил смену таблицы.")
-                    html_pages.append(page.content())
-                if len(html_pages) == max_pages:
-                    pagination = page.locator(".pagination")
-                    next_button = pagination.locator(
-                        "a[rel='next'], button[aria-label='Next'], a[aria-label='Next'], .next"
-                    ).first
-                    has_enabled_next = next_button.count() > 0
-                    if has_enabled_next:
-                        has_enabled_next = not _pagination_next_is_disabled(next_button)
-                    if has_enabled_next:
-                        raise IncompleteUniverseError(
-                            f"Достигнут лимит страниц Coinalyze ({max_pages}); полнота не подтверждена."
                         )
+                    except Exception as exc:
+                        raise IncompleteUniverseError(
+                            f"Не удалось загрузить страницу {len(html_pages) + 1}: {exc}"
+                        ) from exc
+                    current_url = next_url
+                    visited_pages.add(canonical_next)
+                    html_pages.append(current_html)
+                    continue
+
+                # Fallback for JavaScript pagination without a usable href.
+                pagination = page.locator(".pagination")
+                if pagination.count() == 0:
+                    break
+                next_button = pagination.locator(
+                    "a[rel='next'], button[aria-label='Next'], a[aria-label='Next'], .next"
+                ).first
+                if next_button.count() == 0 or _pagination_next_is_disabled(next_button):
+                    break
+                first_row = page.locator("tbody tr").first
+                before = first_row.get_attribute("data-coin") or first_row.get_attribute("data-symbol")
+                next_button.click()
+                page.wait_for_timeout(1200)
+                first_row = page.locator("tbody tr").first
+                after = first_row.get_attribute("data-coin") or first_row.get_attribute("data-symbol")
+                if not after or after == before:
+                    raise IncompleteUniverseError(
+                        f"Переход на страницу {len(html_pages) + 1} не подтвердил смену таблицы."
+                    )
+                current_html = page.content()
+                current_url = str(getattr(page, "url", current_url) or current_url)
+                html_pages.append(current_html)
+
+            if len(html_pages) == max_pages:
+                next_url = _pagination_next_url(current_html, current_url)
+                pagination = page.locator(".pagination")
+                next_button = pagination.locator(
+                    "a[rel='next'], button[aria-label='Next'], a[aria-label='Next'], .next"
+                ).first if pagination.count() else None
+                has_enabled_js_next = (
+                    next_button is not None
+                    and next_button.count() > 0
+                    and not _pagination_next_is_disabled(next_button)
+                )
+                if next_url is not None or has_enabled_js_next:
+                    raise IncompleteUniverseError(
+                        f"Достигнут лимит страниц Coinalyze ({max_pages}); полнота не подтверждена."
+                    )
 
             for page_no, html in enumerate(html_pages, start=1):
                 page_rows, page_headers, page_missing, page_missing_required = parse_table(html)
