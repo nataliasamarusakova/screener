@@ -306,16 +306,16 @@ jobs:
             # Prune only after merging remote branch state. Pruning the runner copy
             # before reset is insufficient: the append-only merge would restore
             # expired records from the remote target.
-            python - <<'PY'
-            from pathlib import Path
-            from screener.storage import Store
+          python - <<'PY'
+          from pathlib import Path
+          from screener.storage import Store
 
-            Store(Path("data"), create_files=False).prune(
-                snapshot_retention_days=30,
-                run_retention_days=90,
-                notification_retention_days=180,
-            )
-            PY
+          Store(Path("data"), create_files=False).prune(
+              snapshot_retention_days=30,
+              run_retention_days=90,
+              notification_retention_days=180,
+          )
+          PY
 
             # runs.jsonl is invocation diagnostics, not cross-run strategy state.
             if git ls-files --error-unmatch data/runs.jsonl >/dev/null 2>&1; then
