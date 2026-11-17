@@ -69,6 +69,10 @@ jobs:
           python -m pip install -r requirements.txt
           mkdir -p data
 
+      - name: Run full regression suite
+        id: tests
+        run: python -m pytest -q
+
       - name: Install Playwright Chromium on cache miss
         if: steps.cache-runtime.outputs.cache-hit != 'true'
         run: python -m playwright install chromium
@@ -257,7 +261,7 @@ jobs:
           fi
 
       - name: Persist scanner state on the current branch
-        if: always()
+        if: always() && steps.tests.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -298,6 +302,20 @@ jobs:
             git reset --hard FETCH_HEAD
             mkdir -p data
             python -m screener.merge_state --source "$state_backup" --target data
+
+            # Prune only after merging remote branch state. Pruning the runner copy
+            # before reset is insufficient: the append-only merge would restore
+            # expired records from the remote target.
+            python - <<'PY'
+            from pathlib import Path
+            from screener.storage import Store
+
+            Store(Path("data"), create_files=False).prune(
+                snapshot_retention_days=30,
+                run_retention_days=90,
+                notification_retention_days=180,
+            )
+            PY
 
             # runs.jsonl is invocation diagnostics, not cross-run strategy state.
             if git ls-files --error-unmatch data/runs.jsonl >/dev/null 2>&1; then
