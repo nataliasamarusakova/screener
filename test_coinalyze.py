@@ -6,6 +6,7 @@ from screener.coinalyze import (
     detect_contract_type,
     fetch_table,
     _pagination_urls,
+    _pagination_next_url,
     parse_number,
     parse_table,
 )
@@ -563,3 +564,108 @@ def test_one_hour_long_short_ratio_is_optional_for_p1_schema():
     # diagnostics only and must not disable every alert when absent.
     assert "ls_ratio_1h" not in REQUIRED_FOR_P1
     assert "ls_ratio_1d" in REQUIRED_FOR_P1
+
+
+
+def test_parse_number_extracts_compact_suffix_before_thousands_separator():
+    assert parse_number("$1,234M") == 1_234_000_000
+    assert parse_number("$1,234K") == 1_234_000
+    assert parse_number("$-1,234M") == -1_234_000_000
+    assert parse_number("1,234.56M") == 1_234_560_000
+    assert parse_number("1.234,56M") == 1_234_560_000
+    assert parse_number("1.2M USD") == 1_200_000
+    assert parse_number("1,234 USDT") == 1_234
+    assert parse_number("-1.17%") == -1.17
+
+
+def test_pagination_ignores_page_one_alias_of_base_url():
+    html = '<div class="pagination"><a href="?page=1">1</a><a href="?page=2">2</a></div>'
+    base = "https://coinalyze.net/?columns=x&contract_type=perpetual"
+    urls = _pagination_urls(html, base)
+    assert len(urls) == 2
+    assert "page=2" in urls[1]
+
+
+def test_pagination_walks_next_page_and_fails_closed_at_bootstrap_ellipsis():
+    html = (
+        '<ul class="pagination">'
+        '<li><a href="?page=1">1</a></li>'
+        '<li><a href="?page=2">2</a></li>'
+        '<li><a href="?page=3">3</a></li>'
+        '<li class="disabled"><span>...</span></li>'
+        '<li><a href="?page=8">8</a></li>'
+        '</ul>'
+    )
+    base = "https://coinalyze.net/?columns=x&contract_type=perpetual&page=1"
+    from urllib.parse import parse_qs, urlparse
+    assert parse_qs(urlparse(_pagination_next_url(html, base)).query)["page"] == ["2"]
+    from screener.coinalyze import IncompleteUniverseError
+    with __import__("pytest").raises(IncompleteUniverseError, match="skip hidden pages"):
+        _pagination_next_url(html, base.replace("page=1", "page=3"))
+
+
+def test_pagination_uses_explicit_next_link_across_hidden_page_range():
+    html = (
+        '<ul class="pagination">'
+        '<li><a href="?page=2">2</a></li>'
+        '<li class="next"><a rel="next" href="?page=4">Next</a></li>'
+        '</ul>'
+    )
+    base = "https://coinalyze.net/?columns=x&contract_type=perpetual&page=3"
+    from urllib.parse import parse_qs, urlparse
+    assert parse_qs(urlparse(_pagination_next_url(html, base)).query)["page"] == ["4"]
+
+
+def test_single_generic_oi_change_column_is_classified_from_cell_unit_not_as_usd():
+    html = """
+    <table><thead><tr><th>Coin</th><th>Open Interest Change 24H</th><th>OI Chg 4H</th></tr></thead>
+    <tbody><tr data-coin="ALTUSDT_PERP"><td>ALT</td><td>-1.17%</td><td>$1.2M</td></tr></tbody></table>
+    """
+    rows, _, _, missing_required = parse_table(html)
+    row = rows[0]
+
+    assert row.oi_chg24_pct == -1.17
+    assert row.oi_chg24_usd is None
+    assert row.oi_chg4h_pct is None
+    assert row.oi_chg4h_usd == 1_200_000
+    assert "oi_chg24_usd" in missing_required
+    assert "oi_chg24_pct" not in missing_required
+    assert "oi_chg4h_pct" in missing_required
+
+
+def test_single_bare_generic_oi_change_column_remains_ambiguous():
+    html = """
+    <table><thead><tr><th>Coin</th><th>OI Chg 24H</th></tr></thead>
+    <tbody><tr data-coin="ALTUSDT_PERP"><td>ALT</td><td>-1.17</td></tr></tbody></table>
+    """
+    rows, _, _, missing_required = parse_table(html)
+    assert rows[0].oi_chg24_pct is None
+    assert rows[0].oi_chg24_usd is None
+    assert "oi_chg24_pct" in missing_required
+    assert "oi_chg24_usd" in missing_required
+
+
+def test_javascript_next_control_is_deferred_to_browser_click_instead_of_skipping_pages():
+    html = (
+        '<ul class="pagination">'
+        '<li><a href="?page=1">1</a></li>'
+        '<li><a href="?page=2">2</a></li>'
+        '<li><a href="?page=3">3</a></li>'
+        '<li><span class="ellipsis">...</span></li>'
+        '<li><a href="?page=8">8</a></li>'
+        '<li class="next"><a href="#" aria-label="Next">Next</a></li>'
+        '</ul>'
+    )
+    base = "https://coinalyze.net/?columns=x&contract_type=perpetual&page=3"
+    assert _pagination_next_url(html, base) is None
+
+
+def test_parse_table_rejects_symbol_delimiter_injection():
+    html = """
+    <table><thead><tr><th>Coin</th></tr></thead>
+    <tbody><tr data-coin="BTC|SHORT|INJECT"><td>Bitcoin</td></tr></tbody></table>
+    """
+    from screener.coinalyze import CoinalyzeError
+    import pytest
+    with pytest.raises(CoinalyzeError, match="unsafe event identity"):
+        parse_table(html)

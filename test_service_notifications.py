@@ -1003,6 +1003,9 @@ def test_higher_low_reentry_uses_confirmation_candle_after_cancellation(monkeypa
         def latest_cancelled_close_time_ms(self, *_args, **_kwargs):
             return self.cancelled_at
 
+        def reversal_markers(self, **_kwargs):
+            return []
+
         def record_notification(self, *args, **kwargs):
             self.recorded.append((args, kwargs))
 
@@ -1184,3 +1187,21 @@ def test_telegram_429_cooldown_applies_before_sending_to_other_recipients(monkey
     assert sleeps == [10.0, 10.0, 10.0]
     assert result[0]["sent"] is False
     assert result[1]["sent"] is True
+
+
+def test_telegram_alert_escapes_untrusted_coinalyze_coin_name():
+    from screener.telegram import format_alert
+
+    market = MarketRow(symbol="INITUSDT_PERP.A", name='<b>Injected</b> & "quoted"', price=1.0, chg24_pct=-1.0)
+    enriched, _ = analyze_universe([market], {"thresholds": {}})
+    result = ScenarioResult(
+        symbol=market.symbol, name=market.name, scenario="SHORT D — Long Liquidation Cascade",
+        direction="SHORT", checks=[Check("cascade", True, "yes", "rule")],
+        quality_flags=[], status="CONFIRMED_SIGNAL",
+        technical={"binance_symbol": "INITUSDT", "weak_bounce_rejection": {"confirmed": True, "resistance": 1.02}},
+    )
+
+    message = format_alert(result, enriched[0], result.technical)
+
+    assert '&lt;b&gt;Injected&lt;/b&gt; &amp; "quoted"' in message
+    assert "<b>Injected</b>" not in message

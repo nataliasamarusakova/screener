@@ -176,20 +176,16 @@ def test_notifications_and_run_events_are_appended_as_jsonl(tmp_path):
     assert runs[0]["run_id"] == runs[1]["run_id"] == run_id
 
 
-def test_malformed_jsonl_line_is_skipped_without_losing_following_records(tmp_path):
+def test_generic_jsonl_reader_skips_malformed_line_without_losing_following_records(tmp_path):
     store = Store(tmp_path / "data")
-    current_record = {
-        "record_type": "notification", "recipient_key": "recipient-a",
-        "contract_type": "PERPETUAL", "delivery_status": "SENT",
-        "sent_at": datetime.now(timezone.utc).isoformat(),
-    }
-    store._append_jsonl(store.notifications_path, {**current_record, "event_key": "first"})
-    with store.notifications_path.open("a", encoding="utf-8") as stream:
+    current_record = {"record_type": "run_started", "run_id": "first"}
+    store._append_jsonl(store.runs_path, current_record)
+    with store.runs_path.open("a", encoding="utf-8") as stream:
         stream.write("{this-is-not-json}\n")
-    store._append_jsonl(store.notifications_path, {**current_record, "event_key": "last"})
+    store._append_jsonl(store.runs_path, {"record_type": "run_finished", "run_id": "last"})
 
-    assert store.notification_exists("first", recipient_key="recipient-a", contract_type="PERPETUAL")
-    assert store.notification_exists("last", recipient_key="recipient-a", contract_type="PERPETUAL")
+    records = list(Store._read_jsonl(store.runs_path))
+    assert [item["run_id"] for item in records] == ["first", "last"]
 
 
 
@@ -595,3 +591,147 @@ def test_cancelled_setup_requires_a_newer_trigger_anchor_for_same_pair_direction
     assert store.latest_cancelled_close_time_ms(
         "ALTUSDT_PERP", "SHORT", recipient_key="recipient-a", contract_type="PERPETUAL"
     ) is None
+
+
+
+def test_canceled_spelling_is_also_used_for_reentry_cooldown(tmp_path):
+    store = Store(tmp_path / "canceled-alias")
+    group = "ALTUSDT_PERP|LONG A — Trend Continuation"
+    close_time_ms = 1_800_000_000_000
+    store.record_notification(
+        f"CANCEL|{group}|old-anchor|{close_time_ms}", 1,
+        recipient_key="recipient-a", contract_type="PERPETUAL",
+        event_group=group, fingerprint="fingerprint", event_state="CANCELED",
+        direction="LONG", invalidation_level=1.25, delivery_status="SENT",
+    )
+
+    assert store.latest_cancelled_close_time_ms(
+        "ALTUSDT_PERP", "LONG", recipient_key="recipient-a", contract_type="PERPETUAL"
+    ) == close_time_ms
+
+
+def test_new_notification_state_does_not_mask_existing_active_lifecycle(tmp_path):
+    store = Store(tmp_path / "new-state-does-not-mask-active")
+    group = "BTCUSDT_PERP|LONG A — Trend Continuation"
+    common = dict(
+        recipient_key="recipient-a", contract_type="PERPETUAL", event_group=group,
+        fingerprint="active-fingerprint", direction="LONG", invalidation_level=70_000,
+    )
+    store.record_notification(
+        "active-event", 1, event_state="ACTIVE", delivery_status="SENT", **common
+    )
+    store.record_notification(
+        "new-event", None, event_state="NEW", delivery_status="SENT", **common
+    )
+
+    active = store.active_notification_states(recipient_keys=["recipient-a"])
+    latest = store.latest_notification_state(
+        group, recipient_key="recipient-a", contract_type="PERPETUAL"
+    )
+    assert [item["event_key"] for item in active] == ["active-event"]
+    assert latest is not None and latest["event_state"] == "ACTIVE"
+
+
+def test_new_state_does_not_hide_cancellation_cooldown(tmp_path):
+    store = Store(tmp_path / "new-state-does-not-hide-cancel")
+    group = "ALTUSDT_PERP|LONG B — Spot Accumulation"
+    close_time_ms = 1_800_000_000_000
+    common = dict(
+        recipient_key="recipient-a", contract_type="PERPETUAL", event_group=group,
+        fingerprint="fingerprint", direction="LONG", invalidation_level=1.25,
+    )
+    store.record_notification(
+        f"CANCEL|{group}|anchor|{close_time_ms}", 1,
+        event_state="CANCELLED", delivery_status="SENT", **common
+    )
+    store.record_notification(
+        "new-state", None, event_state="NEW", delivery_status="SENT", **common
+    )
+
+    assert store.latest_cancelled_close_time_ms(
+        "ALTUSDT_PERP", "LONG", recipient_key="recipient-a", contract_type="PERPETUAL"
+    ) == close_time_ms
+
+
+def test_new_state_does_not_make_old_active_notification_prunable(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    import json
+
+    store = Store(tmp_path / "new-state-prune")
+    group = "BTCUSDT_PERP|LONG A — Trend Continuation"
+    store.record_notification(
+        "active-old", 1, recipient_key="recipient-a", contract_type="PERPETUAL",
+        event_group=group, fingerprint="fp", event_state="ACTIVE", direction="LONG",
+        invalidation_level=70_000, delivery_status="SENT",
+    )
+    store.record_notification(
+        "new-later", None, recipient_key="recipient-a", contract_type="PERPETUAL",
+        event_group=group, fingerprint="fp", event_state="NEW", direction="LONG",
+        delivery_status="SENT",
+    )
+    records = [json.loads(line) for line in store.notifications_path.read_text(encoding="utf-8").splitlines()]
+    old_at = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+    records[0]["sent_at"] = old_at
+    store._rewrite_jsonl(store.notifications_path, records)
+
+    store.prune(notification_retention_days=180)
+
+    retained = list(Store._read_jsonl(store.notifications_path))
+    assert {item["event_key"] for item in retained} == {"active-old", "new-later"}
+
+
+def test_corrupt_complete_notification_line_fails_closed_instead_of_forgetting_active(tmp_path):
+    store = Store(tmp_path / "corrupt-notifications")
+    group = "BTCUSDT_PERP|LONG A — Trend Continuation"
+    store.record_notification(
+        "active-event", 1, recipient_key="recipient-a", contract_type="PERPETUAL",
+        event_group=group, fingerprint="fp", event_state="ACTIVE", direction="LONG",
+        invalidation_level=70_000, delivery_status="SENT",
+    )
+    original = store.notifications_path.read_bytes()
+    store.notifications_path.write_bytes(original + b'{"broken":\n' + original)
+
+    import pytest
+    with pytest.raises(ValueError, match="Invalid critical JSONL record"):
+        store.active_notification_states(recipient_keys=["recipient-a"])
+    with pytest.raises(ValueError, match="Invalid critical JSONL record"):
+        store.prune()
+
+
+def test_truncated_notification_tail_fails_closed_before_retrying_delivery(tmp_path):
+    import pytest
+
+    store = Store(tmp_path / "truncated-notification-tail")
+    store.notifications_path.write_text(
+        '{"record_type":"notification","event_key":"partial', encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="Invalid critical JSONL record"):
+        store.active_notification_states(recipient_keys=["recipient-a"])
+    with pytest.raises(ValueError, match="Invalid critical JSONL record"):
+        store.prune()
+
+
+def test_prune_keeps_unresolved_reversal_marker_until_new_event_state_is_written(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    import json
+
+    store = Store(tmp_path / "unresolved-reversal-marker")
+    symbol = "BTCUSDT_PERP"
+    new_event_key = f"{symbol}|LONG A — Trend Continuation|123"
+    marker_key = f"REVERSAL|{symbol}|SHORT|LONG|{new_event_key}"
+    store.record_notification(
+        marker_key, 42, recipient_key="recipient-a", contract_type="PERPETUAL",
+        event_group=f"REVERSAL|{symbol}|SHORT|LONG", fingerprint="new-fp",
+        event_state="SENT", direction="LONG", invalidation_level=70_000,
+        pair="BTCUSDT", scenario_code="LONG A", related_event_keys=["old-short"],
+        delivery_status="SENT",
+    )
+    records = [json.loads(line) for line in store.notifications_path.read_text(encoding="utf-8").splitlines()]
+    records[0]["sent_at"] = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
+    store._rewrite_jsonl(store.notifications_path, records)
+
+    store.prune(notification_retention_days=180)
+
+    retained = list(Store._read_jsonl_strict(store.notifications_path))
+    assert len(retained) == 1
+    assert retained[0]["event_key"] == marker_key

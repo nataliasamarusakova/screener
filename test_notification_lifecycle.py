@@ -559,8 +559,10 @@ def test_permanent_reversal_failure_is_recorded_without_replacing_old_active_ale
     first = _collect_notifications(
         [new_long], rows, _settings(), store, True, False, contract_type="PERPETUAL"
     )
+    # No current candidate is needed: the durable marker alone must finish
+    # the interrupted state transition.
     second = _collect_notifications(
-        [new_long], rows, _settings(), store, True, False, contract_type="PERPETUAL"
+        [], rows, _settings(), store, True, False, contract_type="PERPETUAL"
     )
 
     assert len(first) == 1 and first[0]["type"] == "reversal" and not first[0]["sent"]
@@ -717,3 +719,129 @@ def test_retryable_new_signal_delivery_is_not_persisted_as_sent_and_can_retry(tm
     assert FirstAttemptRateLimitedTelegram.calls == 2
     assert store.notification_exists(event_key, recipient_key=_recipient_key(), contract_type="PERPETUAL") is True
     assert len(store.active_notification_states(recipient_keys=[_recipient_key()])) == 1
+
+
+
+def test_reversal_recovers_new_active_state_after_crash_between_old_and_new_writes(tmp_path, monkeypatch):
+    import pytest
+    import screener.service as service
+
+    FakeTelegram.sent = []
+    monkeypatch.setattr(service, "TelegramClient", FakeTelegram)
+    rows = _enriched()
+    row = rows[0]
+    store = Store(tmp_path / "reversal-crash-after-old-state")
+    _activate_short(store, row)
+    new_long = _confirmed_result(row, "LONG", "LONG A", level=0.7500, close=0.7700)
+
+    original_record = store.record_notification
+    crashed = {"done": False}
+
+    def crash_after_old_state(*args, **kwargs):
+        original_record(*args, **kwargs)
+        if kwargs.get("event_state") == "REVERSED" and not crashed["done"]:
+            crashed["done"] = True
+            raise RuntimeError("simulated crash after OLD_STATE=REVERSED")
+
+    store.record_notification = crash_after_old_state
+    with pytest.raises(RuntimeError, match="OLD_STATE=REVERSED"):
+        _collect_notifications(
+            [new_long], rows, _settings(), store, True, False, contract_type="PERPETUAL"
+        )
+
+    # The reversal message and old terminal state are durable, but the new ACTIVE
+    # record was not written before the simulated process death.
+    assert len(FakeTelegram.sent) == 1
+    assert store.active_notification_states(
+        recipient_keys=[_recipient_key()], contract_type="PERPETUAL"
+    ) == []
+
+    store.record_notification = original_record
+    second = _collect_notifications(
+        [new_long], rows, _settings(), store, True, False, contract_type="PERPETUAL"
+    )
+
+    assert second == []
+    assert len(FakeTelegram.sent) == 1
+    active = store.active_notification_states(
+        recipient_keys=[_recipient_key()], contract_type="PERPETUAL"
+    )
+    assert len(active) == 1
+    assert active[0]["direction"] == "LONG"
+
+
+def test_telegram_debug_transport_logger_cannot_emit_token_bearing_request_path():
+    import logging
+    import screener.telegram  # noqa: F401
+
+    assert logging.getLogger("urllib3.connectionpool").level >= logging.WARNING
+
+
+def test_telegram_non_object_success_payload_is_classified_unknown(monkeypatch):
+    import screener.telegram as telegram_module
+    from screener.telegram import TelegramClient
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return ["unexpected", "shape"]
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    monkeypatch.setattr(telegram_module.requests, "post", lambda *_args, **_kwargs: Response())
+    client = TelegramClient(
+        "token", ["12345"], min_interval_per_chat_sec=0, min_interval_global_sec=0
+    )
+
+    result = client.send("test")
+
+    assert result[0]["sent"] is False
+    assert result[0]["delivery_unknown"] is True
+    assert "non-object JSON" in result[0]["error"]
+
+
+def test_old_reversal_marker_does_not_reverse_a_later_reentry_on_the_old_side(tmp_path, monkeypatch):
+    import screener.service as service
+
+    monkeypatch.setattr(service, "TelegramClient", FakeTelegram)
+    rows = _enriched()
+    row = rows[0]
+    symbol = row.symbol
+    recipient = _recipient_key()
+    store = Store(tmp_path / "old-marker-later-reentry")
+    old_group = f"{symbol}|SHORT A — Trend Continuation"
+    new_group = f"{symbol}|LONG A — Trend Continuation"
+    marker_new_key = f"{new_group}|100"
+    store.record_notification(
+        "old-short-event", 1, recipient_key=recipient, contract_type="PERPETUAL",
+        event_group=old_group, fingerprint="old-fingerprint", event_state="ACTIVE",
+        direction="SHORT", invalidation_level=1.2, delivery_status="SENT",
+    )
+    store.record_notification(
+        f"REVERSAL|{symbol}|SHORT|LONG|{marker_new_key}", 2,
+        recipient_key=recipient, contract_type="PERPETUAL",
+        event_group=f"REVERSAL|{symbol}|SHORT|LONG", fingerprint="new-fingerprint",
+        event_state="SENT", direction="LONG", invalidation_level=1.1,
+        pair="ALTUSDT", scenario_code="LONG A", related_event_keys=["old-short-event"],
+        delivery_status="SENT",
+    )
+    store.record_notification(
+        "later-short-reentry", 3, recipient_key=recipient, contract_type="PERPETUAL",
+        event_group=old_group, fingerprint="later-fingerprint", event_state="ACTIVE",
+        direction="SHORT", invalidation_level=1.25, delivery_status="SENT",
+    )
+
+    service._collect_notifications(
+        [], rows, _settings(), store, True, False, contract_type="PERPETUAL"
+    )
+
+    active = store.active_notification_states(
+        recipient_keys=[recipient], contract_type="PERPETUAL"
+    )
+    assert len(active) == 1
+    assert active[0]["event_key"] == "later-short-reentry"
+    assert active[0]["event_state"] == "ACTIVE"

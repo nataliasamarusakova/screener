@@ -75,3 +75,22 @@ def test_runtime_requirements_are_exactly_pinned_in_one_file():
     ]
     assert not (root / "requirements-dev.txt").exists()
     assert not (root / "constraints.txt").exists()
+
+
+
+def test_workflow_prunes_after_remote_and_runner_state_are_merged():
+    workflow = (Path(__file__).resolve().parent / ".github/workflows/screener.yml").read_text()
+    merge_at = workflow.index("python -m screener.merge_state --source")
+    prune_at = workflow.index('Store(Path("data"), create_files=False).prune', merge_at)
+    stage_at = workflow.index("git add data/snapshots.jsonl", merge_at)
+    assert merge_at < prune_at < stage_at
+
+
+
+def test_workflow_runs_regressions_before_scanning_and_skips_persistence_if_tests_fail():
+    workflow = (Path(__file__).resolve().parent / ".github/workflows/screener.yml").read_text()
+    tests_at = workflow.index("- name: Run full regression suite")
+    scan_at = workflow.index("python -m screener\n", tests_at)
+    persist_at = workflow.index("- name: Persist scanner state on the current branch")
+    assert tests_at < scan_at < persist_at
+    assert "if: always() && steps.tests.outcome == 'success'" in workflow[persist_at:]

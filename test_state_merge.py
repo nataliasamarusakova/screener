@@ -143,7 +143,7 @@ def test_merge_state_rejects_conflicting_poll_states_with_same_timestamp(tmp_pat
         merge_state(local, target)
 
 
-def test_merge_state_discards_only_unterminated_jsonl_tail(tmp_path):
+def test_merge_state_fails_closed_on_unterminated_notification_tail(tmp_path):
     remote, local, target = tmp_path / "remote", tmp_path / "local", tmp_path / "target"
     manifest, row = _snapshot("committed", "2026-11-16T10:00:00+00:00", "BTCUSDT_PERP", "Bitcoin")
     _write_jsonl(remote / "snapshots.jsonl", [manifest])
@@ -157,10 +157,14 @@ def test_merge_state_discards_only_unterminated_jsonl_tail(tmp_path):
     for file in ("snapshots.jsonl", "market_rows.jsonl", "notifications.jsonl"):
         (target / file).write_bytes((remote / file).read_bytes())
 
-    merge_state(local, target)
+    with pytest.raises(ValueError, match="Invalid JSONL record"):
+        merge_state(local, target)
 
-    assert len((target / "snapshots.jsonl").read_text().splitlines()) == 1
-    assert len((target / "market_rows.jsonl").read_text().splitlines()) == 1
+    # Snapshot/row readers can still discard an unterminated tail; notification
+    # markers deliberately use strict_tail=True because they guard external sends.
+    from screener.merge_state import _read_jsonl
+    assert _read_jsonl(local / "snapshots.jsonl") == []
+    assert _read_jsonl(local / "market_rows.jsonl") == []
     assert (target / "notifications.jsonl").read_text() == ""
 
 
@@ -179,3 +183,33 @@ def test_merge_state_fails_on_malformed_jsonl_in_middle_of_file(tmp_path):
 
     with pytest.raises(ValueError, match="Invalid JSONL record"):
         merge_state(local, target)
+
+
+def test_pruning_after_state_merge_removes_expired_remote_snapshots(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    remote, local, target = tmp_path / "remote-old", tmp_path / "local-new", tmp_path / "target-pruned"
+    old_at = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+    new_at = datetime.now(timezone.utc).isoformat()
+    old_manifest, old_row = _snapshot("old-remote", old_at, "BTCUSDT_PERP", "Bitcoin")
+    new_manifest, new_row = _snapshot("new-local", new_at, "BTCUSDT_PERP", "Bitcoin")
+    _write_jsonl(remote / "snapshots.jsonl", [old_manifest])
+    _write_jsonl(remote / "market_rows.jsonl", [old_row])
+    _write_jsonl(remote / "notifications.jsonl", [])
+    _write_jsonl(local / "snapshots.jsonl", [new_manifest])
+    _write_jsonl(local / "market_rows.jsonl", [new_row])
+    _write_jsonl(local / "notifications.jsonl", [])
+    target.mkdir()
+    for name in ("snapshots.jsonl", "market_rows.jsonl", "notifications.jsonl"):
+        (target / name).write_bytes((remote / name).read_bytes())
+
+    merge_state(local, target)
+    assert len(Store(target, create_files=False).recent_symbol_history(
+        "BTCUSDT_PERP", limit=10, contract_type="PERPETUAL"
+    )) == 2
+
+    Store(target, create_files=False).prune(snapshot_retention_days=30)
+    history = Store(target, create_files=False).recent_symbol_history(
+        "BTCUSDT_PERP", limit=10, contract_type="PERPETUAL"
+    )
+    assert [item["_snapshot_id"] for item in history] == ["new-local"]

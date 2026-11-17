@@ -56,7 +56,7 @@ def test_weak_bounce_rejection_requires_the_latest_closed_candle(monkeypatch):
 def test_weak_bounce_rejection_accepts_fresh_bearish_sweep_below_resistance(monkeypatch):
     import screener.structure as structure
 
-    values = [candle(i, 115, 100, 112) for i in range(24)]
+    values = [candle(i, 115, 100, 107) for i in range(24)]
     values[-1] = Candle(
         open_time_ms=23 * 60_000, close_time_ms=23 * 60_000 + 59_999,
         open=108.5, high=110.0, low=105.0, close=107.0,
@@ -296,3 +296,23 @@ def test_weak_bounce_rejection_is_blocked_on_a_new_24h_low(monkeypatch):
 
     assert result["confirmed"] is False
     assert "new 24H low" in result["reason"]
+
+
+
+def test_weak_bounce_rejection_rejects_resistance_broken_by_intervening_close(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 115, 100, 107) for i in range(24)]
+    values[15] = candle(15, 116, 107, 109)  # Closed above the selected 108 resistance.
+    values[-1] = Candle(
+        open_time_ms=23 * 60_000, close_time_ms=23 * 60_000 + 59_999,
+        open=108.5, high=110.0, low=105.0, close=107.0,
+        volume=1, quote_volume=1, trades=10,
+    )
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([(0, 115.0), (10, 108.0)], []))
+    monkeypatch.setattr(structure, "atr", lambda *_args, **_kwargs: 2.0)
+
+    result = weak_bounce_rejection(values, left=1, right=1)
+
+    assert result["confirmed"] is False
+    assert "invalidated" in result["reason"].lower()

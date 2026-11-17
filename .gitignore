@@ -7,3 +7,6 @@ playwright/.cache/
 # Per-invocation diagnostics are local to a runner; durable state includes
 # 4H snapshots, last-poll freshness, and notification lifecycle.
 data/runs.jsonl
+
+# Explicitly generated recovery backups from rearm_failed_notification.py
+*.bak
