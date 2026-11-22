@@ -1,2 +1,3 @@
 {"contract_type":"PERPETUAL","fetched_at":"2026-11-22T15:11:05.429863+00:00","record_type":"snapshot","row_count":65,"snapshot_hash":"04f05331c3062740a912fd06978daf0a845c504cf0f26a5543da3814979d998d","snapshot_id":"4cbbe3242ac4440e9e771737fcbcd53c"}
 {"contract_type":"PERPETUAL","fetched_at":"2026-11-22T19:11:17.229015+00:00","record_type":"snapshot","row_count":61,"snapshot_hash":"e926e911d1c3155aa76b3ef61ea7caf622c83ed01d317336cd46b362691d8e43","snapshot_id":"c56345d2ebac47f594e7cbdb16d2120e"}
+{"contract_type":"PERPETUAL","fetched_at":"2026-11-22T23:16:15.541570+00:00","record_type":"snapshot","row_count":64,"snapshot_hash":"6d4161968a9bf9ab15a877279f40f46195b20923bc85a85237a5dac72a7cb309","snapshot_id":"bfaccee38a714515b7bd6ad776df9b93"}
