@@ -753,3 +753,38 @@ def test_prune_keeps_unresolved_reversal_marker_until_new_event_state_is_written
     retained = list(Store._read_jsonl_strict(store.notifications_path))
     assert len(retained) == 1
     assert retained[0]["event_key"] == marker_key
+
+
+def test_prune_keeps_reversal_marker_when_new_group_has_only_older_cancelled_state(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    import json
+
+    store = Store(tmp_path / "unresolved-reversal-with-old-cancel")
+    symbol = "BTCUSDT_PERP"
+    new_event_key = f"{symbol}|LONG A — Trend Continuation|456"
+    new_group = f"{symbol}|LONG A — Trend Continuation"
+    marker_key = f"REVERSAL|{symbol}|SHORT|LONG|{new_event_key}"
+    store.record_notification(
+        "CANCEL|older-long-event|123", 41, recipient_key="recipient-a",
+        contract_type="PERPETUAL", event_group=new_group,
+        fingerprint="old-long-fp", event_state="CANCELLED", direction="LONG",
+        invalidation_level=70_000, pair="BTCUSDT", scenario_code="LONG A",
+        delivery_status="SENT",
+    )
+    store.record_notification(
+        marker_key, 42, recipient_key="recipient-a", contract_type="PERPETUAL",
+        event_group=f"REVERSAL|{symbol}|SHORT|LONG", fingerprint="new-fp",
+        event_state="SENT", direction="LONG", invalidation_level=69_000,
+        pair="BTCUSDT", scenario_code="LONG A", related_event_keys=["old-short"],
+        delivery_status="SENT",
+    )
+    records = [json.loads(line) for line in store.notifications_path.read_text(encoding="utf-8").splitlines()]
+    now = datetime.now(timezone.utc)
+    records[0]["sent_at"] = (now - timedelta(days=365)).isoformat()
+    records[1]["sent_at"] = (now - timedelta(days=364)).isoformat()
+    store._rewrite_jsonl(store.notifications_path, records)
+
+    store.prune(notification_retention_days=180)
+
+    retained = list(Store._read_jsonl_strict(store.notifications_path))
+    assert [item["event_key"] for item in retained] == [marker_key]

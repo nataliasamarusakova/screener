@@ -417,6 +417,20 @@ def test_blocked_scenarios_are_not_near_candidates():
     assert result.near_candidate is False
 
 
+def test_quality_flag_alone_excludes_near_candidate_even_without_blocked_status():
+    from screener.models import Check, ScenarioResult
+
+    result = ScenarioResult(
+        symbol="ALTUSDT", name="ALT", scenario="LONG A", direction="LONG",
+        checks=[Check("condition 1", True, "yes", "rule"),
+                Check("condition 2", True, "yes", "rule"),
+                Check("condition 3", False, "no", "rule")],
+        quality_flags=["OI_QUALITY_WARNING"], status="NOT_MET",
+    )
+
+    assert result.near_candidate is False
+
+
 def test_zero_known_liquidations_mean_no_cascade_not_unknown():
     row = MarketRow(
         symbol="ZEROUSDT_PERP", name="ZERO", price=10, chg24_pct=-2,

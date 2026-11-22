@@ -596,6 +596,16 @@ def test_persisted_reversal_marker_recovers_partial_state_without_resending(tmp_
     new_group, new_event_key, new_fingerprint, _ = identity
     reversal_key = f"REVERSAL|{row.symbol}|SHORT|LONG|{new_event_key}"
 
+    # A CANCELLED setup from an earlier lifecycle in the same scenario group
+    # must not mask recovery of this newer reversal event.
+    store.record_notification(
+        "CANCEL|old-long-event|123", 66, recipient_key=_recipient_key(),
+        event_group=new_group, fingerprint="old-long-fingerprint",
+        event_state="CANCELLED", direction="LONG", invalidation_level=0.7500,
+        pair="FILUSDT", scenario_code="LONG A", contract_type="PERPETUAL",
+        delivery_status="SENT",
+    )
+
     # Simulate a crash after the Telegram reversal record was persisted, but
     # before the old/new per-scenario lifecycle rows were appended.
     store.record_notification(
@@ -844,3 +854,55 @@ def test_old_reversal_marker_does_not_reverse_a_later_reentry_on_the_old_side(tm
     assert len(active) == 1
     assert active[0]["event_key"] == "later-short-reentry"
     assert active[0]["event_state"] == "ACTIVE"
+
+
+def test_orphan_reversal_marker_recovers_after_old_cancelled_new_group_state(tmp_path, monkeypatch):
+    import screener.service as service
+
+    FakeTelegram.sent = []
+    monkeypatch.setattr(service, "TelegramClient", FakeTelegram)
+    rows = _enriched()
+    row = rows[0]
+    store = Store(tmp_path / "orphan-reversal-old-cancelled")
+    old_group = _activate_short(store, row)
+    new_long = _confirmed_result(row, "LONG", "LONG A", level=0.7500, close=0.7700)
+    identity = service._notification_identity(new_long)
+    assert identity is not None
+    new_group, new_event_key, new_fingerprint, new_level = identity
+    reversal_key = f"REVERSAL|{row.symbol}|SHORT|LONG|{new_event_key}"
+
+    # The old SHORT has already been transitioned, so only the durable marker
+    # remains to reconcile. The LONG group contains a stale cancellation.
+    store.record_notification(
+        "OLD_STATE|old-short-event|REVERSED", 77, recipient_key=_recipient_key(),
+        event_group=old_group, fingerprint="old-short-fingerprint",
+        event_state="REVERSED", direction="SHORT", invalidation_level=0.7659,
+        pair="FILUSDT", scenario_code="SHORT D", contract_type="PERPETUAL",
+        delivery_status="SENT",
+    )
+    store.record_notification(
+        "CANCEL|older-long-event|123", 66, recipient_key=_recipient_key(),
+        event_group=new_group, fingerprint="older-long-fingerprint",
+        event_state="CANCELLED", direction="LONG", invalidation_level=new_level,
+        pair="FILUSDT", scenario_code="LONG A", contract_type="PERPETUAL",
+        delivery_status="SENT",
+    )
+    store.record_notification(
+        reversal_key, 88, recipient_key=_recipient_key(),
+        event_group=f"REVERSAL|{row.symbol}|SHORT|LONG",
+        fingerprint=new_fingerprint, event_state="SENT", direction="LONG",
+        invalidation_level=new_level, pair="FILUSDT", scenario_code="LONG A",
+        related_event_keys=["old-short-event"], contract_type="PERPETUAL",
+        delivery_status="SENT",
+    )
+
+    assert _collect_notifications(
+        [], rows, _settings(), store, True, False, contract_type="PERPETUAL"
+    ) == []
+    assert FakeTelegram.sent == []
+    recovered = store.latest_notification_state(
+        new_group, recipient_key=_recipient_key(), contract_type="PERPETUAL"
+    )
+    assert recovered is not None
+    assert recovered["event_key"] == new_event_key
+    assert recovered["event_state"] == "ACTIVE"

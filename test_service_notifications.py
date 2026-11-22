@@ -1277,3 +1277,61 @@ def test_telegram_alert_escapes_untrusted_coinalyze_coin_name():
 
     assert '&lt;b&gt;Injected&lt;/b&gt; &amp; "quoted"' in message
     assert "<b>Injected</b>" not in message
+
+
+def test_short_c_confirmation_anchor_uses_retest_not_initial_break():
+    from screener.service import _confirmation_anchor, _notification_identity
+    from screener.telegram import _confirmation_anchor as telegram_confirmation_anchor
+
+    market = MarketRow(symbol="ALTUSDT_PERP", name="ALT", price=1.0, chg24_pct=-2.0)
+    result = ScenarioResult(
+        symbol=market.symbol, name=market.name, scenario="SHORT C — Bearish Structure Break",
+        direction="SHORT", checks=[Check("P1", True, "pass", "rule")],
+        quality_flags=[], status="CONFIRMED_SIGNAL",
+        technical={
+            "binance_symbol": "ALTUSDT",
+            "bearish_structure_break": {
+                "confirmed": True,
+                "break_open_time_ms": 1_790_000_000_000,
+                "level": 0.95,
+            },
+            "trend_retest_short": {
+                "confirmed": True,
+                "retest_open_time_ms": 1_790_000_360_000,
+                "level": 0.95,
+            },
+        },
+    )
+
+    expected_anchor = 1_790_000_360_000
+    assert _confirmation_anchor(result) == expected_anchor
+    assert telegram_confirmation_anchor(result) == expected_anchor
+    identity = _notification_identity(result)
+    assert identity is not None
+    assert identity[1].endswith(f"|{expected_anchor}")
+
+
+def test_signal_warnings_are_not_silently_capped_at_two():
+    from screener.telegram import _signal_warnings
+
+    market = MarketRow(
+        symbol="ALTUSDT_PERP", name="ALT", price=1.0, chg24_pct=3.0,
+        oi_chg24_pct=-1.0, oi_chg4h_usd=250_000,
+        fr_oiw_pct=0.01, pfr_oiw_pct=-0.01, btc_corr7d=0.86,
+    )
+    enriched, _ = analyze_universe([market], {"thresholds": {}})
+    result = ScenarioResult(
+        symbol=market.symbol, name=market.name, scenario="LONG A — Trend Continuation",
+        direction="LONG", checks=[Check("P1", True, "pass", "rule")],
+        quality_flags=[], status="CONFIRMED_SIGNAL_WITH_WARNING",
+    )
+    warnings = _signal_warnings(
+        result, enriched[0], {"context_4h": {"ema20": 0.9, "ema50": 1.0}}
+    )
+
+    assert len(warnings) == 5
+    assert any("PFR OI_W" in warning for warning in warnings)
+    assert any("EMA20 ниже EMA50" in warning for warning in warnings)
+    assert any("OI 4H мало" in warning for warning in warnings)
+    assert any("Цена растёт при падающем OI" in warning for warning in warnings)
+    assert any("BTC Corr. 7D" in warning for warning in warnings)
