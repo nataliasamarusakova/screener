@@ -7,21 +7,23 @@ def candle(i: int, high: float, low: float, close: float | None = None) -> Candl
     return Candle(i * 60_000, i * 60_000 + 59_999, close, high, low, close, 1, 1, 10)
 
 
-def test_higher_low_uses_only_confirmed_swings():
+def test_higher_low_uses_only_confirmed_swings(monkeypatch):
     values = [
         candle(0, 11, 9), candle(1, 12, 8), candle(2, 11, 9), candle(3, 10, 7),
         candle(4, 11, 8), candle(5, 13, 10), candle(6, 12, 9), candle(7, 11, 8),
         candle(8, 12, 9), candle(9, 14, 11), candle(10, 13, 10), candle(11, 12, 9),
     ]
+    import screener.structure as structure
     highs, lows = confirmed_pivots(values, left=1, right=1, lookback=30)
     assert len(lows) >= 2
+    monkeypatch.setattr(structure, "atr", lambda *_args, **_kwargs: 2.0)
     result = higher_low(values, left=1, right=1, lookback=30)
     assert result["confirmed"] is True
     assert result["confirmation_open_time_ms"] > result["latest_open_time_ms"]
     assert result["confirmation_close_time_ms"] == result["confirmation_open_time_ms"] + 59_999
 
 
-def test_higher_low_is_invalidated_by_any_later_close_below_latest_pivot(monkeypatch):
+def test_higher_low_is_invalidated_by_any_later_wick_below_latest_pivot(monkeypatch):
     import screener.structure as structure
 
     values = [
@@ -121,18 +123,26 @@ def test_scenario_specific_invalidation_uses_the_correct_structure_level():
 
 
 
-def test_failed_breakout_rejection_returns_the_confirmation_candle_anchor():
-    values = [
-        candle(0, 9, 7, 8),
-        candle(1, 10, 8, 9),
-        candle(2, 12, 9, 11),
-        candle(3, 11, 8, 9),
-        candle(4, 11.5, 8.5, 10),
-        candle(5, 12.5, 9, 11.5),
-    ]
+def test_failed_breakout_rejection_returns_the_confirmation_candle_anchor(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 99, 97, 98) for i in range(12)]
+    values[-2] = Candle(
+        open_time_ms=10 * 60_000, close_time_ms=10 * 60_000 + 59_999,
+        open=99.0, high=101.0, low=98.5, close=100.5,
+        volume=1, quote_volume=1, trades=10,
+    )
+    values[-1] = Candle(
+        open_time_ms=11 * 60_000, close_time_ms=11 * 60_000 + 59_999,
+        open=100.5, high=101.0, low=98.0, close=99.0,
+        volume=1, quote_volume=1, trades=10,
+    )
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([(2, 100.0)], []))
+
     result = failed_breakout_rejection(values, left=1, right=1, lookback=30)
 
     assert result["confirmed"] is True
+    assert result["breakout_open_time_ms"] == values[-2].open_time_ms
     assert result["failure_open_time_ms"] == values[-1].open_time_ms
 
 
@@ -166,8 +176,16 @@ def test_failed_breakout_rejection_accepts_fresh_break_then_rejection(monkeypatc
     import screener.structure as structure
 
     values = [candle(i, 99, 97, 98) for i in range(12)]
-    values[-2] = candle(10, 103, 100, 102)  # fresh break and close above 100
-    values[-1] = candle(11, 103, 98, 99)    # immediate rejection back below 100
+    values[-2] = Candle(
+        open_time_ms=10 * 60_000, close_time_ms=10 * 60_000 + 59_999,
+        open=99.0, high=103.0, low=100.0, close=102.0,
+        volume=1, quote_volume=1, trades=10,
+    )  # fresh break and close above 100
+    values[-1] = Candle(
+        open_time_ms=11 * 60_000, close_time_ms=11 * 60_000 + 59_999,
+        open=103.0, high=103.0, low=98.0, close=99.0,
+        volume=1, quote_volume=1, trades=10,
+    )  # bearish rejection back below 100
     monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([(2, 100.0)], []))
 
     result = failed_breakout_rejection(values, left=1, right=1, lookback=30, max_age_bars=3)
@@ -344,3 +362,192 @@ def test_weak_bounce_rejection_rejects_resistance_broken_by_intervening_close(mo
 
     assert result["confirmed"] is False
     assert "invalidated" in result["reason"].lower()
+
+
+
+def test_breakout_retest_rejects_a_red_dump_that_only_closes_a_tick_above_level(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 99, 98, 98.5) for i in range(6)]
+    values[1] = candle(1, 100, 98, 99)
+    values[3] = Candle(
+        open_time_ms=3 * 60_000, close_time_ms=3 * 60_000 + 59_999,
+        open=99.0, high=102.0, low=98.5, close=101.5,
+        volume=1, quote_volume=1, trades=10,
+    )
+    values[4] = Candle(
+        open_time_ms=4 * 60_000, close_time_ms=4 * 60_000 + 59_999,
+        open=107.0, high=108.0, low=99.9, close=100.1,
+        volume=1, quote_volume=1, trades=10,
+    )
+    values[5] = candle(5, 102, 100.5, 101)
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([(1, 100.0)], []))
+    monkeypatch.setattr(structure, "atr", lambda *_args, **_kwargs: 1.0)
+
+    result = structure.breakout_and_retest(values, "LONG", left=1, right=1, lookback=30)
+
+    assert result["confirmed"] is False
+
+
+def test_breakout_retest_rejects_entry_more_than_two_atr_from_level(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 99, 98, 98.5) for i in range(6)]
+    values[1] = candle(1, 100, 98, 99)
+    values[3] = Candle(
+        open_time_ms=3 * 60_000, close_time_ms=3 * 60_000 + 59_999,
+        open=99.0, high=102.0, low=98.5, close=101.5,
+        volume=1, quote_volume=1, trades=10,
+    )
+    values[4] = Candle(
+        open_time_ms=4 * 60_000, close_time_ms=4 * 60_000 + 59_999,
+        open=100.0, high=101.0, low=99.9, close=100.5,
+        volume=1, quote_volume=1, trades=10,
+    )
+    values[5] = candle(5, 104, 102.5, 103)
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([(1, 100.0)], []))
+    monkeypatch.setattr(structure, "atr", lambda *_args, **_kwargs: 1.0)
+
+    result = structure.breakout_and_retest(values, "LONG", left=1, right=1, lookback=30)
+
+    assert result["confirmed"] is False
+
+
+def test_higher_low_rejects_a_minimum_that_is_not_materially_higher(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 110, 100, 105) for i in range(20)]
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([], [(5, 95.0), (10, 95.1)]))
+    monkeypatch.setattr(structure, "atr", lambda *_args, **_kwargs: 2.0)
+
+    result = higher_low(values, left=1, right=1, min_rise_atr=0.25)
+
+    assert result["confirmed"] is False
+    assert "too small" in result["reason"].lower()
+
+
+def test_higher_low_rejects_a_price_already_extended_from_invalidation(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 110, 100, 105) for i in range(20)]
+    values[-1] = Candle(
+        open_time_ms=19 * 60_000, close_time_ms=19 * 60_000 + 59_999,
+        open=108.0, high=110.0, low=106.0, close=109.0,
+        volume=1, quote_volume=1, trades=10,
+    )
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([], [(5, 90.0), (10, 95.0)]))
+    monkeypatch.setattr(structure, "atr", lambda *_args, **_kwargs: 2.0)
+
+    result = higher_low(values, left=1, right=1, max_extension_atr=2.0)
+
+    assert result["confirmed"] is False
+    assert "extended" in result["reason"].lower()
+
+
+def test_failed_breakout_rejection_never_accepts_a_green_candle(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 99, 97, 98) for i in range(12)]
+    values[-2] = Candle(
+        open_time_ms=10 * 60_000, close_time_ms=10 * 60_000 + 59_999,
+        open=96.0, high=101.0, low=95.5, close=100.5,
+        volume=1, quote_volume=1, trades=10,
+    )
+    values[-1] = Candle(
+        open_time_ms=11 * 60_000, close_time_ms=11 * 60_000 + 59_999,
+        open=95.0, high=100.1, low=95.0, close=99.9,
+        volume=1, quote_volume=1, trades=10,
+    )
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([(2, 100.0)], []))
+
+    result = failed_breakout_rejection(values, left=1, right=1, lookback=30)
+
+    assert result["confirmed"] is False
+
+
+def test_failed_breakout_rejection_does_not_use_an_old_pivot_below_unbroken_higher_high(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 99, 97, 98) for i in range(12)]
+    values[-2] = Candle(
+        open_time_ms=10 * 60_000, close_time_ms=10 * 60_000 + 59_999,
+        open=99.0, high=101.0, low=98.5, close=100.5,
+        volume=1, quote_volume=1, trades=10,
+    )
+    values[-1] = Candle(
+        open_time_ms=11 * 60_000, close_time_ms=11 * 60_000 + 59_999,
+        open=101.0, high=101.5, low=98.0, close=99.0,
+        volume=1, quote_volume=1, trades=10,
+    )
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([(2, 100.0), (7, 120.0)], []))
+
+    result = failed_breakout_rejection(values, left=1, right=1, lookback=30)
+
+    assert result["confirmed"] is False
+
+
+
+def test_short_breakdown_retest_rejects_a_strong_green_reclaim_candle(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 102, 101, 101.5) for i in range(6)]
+    values[1] = candle(1, 102, 100, 101)
+    values[3] = Candle(
+        open_time_ms=3 * 60_000, close_time_ms=3 * 60_000 + 59_999,
+        open=101.0, high=102.0, low=97.0, close=98.0,
+        volume=1, quote_volume=1, trades=10,
+    )
+    values[4] = Candle(
+        open_time_ms=4 * 60_000, close_time_ms=4 * 60_000 + 59_999,
+        open=95.0, high=100.1, low=94.5, close=99.9,
+        volume=1, quote_volume=1, trades=10,
+    )
+    values[5] = candle(5, 99.5, 98.5, 99.0)
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([], [(1, 100.0)]))
+    monkeypatch.setattr(structure, "atr", lambda *_args, **_kwargs: 1.0)
+
+    result = structure.breakout_and_retest(values, "SHORT", left=1, right=1, lookback=30)
+
+    assert result["confirmed"] is False
+
+
+def test_failed_breakout_cannot_use_the_latest_candle_as_both_break_and_rejection(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 99, 97, 98) for i in range(8)]
+    values[-1] = Candle(
+        open_time_ms=7 * 60_000, close_time_ms=7 * 60_000 + 59_999,
+        open=99.0, high=101.0, low=98.0, close=99.0,
+        volume=1, quote_volume=1, trades=10,
+    )
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([(2, 100.0)], []))
+
+    result = failed_breakout_rejection(values, left=1, right=1, lookback=30)
+
+    assert result["confirmed"] is False
+
+
+def test_breakout_retest_accepts_a_fresh_bullish_reaction_within_extension_limit(monkeypatch):
+    import screener.structure as structure
+
+    values = [candle(i, 99, 98, 98.5) for i in range(6)]
+    values[1] = candle(1, 100, 98, 99)
+    values[3] = Candle(
+        open_time_ms=3 * 60_000, close_time_ms=3 * 60_000 + 59_999,
+        open=99.0, high=102.0, low=98.5, close=101.5,
+        volume=1, quote_volume=1, trades=10,
+    )
+    values[4] = Candle(
+        open_time_ms=4 * 60_000, close_time_ms=4 * 60_000 + 59_999,
+        open=100.0, high=101.0, low=99.9, close=100.5,
+        volume=1, quote_volume=1, trades=10,
+    )
+    values[5] = candle(5, 102, 100.5, 101)
+    monkeypatch.setattr(structure, "confirmed_pivots", lambda *_args, **_kwargs: ([(1, 100.0)], []))
+    monkeypatch.setattr(structure, "atr", lambda *_args, **_kwargs: 1.0)
+
+    result = structure.breakout_and_retest(values, "LONG", left=1, right=1, lookback=30)
+
+    assert result["confirmed"] is True
+    assert result["retest_open_time_ms"] == values[4].open_time_ms
+    assert result["extension_atr"] == 1.0

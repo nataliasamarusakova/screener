@@ -912,7 +912,7 @@ def test_notification_outcome_marks_only_definite_transient_failures_retryable()
     }]) is False
 
 
-def test_chart_candidate_cap_prefers_scenario_completeness_before_open_interest(monkeypatch):
+def test_chart_candidate_cap_excludes_non_entry_statuses_and_keeps_real_chart_wait(monkeypatch):
     from types import SimpleNamespace
     import screener.service as service
 
@@ -929,6 +929,36 @@ def test_chart_candidate_cap_prefers_scenario_completeness_before_open_interest(
             oi_vol_ratio=0.5, vol_mktcap_ratio=0.1,
             futures_imbalance_4h=9, spot_imbalance_4h=9,
         ),
+        MarketRow(
+            symbol="MIDUSDT_PERP", name="MID", price=1, chg24_pct=1,
+            volume24_usd=100_000_000, oi_usd=80_000_000,
+            oi_vol_ratio=0.5, vol_mktcap_ratio=0.1,
+            futures_imbalance_4h=8, spot_imbalance_4h=8,
+        ),
+        MarketRow(
+            symbol="MIDTRUEUSDT_PERP", name="MIDTRUE", price=1, chg24_pct=1,
+            volume24_usd=100_000_000, oi_usd=35_000_000,
+            oi_vol_ratio=0.5, vol_mktcap_ratio=0.1,
+            futures_imbalance_4h=8, spot_imbalance_4h=8,
+        ),
+        MarketRow(
+            symbol="NEARUSDT_PERP", name="NEAR", price=1, chg24_pct=1,
+            volume24_usd=100_000_000, oi_usd=700_000_000,
+            oi_vol_ratio=0.5, vol_mktcap_ratio=0.1,
+            futures_imbalance_4h=7, spot_imbalance_4h=7,
+        ),
+        MarketRow(
+            symbol="FLAGUSDT_PERP", name="FLAG", price=1, chg24_pct=1,
+            volume24_usd=100_000_000, oi_usd=800_000_000,
+            oi_vol_ratio=0.5, vol_mktcap_ratio=0.1,
+            futures_imbalance_4h=6, spot_imbalance_4h=6,
+        ),
+        MarketRow(
+            symbol="BOUNCEUSDT_PERP", name="BOUNCE", price=1, chg24_pct=1,
+            volume24_usd=100_000_000, oi_usd=850_000_000,
+            oi_vol_ratio=0.5, vol_mktcap_ratio=0.1,
+            futures_imbalance_4h=5, spot_imbalance_4h=5,
+        ),
     ]
     enriched, stats = analyze_universe(markets, {"thresholds": {}})
 
@@ -939,30 +969,43 @@ def test_chart_candidate_cap_prefers_scenario_completeness_before_open_interest(
             return []
         def symbol_history_is_current(self, *_args, **_kwargs):
             return True
-        def spot_sequence_status(self, *_args, **_kwargs):
-            return {"ok": False}
+        def spot_sequence_status(self, symbol, *_args, **_kwargs):
+            return str(symbol).startswith("MIDTRUE")
 
     def fake_evaluate(row, *_args, **_kwargs):
-        if row.symbol.startswith("SMALL"):
-            checks = [Check("a", True, "yes", "rule") for _ in range(4)]
-            status = "CONFIRMED_SIGNAL"
+        checks = [Check("a", True, "yes", "rule") for _ in range(6)]
+        flags = []
+        if row.symbol.startswith("BIG"):
+            status = "PREPARATION"  # full prep checks are not an entry trigger
+        elif row.symbol.startswith("SMALL"):
+            status = "WAITING_FOR_1H_BREAKOUT_RETEST"  # all table checks pass
+        elif row.symbol.startswith("MIDTRUE"):
+            status = "WAITING_FOR_HISTORY_OR_HIGHER_LOW"  # Spot sequence is ready; only HL is missing
+        elif row.symbol.startswith("MID"):
+            status = "WAITING_FOR_HISTORY_OR_HIGHER_LOW"  # Spot sequence is not ready
+        elif row.symbol.startswith("NEAR"):
+            status = "NOT_MET"  # even 5/6 checks cannot be fixed by Binance candles
+            checks[-1] = Check("table condition", False, "no", "rule")
+        elif row.symbol.startswith("BOUNCE"):
+            status = "WAIT_BOUNCE"  # contextual observation, not a fresh entry
         else:
-            checks = [Check("a", True, "yes", "rule"), Check("b", False, "no", "rule")]
-            status = "PREPARATION"
+            status = "WAITING_FOR_1H_BREAKOUT_RETEST"
+            flags = ["quality flag"]
         return [ScenarioResult(
             symbol=row.symbol, name=row.market.name, scenario="LONG A", direction="LONG",
-            checks=checks, quality_flags=[], status=status,
+            checks=checks, quality_flags=flags, status=status,
+            technical={"spot_sequence_ok": row.symbol.startswith("MIDTRUE")},
         )]
 
     monkeypatch.setattr(service, "evaluate_scenarios", fake_evaluate)
     settings = SimpleNamespace(
-        p1={"scenario": {}, "scanner": {"max_chart_candidates": 1}},
+        p1={"scenario": {}, "scanner": {"max_chart_candidates": 2}},
         telegram_bot_token="", telegram_chat_ids=[],
     )
 
     selected = service._preliminary_candidate_symbols(enriched, stats, settings, FakeStore())
 
-    assert selected == {"SMALLUSDT_PERP"}
+    assert selected == {"SMALLUSDT_PERP", "MIDTRUEUSDT_PERP"}
 
 
 def test_unchanged_coinalyze_poll_still_allows_fresh_1h_entry_processing(tmp_path, monkeypatch):

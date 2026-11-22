@@ -227,7 +227,7 @@ def test_short_e_requires_non_overlapping_4h_snapshots_and_fresh_history():
     )
     enriched, stats = analyze_universe([market], {"thresholds": {}})
     base = datetime.now(timezone.utc) - timedelta(hours=7, minutes=48)
-    values = [(2, 3, 300_000, 700_000, -3), (1, 2, 500_000, 500_000, -1), (-4, -5, 400_000, 600_000, -1)]
+    values = [(2, 3, 300_000, 700_000, -3), (1, 2, 500_000, 500_000, -1), (1, 2, 400_000, 600_000, -1)]
 
     def history_at(hours):
         return [
@@ -250,6 +250,17 @@ def test_short_e_requires_non_overlapping_4h_snapshots_and_fresh_history():
         technical=tech, as_of=base + timedelta(hours=8),
     )
     assert next(item for item in independent_snapshots if item.scenario.startswith("SHORT E")).status == "CONFIRMED_SIGNAL"
+
+    stale_bearish_saved = history_at((0, 4.0, 8.0))
+    stale_bearish_saved[-1]["futures_imbalance_4h"] = -4
+    stale_bearish_saved[-1]["spot_imbalance_4h"] = -5
+    already_bearish = evaluate_scenarios(
+        enriched[0], stats, {"thresholds": {}}, history=stale_bearish_saved,
+        technical=tech, as_of=base + timedelta(hours=8),
+    )
+    already_bearish_short_e = next(item for item in already_bearish if item.scenario.startswith("SHORT E"))
+    assert already_bearish_short_e.status == "NOT_MET"
+    assert next(check for check in already_bearish_short_e.checks if check.name == "Latest saved F/S were not bearish").passed is False
 
     too_early = evaluate_scenarios(
         enriched[0], stats, {"thresholds": {}}, history=history_at((0, 3.8, 7.6)),
@@ -478,3 +489,77 @@ def test_empty_scenario_result_is_not_a_near_candidate():
         checks=[], quality_flags=[], status="NOT_MET",
     )
     assert result.near_candidate is False
+
+
+
+def test_tiny_liquidation_amount_cannot_create_cascade_or_long_d_signal():
+    from screener.scenarios import _is_cascade
+
+    row = MarketRow(
+        symbol="TINYUSDT_PERP", name="TINY", price=10, chg24_pct=-8,
+        market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=80_000_000,
+        oi_chg24_pct=-8, oi_chg24_usd=-6_400_000, oi_chg4h_pct=-2, oi_chg4h_usd=-1_600_000,
+        oi_vol_ratio=0.4, oi_mktcap_ratio=0.08, vol_mktcap_ratio=0.2,
+        fr_avg_pct=0.001, fr_oiw_pct=0.001, pfr_oiw_pct=0.001,
+        liq_total24_usd=500, liq_long24_usd=500, liq_short24_usd=0,
+        ls_ratio_1d=1.2, futures_imbalance_4h=10, spot_imbalance_4h=5,
+    )
+    enriched, stats = analyze_universe([row], {"thresholds": {}})
+
+    assert enriched[0].long_liq_share == 1.0
+    assert _is_cascade(enriched[0], {}) is False
+    long_d = next(
+        item for item in evaluate_scenarios(enriched[0], stats, {"thresholds": {}}, technical={"higher_low": {"confirmed": True}})
+        if item.scenario.startswith("LONG D")
+    )
+    materiality = next(check for check in long_d.checks if check.name == "Long liquidations material")
+    assert materiality.passed is False
+    assert long_d.status == "NOT_MET"
+
+
+def test_liquidation_materiality_uses_usd_or_open_interest_ratio():
+    from screener.scenarios import _liquidation_side_is_material
+
+    assert _liquidation_side_is_material(300_000, 80_000_000, {}) is False
+    assert _liquidation_side_is_material(300_000, 40_000_000, {}) is True
+    assert _liquidation_side_is_material(300_000, None, {}) is None
+
+
+def test_short_e_rejects_dominant_but_immaterial_short_liquidations():
+    from datetime import datetime, timedelta, timezone
+
+    row = MarketRow(
+        symbol="ALTUSDT_PERP", name="ALT", price=10, chg24_pct=-2,
+        market_cap_usd=1_000_000_000, volume24_usd=200_000_000, oi_usd=80_000_000,
+        oi_chg24_pct=-1, oi_chg24_usd=-800_000, oi_chg4h_pct=-0.2, oi_chg4h_usd=-160_000,
+        oi_vol_ratio=0.4, oi_mktcap_ratio=0.08, vol_mktcap_ratio=0.2,
+        fr_avg_pct=0.001, fr_oiw_pct=0.001, pfr_oiw_pct=0.001,
+        liq_total24_usd=300, liq_long24_usd=100, liq_short24_usd=200,
+        ls_ratio_1d=1.5, futures_imbalance_4h=-4, spot_imbalance_4h=-5,
+    )
+    enriched, stats = analyze_universe([row], {"thresholds": {}})
+    base = datetime.now(timezone.utc) - timedelta(hours=8)
+    history = [
+        {
+            "snapshot_at": (base + timedelta(hours=4 * index)).isoformat(),
+            "futures_imbalance_4h": flow_f,
+            "spot_imbalance_4h": flow_s,
+            "liq_long24_usd": long_liqs,
+            "liq_short24_usd": short_liqs,
+            "oi_chg24_pct": -1,
+            "oi_usd": 80_000_000,
+        }
+        for index, (flow_f, flow_s, long_liqs, short_liqs) in enumerate(
+            ((2, 3, 100, 200), (1, 2, 100, 200), (1, 2, 100, 200))
+        )
+    ]
+    result = evaluate_scenarios(
+        enriched[0], stats, {"thresholds": {}}, history=history,
+        technical={"failed_breakout_rejection": {"confirmed": True}},
+        as_of=base + timedelta(hours=8),
+    )
+    short_e = next(item for item in result if item.scenario.startswith("SHORT E"))
+
+    assert next(check for check in short_e.checks if check.name == "Earlier short liquidations dominated").passed is True
+    assert next(check for check in short_e.checks if check.name == "Earlier short liquidations material").passed is False
+    assert short_e.status == "NOT_MET"
