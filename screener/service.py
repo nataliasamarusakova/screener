@@ -94,6 +94,7 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
     lookback = int(structure_cfg.get("pivot_lookback_bars", 60))
     retest_lookback = int(structure_cfg.get("retest_lookback_bars", 8))
     atr_tolerance = float(structure_cfg.get("retest_atr_tolerance", 0.25))
+    retest_max_extension_atr = float(structure_cfg.get("retest_max_extension_atr", 2.0))
 
     result: dict[str, Any] = {}
     try:
@@ -121,14 +122,18 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
         result["higher_low"] = higher_low(
             candles1h, left, right, lookback,
             max_age_bars=int(structure_cfg.get("higher_low_max_age_bars", 24)),
+            min_rise_atr=float(structure_cfg.get("higher_low_min_rise_atr", 0.25)),
+            max_extension_atr=float(structure_cfg.get("higher_low_max_extension_atr", 2.0)),
         )
         result["trend_retest_long"] = breakout_and_retest(
             candles1h, "LONG", left=left, right=right, lookback=lookback,
             retest_lookback=retest_lookback, atr_tolerance=atr_tolerance,
+            max_extension_atr=retest_max_extension_atr,
         )
         result["trend_retest_short"] = breakout_and_retest(
             candles1h, "SHORT", left=left, right=right, lookback=lookback,
             retest_lookback=retest_lookback, atr_tolerance=atr_tolerance,
+            max_extension_atr=retest_max_extension_atr,
         )
         short_retest = result["trend_retest_short"]
         short_reference_level = (
@@ -243,7 +248,18 @@ def _preliminary_candidate_symbols(
     # Active alerts remain chart candidates even when a coin disappears from
     # the current Coinalyze universe. Absence from that table is not cancellation.
     symbols.update(active_symbols)
-    candidate_priority: dict[str, tuple[int, float, int, float]] = {}
+    # Only fetch charts when every non-chart P1 condition has passed and a
+    # specific 1H confirmation can still change the outcome. Preparation and
+    # wait-for-bounce states are context, not entry candidates.
+    chart_wait_statuses = {
+        "WAITING_FOR_1H_BREAKOUT_RETEST",
+        "WAITING_FOR_HIGHER_LOW",
+        "WAITING_FOR_HISTORY_OR_HIGHER_LOW",
+        "WAITING_FOR_1H_BREAKDOWN_RETEST",
+        "WAITING_FOR_1H_STRUCTURE_BREAK",
+        "WAITING_FOR_1H_FAILED_BREAKOUT",
+    }
+    candidate_priority: dict[str, tuple[float, float]] = {}
     for row in enriched:
         history = store.recent_symbol_history(row.symbol, limit=100, contract_type=contract_type)
         if contract_type and not store.symbol_history_is_current(row.symbol, contract_type=contract_type):
@@ -262,22 +278,27 @@ def _preliminary_candidate_symbols(
             history=history,
             as_of=as_of,
         )
-        qualifying = [r for r in draft if r.near_candidate or r.status in {"PREPARATION", "WAIT_BOUNCE"}]
+        qualifying = [
+            result for result in draft
+            if not result.quality_flags
+            and result.status in chart_wait_statuses
+            and (
+                result.status != "WAITING_FOR_HISTORY_OR_HIGHER_LOW"
+                or result.technical.get("spot_sequence_ok") is True
+            )
+        ]
         if qualifying:
             symbols.add(row.symbol)
-            best = max(
-                qualifying,
-                key=lambda result: (
-                    int(result.complete),
-                    result.passed_count / result.total_count if result.total_count else 0.0,
-                    result.passed_count,
-                ),
-            )
-            candidate_priority[row.symbol] = (
-                int(best.complete),
-                best.passed_count / best.total_count if best.total_count else 0.0,
-                best.passed_count,
+            # All admitted states have already passed their non-chart checks.
+            # Prefer directly observable 24H turnover, then OI; do not rank by
+            # check-count because every admitted state has only chart work left.
+            liquidity_rank = (
+                float(row.market.volume24_usd or 0.0),
                 float(row.market.oi_usd or 0.0),
+            )
+            candidate_priority[row.symbol] = max(
+                candidate_priority.get(row.symbol, (0.0, 0.0)),
+                liquidity_rank,
             )
     max_candidates = int(settings.p1.get("scanner", {}).get("max_chart_candidates", 40))
     if len(symbols) > max_candidates:
@@ -288,7 +309,7 @@ def _preliminary_candidate_symbols(
         room = max(0, max_candidates - len(active_present))
         selected = set(sorted(
             remaining,
-            key=lambda symbol: candidate_priority.get(symbol, (0, 0.0, 0, 0.0)),
+            key=lambda symbol: candidate_priority.get(symbol, (0.0, 0.0)),
             reverse=True,
         )[:room])
         symbols = active_present | selected

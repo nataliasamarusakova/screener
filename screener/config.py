@@ -29,6 +29,10 @@ DEFAULT_P1_CONFIG: dict[str, Any] = {
         "quality_vol_mktcap_max": 2.0,
         "quality_oi_vol_min": 0.1,
         "quality_oi_min_usd": 40_000_000.0,
+        # Initial guardrails, not statistically calibrated thresholds. Require
+        # either meaningful USD size or a material share of open interest.
+        "liquidation_min_side_usd": 500_000.0,
+        "liquidation_min_side_oi_ratio": 0.005,
         # Guardrail only: do not treat liquidation coverage as causal on tiny OI changes.
         "oi_24h_min_drop_usd_for_liq_coverage": 1_000_000.0,
         "oi_24h_min_drop_pct_for_short_d": -1.0,
@@ -46,8 +50,13 @@ DEFAULT_P1_CONFIG: dict[str, Any] = {
         "pivot_lookback_bars": 60,
         # A higher-low trigger must use a swing formed within the last 24 closed 1H bars.
         "higher_low_max_age_bars": 24,
+        # Initial ATR guardrails from the audit; verify against forward results
+        # before tightening or relaxing these defaults.
+        "higher_low_min_rise_atr": 0.25,
+        "higher_low_max_extension_atr": 2.0,
         "retest_lookback_bars": 8,
         "retest_atr_tolerance": 0.25,
+        "retest_max_extension_atr": 2.0,
         "weak_rejection_wick_body_ratio": 0.75,
         "weak_rejection_atr_tolerance": 0.5,
         # A failed breakout is a short-lived event, not a level that can remain

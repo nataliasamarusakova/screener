@@ -18,6 +18,25 @@ def atr(candles: list[Candle], period: int = 14) -> float | None:
     return sum(sample) / len(sample) if sample else None
 
 
+def _close_position(candle: Candle) -> float | None:
+    candle_range = candle.high - candle.low
+    if not math.isfinite(candle_range) or candle_range <= 0:
+        return None
+    return (candle.close - candle.low) / candle_range
+
+
+def _has_unbroken_higher_pivot(
+    candles: list[Candle], pivots: list[tuple[int, float]], pivot_idx: int, level: float
+) -> bool:
+    """Return True when a newer, higher swing high still caps the market."""
+    for later_idx, later_level in pivots:
+        if later_idx <= pivot_idx or later_level <= level:
+            continue
+        if not any(candle.close > later_level for candle in candles[later_idx + 1:]):
+            return True
+    return False
+
+
 def confirmed_pivots(
     candles: list[Candle], left: int = 2, right: int = 2, lookback: int = 60
 ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
@@ -45,7 +64,8 @@ def confirmed_pivots(
 
 def higher_low(
     candles: list[Candle], left: int = 2, right: int = 2, lookback: int = 60,
-    *, max_age_bars: int = 24,
+    *, max_age_bars: int = 24, min_rise_atr: float = 0.25,
+    max_extension_atr: float = 2.0,
 ) -> dict[str, Any]:
     """Confirm a higher low only while its latest pivot remains recent and unbroken.
 
@@ -55,21 +75,66 @@ def higher_low(
     """
     if isinstance(max_age_bars, bool) or not isinstance(max_age_bars, int) or max_age_bars < 1:
         raise ValueError("max_age_bars must be a positive integer")
+    if not math.isfinite(float(min_rise_atr)) or min_rise_atr < 0:
+        raise ValueError("min_rise_atr must be a finite non-negative number")
+    if not math.isfinite(float(max_extension_atr)) or max_extension_atr <= 0:
+        raise ValueError("max_extension_atr must be a finite positive number")
     _, lows = confirmed_pivots(candles, left, right, lookback)
     if len(lows) < 2:
         return {"confirmed": False, "reason": "Need at least two confirmed 1H swing lows", "pivot_lows": [x[1] for x in lows]}
     previous, latest = lows[-2], lows[-1]
-    later_closes = [candle.close for candle in candles[latest[0] + 1:]]
-    invalidated = any(close < latest[1] for close in later_closes)
+    later_candles = candles[latest[0] + 1:]
+    invalidated = any(candle.low < latest[1] for candle in later_candles)
     age_bars = len(candles) - 1 - latest[0]
     stale = age_bars > max_age_bars
-    confirmed = latest[1] > previous[1] and not invalidated and not stale
     if invalidated:
-        reason = "Latest confirmed swing low was invalidated by a later 1H close"
-    elif stale:
-        reason = f"Latest confirmed swing low is stale ({age_bars} bars; maximum {max_age_bars})"
+        return {
+            "confirmed": False,
+            "reason": "Latest confirmed swing low was invalidated by a later 1H wick below the pivot",
+            "previous_low": previous[1],
+            "latest_low": latest[1],
+            "age_bars": age_bars,
+            "max_age_bars": max_age_bars,
+        }
+    if stale:
+        return {
+            "confirmed": False,
+            "reason": f"Latest confirmed swing low is stale ({age_bars} bars; maximum {max_age_bars})",
+            "previous_low": previous[1],
+            "latest_low": latest[1],
+            "age_bars": age_bars,
+            "max_age_bars": max_age_bars,
+        }
+    volatility = atr(candles)
+    if volatility is None or not math.isfinite(volatility) or volatility <= 0:
+        return {
+            "confirmed": False,
+            "reason": "Insufficient/invalid candles to assess higher-low size and extension",
+            "previous_low": previous[1],
+            "latest_low": latest[1],
+            "age_bars": age_bars,
+            "max_age_bars": max_age_bars,
+        }
+    rise = latest[1] - previous[1]
+    minimum_rise = volatility * min_rise_atr
+    extension = candles[-1].close - latest[1]
+    extension_atr = extension / volatility
+    close_position = _close_position(candles[-1])
+    current_reaction = (
+        candles[-1].close > candles[-1].open
+        or (close_position is not None and close_position >= 0.5)
+    )
+    materially_higher = rise >= minimum_rise
+    not_extended = 0 <= extension_atr <= max_extension_atr
+    confirmed = materially_higher and not_extended and current_reaction
+    if not materially_higher:
+        reason = f"Higher low is too small ({rise:.6g}; minimum {minimum_rise:.6g}, {min_rise_atr:g} ATR)"
+    elif not not_extended:
+        reason = f"Price is too extended from the higher-low invalidation ({extension_atr:.2f} ATR; maximum {max_extension_atr:g})"
+    elif not current_reaction:
+        reason = "Latest closed 1H candle has not shown a bullish reaction from the higher low"
     elif confirmed:
-        reason = "Latest confirmed swing low is higher, recent and remains unbroken"
+        reason = "Latest confirmed swing low is materially higher, recent, wick-unbroken and not overextended"
     else:
         reason = "Latest confirmed swing low is not higher"
     return {
@@ -86,6 +151,12 @@ def higher_low(
         "confirmation_close_time_ms": candles[latest[0] + right].close_time_ms,
         "age_bars": age_bars,
         "max_age_bars": max_age_bars,
+        "rise": rise,
+        "minimum_rise": minimum_rise,
+        "atr14": volatility,
+        "extension_atr": extension_atr,
+        "max_extension_atr": max_extension_atr,
+        "current_reaction": current_reaction,
     }
 
 
@@ -98,6 +169,7 @@ def breakout_and_retest(
     lookback: int = 60,
     retest_lookback: int = 8,
     atr_tolerance: float = 0.25,
+    max_extension_atr: float = 2.0,
 ) -> dict[str, Any]:
     """Confirm a recent breakout, then a retest that has not been invalidated.
 
@@ -123,6 +195,8 @@ def breakout_and_retest(
             "invalidation_rule": "LONG: 1H close below level" if side == "LONG" else "SHORT: 1H close above level",
         }
 
+    if not math.isfinite(float(max_extension_atr)) or max_extension_atr <= 0:
+        return {"confirmed": False, "reason": "Invalid maximum retest extension ATR setting"}
     tolerance = volatility * max(0.0, float(atr_tolerance))
     last_index = len(candles) - 1
     safe_retest_lookback = max(1, int(retest_lookback))
@@ -135,13 +209,20 @@ def breakout_and_retest(
         return close < level if side == "LONG" else close > level
 
     def retest_holds(candle: Candle, level: float) -> bool:
+        close_position = _close_position(candle)
+        if close_position is None:
+            return False
         if side == "LONG":
             touched = candle.low <= level + tolerance and candle.low >= level - 2 * tolerance
-            return touched and candle.close > level
+            reaction = candle.close > candle.open or close_position >= 0.5
+            return touched and candle.close > level and reaction
         touched = candle.high >= level - tolerance and candle.high <= level + 2 * tolerance
-        return touched and candle.close < level
+        reaction = candle.close < candle.open or close_position <= 0.5
+        return touched and candle.close < level and reaction
 
     for pivot_idx, level in reversed(pivots):
+        if side == "LONG" and _has_unbroken_higher_pivot(candles, highs, pivot_idx, level):
+            continue
         state = "WAIT_BREAKOUT"
         breakout_idx: int | None = None
         retest_idx: int | None = None
@@ -195,9 +276,15 @@ def breakout_and_retest(
 
         if state == "VALID_RETEST" and retest_idx is not None and retest_idx >= earliest_retest:
             assert breakout_idx is not None
+            extension_atr = (
+                (candles[-1].close - level) / volatility
+                if side == "LONG" else (level - candles[-1].close) / volatility
+            )
+            if extension_atr < 0 or extension_atr > max_extension_atr:
+                continue
             return {
                 "confirmed": True,
-                "reason": "Closed 1H breakout followed by a retest with no subsequent invalidating close",
+                "reason": "Closed 1H breakout and directionally valid retest remain fresh and within the ATR extension limit",
                 "side": side,
                 "level": level,
                 "pivot_open_time_ms": candles[pivot_idx].open_time_ms,
@@ -206,6 +293,8 @@ def breakout_and_retest(
                 "breakout_open_time_ms": candles[breakout_idx].open_time_ms,
                 "retest_open_time_ms": candles[retest_idx].open_time_ms,
                 "last_close": candles[-1].close,
+                "extension_atr": extension_atr,
+                "max_extension_atr": max_extension_atr,
             }
 
     return {
@@ -402,11 +491,15 @@ def failed_breakout_rejection(
         return {"confirmed": False, "reason": "No confirmed 1H swing high or insufficient candles"}
     last = candles[-1]
     max_age_bars = max(1, int(max_age_bars))
-    first_recent_index = max(1, len(candles) - max_age_bars)
-    for _pivot_idx, level in reversed(highs):
+    first_recent_index = max(1, len(candles) - 1 - max_age_bars)
+    for pivot_idx, level in reversed(highs):
+        if _has_unbroken_higher_pivot(candles, highs, pivot_idx, level):
+            continue
         breakout_indices = [
-            index for index in range(first_recent_index, len(candles))
-            if candles[index - 1].close <= level and candles[index].high > level
+            index for index in range(first_recent_index, len(candles) - 1)
+            if candles[index - 1].close <= level
+            and candles[index].high > level
+            and candles[index].close > level
         ]
         if not breakout_indices:
             continue
@@ -414,7 +507,21 @@ def failed_breakout_rejection(
         accepted_above_until_rejection = all(
             candle.close >= level for candle in candles[breakout_idx:-1]
         )
-        if last.high > level and last.close < level and accepted_above_until_rejection:
+        close_position = _close_position(last)
+        body = abs(last.close - last.open)
+        upper_wick = last.high - max(last.open, last.close)
+        rejection_shape = (
+            last.close < last.open
+            and close_position is not None
+            and (close_position <= 0.5 or upper_wick >= 0.5 * body)
+        )
+        if (
+            breakout_idx < len(candles) - 1
+            and last.high > level
+            and last.close < level
+            and accepted_above_until_rejection
+            and rejection_shape
+        ):
             return {
                 "confirmed": True,
                 "reason": "Fresh 1H break above a prior swing high was rejected back below it",

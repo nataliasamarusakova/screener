@@ -128,7 +128,37 @@ def _result(row: EnrichedRow, scenario: str, direction: str, checks: list[Check]
     )
 
 
-def _is_cascade(row: EnrichedRow) -> bool | None:
+def _liquidation_side_is_material(
+    side_liquidations_usd: float | None,
+    oi_usd: float | None,
+    thresholds: dict[str, Any] | None = None,
+) -> bool | None:
+    """Require a liquidation side to matter in USD terms or relative to OI."""
+    thresholds = thresholds or {}
+    min_usd = max(0.0, float(thresholds.get("liquidation_min_side_usd", 500_000.0)))
+    min_oi_ratio = max(0.0, float(thresholds.get("liquidation_min_side_oi_ratio", 0.005)))
+    if side_liquidations_usd is None:
+        return None
+    try:
+        amount = float(side_liquidations_usd)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(amount) or amount < 0:
+        return None
+    if amount >= min_usd:
+        return True
+    if oi_usd is None:
+        return None
+    try:
+        open_interest = float(oi_usd)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(open_interest) or open_interest <= 0:
+        return None
+    return amount / open_interest >= min_oi_ratio
+
+
+def _is_cascade(row: EnrichedRow, thresholds: dict[str, Any] | None = None) -> bool | None:
     """Conservative SHORT prohibition for a possible long-liquidation flush.
 
     The global P1 prohibition is broader than the explicit SHORT D signature:
@@ -150,6 +180,7 @@ def _is_cascade(row: EnrichedRow) -> bool | None:
     # already disproves the cascade regardless of other missing fields.
     known_predicates = (
         (row.long_liq_share, lambda value: value >= 0.80),
+        (_liquidation_side_is_material(m.liq_long24_usd, m.oi_usd, thresholds), lambda value: value >= 1.0),
         (m.oi_chg24_pct, lambda value: value < 0),
         (m.oi_chg4h_pct, lambda value: value < 0),
     )
@@ -279,6 +310,12 @@ def evaluate_scenarios(
         _check("Price 24H", _le(m.chg24_pct, -4.0), f"{m.chg24_pct}%", "<= -4%"),
         _check("Spot positive", _gt(m.spot_imbalance_4h), str(m.spot_imbalance_4h), "> 0"),
         _check("F not below universe median", None if m.futures_imbalance_4h is None or stats.median_f is None else m.futures_imbalance_4h >= stats.median_f, f"{m.futures_imbalance_4h} vs median {stats.median_f}", "F >= median F"),
+        _check(
+            "Long liquidations material",
+            _liquidation_side_is_material(m.liq_long24_usd, m.oi_usd, t),
+            f"${m.liq_long24_usd:,.0f}" if m.liq_long24_usd is not None else "n/a",
+            f">= ${float(t.get('liquidation_min_side_usd', 500_000.0)):,.0f} or >= {float(t.get('liquidation_min_side_oi_ratio', 0.005)):.3%} of OI",
+        ),
     ]
     if all(c.passed is True for c in checks):
         if not no_flags:
@@ -295,7 +332,7 @@ def evaluate_scenarios(
     flow_ok = None
     if m.futures_imbalance_4h is not None and m.spot_imbalance_4h is not None:
         flow_ok = bool(m.futures_imbalance_4h < 0 and m.spot_imbalance_4h < 0 and (row.f_strong_sell or row.s_strong_sell))
-    cascade = _is_cascade(row)
+    cascade = _is_cascade(row, t)
     checks = [
         _check("F/S negative; at least one strong", flow_ok, f"F={m.futures_imbalance_4h}; S={m.spot_imbalance_4h}; strong_F={row.f_strong_sell}; strong_S={row.s_strong_sell}", "F<0 and S<0 and (F or S in bottom 15%)"),
         _check("OI 4H growth", _ge(m.oi_chg4h_pct, oi_min), f"{m.oi_chg4h_pct}% (threshold +{oi_min}%)", f">={oi_min}%"),
@@ -379,12 +416,18 @@ def evaluate_scenarios(
         _check("F negative", _lt(m.futures_imbalance_4h), str(m.futures_imbalance_4h), "< 0"),
         _check("S negative", _lt(m.spot_imbalance_4h), str(m.spot_imbalance_4h), "< 0"),
         _check("OI 24H decline material", material_oi_decline, f"{m.oi_chg24_pct}% / {m.oi_chg24_usd} USD", f"<= {min_oi_drop_pct:g}% or <= -${min_oi_drop_usd:,.0f}"),
+        _check(
+            "Long liquidations material",
+            _liquidation_side_is_material(m.liq_long24_usd, m.oi_usd, t),
+            f"${m.liq_long24_usd:,.0f}" if m.liq_long24_usd is not None else "n/a",
+            f">= ${float(t.get('liquidation_min_side_usd', 500_000.0)):,.0f} or >= {float(t.get('liquidation_min_side_oi_ratio', 0.005)):.3%} of OI",
+        ),
         _check("Quality flags", no_flags, ", ".join(row.quality_flags) or "none", "none"),
     ]
     core_pattern = all(c.passed is True for c in checks[:5])
-    core_pressure = core_pattern and checks[5].passed is True
-    if core_pattern and checks[5].passed is not True:
-        status, reason = "BLOCKED_CAUSALITY", "OI 24H decline is below the configured materiality floor"
+    core_pressure = core_pattern and checks[5].passed is True and checks[6].passed is True
+    if core_pattern and (checks[5].passed is not True or checks[6].passed is not True):
+        status, reason = "BLOCKED_CAUSALITY", "OI 24H decline or long-liquidation amount is below its configured materiality floor"
     elif core_pressure and not no_flags:
         status, reason = "BLOCKED_QUALITY", "Cascade pattern present but quality flags exclude this market"
     elif all(c.passed is True for c in checks):
@@ -436,16 +479,46 @@ def evaluate_scenarios(
     initial_short_dominant = None
     initial_oi_falling = None
     prior_flow_not_down = None
+    latest_saved_flow_not_down = None
+    initial_short_liqs_material = None
+    short_liqs_value: float | None = None
     if initial:
         long_liqs = initial.get("liq_long24_usd")
         short_liqs = initial.get("liq_short24_usd")
-        initial_short_dominant = short_liqs > long_liqs if short_liqs is not None and long_liqs is not None else None
+        try:
+            long_liqs_value = float(long_liqs) if long_liqs is not None else None
+            short_liqs_value = float(short_liqs) if short_liqs is not None else None
+            if (
+                long_liqs_value is not None and short_liqs_value is not None
+                and math.isfinite(long_liqs_value) and math.isfinite(short_liqs_value)
+                and long_liqs_value >= 0 and short_liqs_value >= 0
+            ):
+                initial_short_dominant = short_liqs_value > long_liqs_value
+        except (TypeError, ValueError):
+            initial_short_dominant = None
+        initial_short_liqs_material = _liquidation_side_is_material(
+            short_liqs_value,
+            initial.get("oi_usd"),
+            t,
+        )
         oi24 = initial.get("oi_chg24_pct")
         initial_oi_falling = oi24 < 0 if oi24 is not None else None
+    def saved_flow_not_down(item: dict[str, Any] | None) -> bool | None:
+        if item is None or item.get("futures_imbalance_4h") is None or item.get("spot_imbalance_4h") is None:
+            return None
+        try:
+            futures = float(item["futures_imbalance_4h"])
+            spot = float(item["spot_imbalance_4h"])
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(futures) or not math.isfinite(spot):
+            return None
+        return futures >= 0 and spot >= 0
+
     if previous:
-        prev_f = previous.get("futures_imbalance_4h")
-        prev_s = previous.get("spot_imbalance_4h")
-        prior_flow_not_down = (prev_f >= 0 and prev_s >= 0) if prev_f is not None and prev_s is not None else None
+        prior_flow_not_down = saved_flow_not_down(previous)
+    if history_ready:
+        latest_saved_flow_not_down = saved_flow_not_down(latest_three[2])
     failed_breakout = technical.get("failed_breakout_rejection", {}).get("confirmed")
     live_flow_down = (
         None if m.futures_imbalance_4h is None or m.spot_imbalance_4h is None
@@ -454,19 +527,34 @@ def evaluate_scenarios(
     # The historical snapshots establish that flow was not already bearish.
     # The live Coinalyze poll confirms the turn; waiting for another 4H archive
     # snapshot would delay a valid SHORT E by up to one full sampling interval.
-    flow_turned_down = None if prior_flow_not_down is None or live_flow_down is None else (prior_flow_not_down and live_flow_down)
     checks = [
         _check("Three fresh comparable 4H snapshots available", history_ready, f"latest 3 spacing valid={spacing_ok}; latest fresh={fresh_latest}", "three consecutive observations spaced 4h..4h + late-poll tolerance; latest age <= interval + tolerance"),
         _check("Earlier short liquidations dominated", initial_short_dominant, str(initial_short_dominant), "Snapshot t−2: Short Liqs > Long Liqs"),
+        _check(
+            "Earlier short liquidations material",
+            initial_short_liqs_material,
+            f"${short_liqs_value:,.0f}" if short_liqs_value is not None else "n/a",
+            f">= ${float(t.get('liquidation_min_side_usd', 500_000.0)):,.0f} or >= {float(t.get('liquidation_min_side_oi_ratio', 0.005)):.3%} of OI",
+        ),
         _check("Earlier OI was falling", initial_oi_falling, str(initial_oi_falling), "Snapshot t−2: OI Chg 24H < 0"),
-        _check("F/S turned down", flow_turned_down, f"snapshot t−1 F/S not both negative={prior_flow_not_down}; live F={m.futures_imbalance_4h}; S={m.spot_imbalance_4h}", "Saved snapshot t−1: F/S >= 0; current live Coinalyze poll: F<0 and S<0"),
-        _check("Current F/S remain down", live_flow_down, f"current F={m.futures_imbalance_4h}; S={m.spot_imbalance_4h}", "Current Coinalyze poll must still have F<0 and S<0"),
+        _check("Earlier saved F/S were not bearish", prior_flow_not_down, str(prior_flow_not_down), "Snapshot t−1: F>=0 and S>=0"),
+        _check("Latest saved F/S were not bearish", latest_saved_flow_not_down, str(latest_saved_flow_not_down), "Latest saved snapshot t0: F>=0 and S>=0"),
+        _check("Live F/S turned bearish", live_flow_down, f"current F={m.futures_imbalance_4h}; S={m.spot_imbalance_4h}", "Current live Coinalyze poll: F<0 and S<0"),
         _check("Breakout failed on 1H", failed_breakout, str(failed_breakout), "Recent high above swing high; latest 1H close back below"),
         _check("No liquidation-cascade prohibition", None if cascade is None else not cascade, str(cascade), "SHORT forbidden during active long-liquidation cascade"),
         _check("Quality flags", no_flags, ", ".join(row.quality_flags) or "none", "none"),
     ]
-    status = "CONFIRMED_SIGNAL" if all(c.passed is True for c in checks) and no_flags else "NOT_MET"
-    reason = "Three-snapshot history and 1H failed-breakout predicates align" if status == "CONFIRMED_SIGNAL" else "Requires three distinct snapshots, earlier short liquidation/OI decline, F/S turn-down and 1H failed-breakout structure"
+    non_chart_checks_pass = all(
+        check.passed is True for check in checks if check.name != "Breakout failed on 1H"
+    )
+    if non_chart_checks_pass and failed_breakout is True and no_flags:
+        status, reason = "CONFIRMED_SIGNAL", "Three distinct snapshots, material short liquidations, non-bearish saved flow and 1H failed-breakout structure align"
+    elif non_chart_checks_pass and not no_flags:
+        status, reason = "BLOCKED_QUALITY", "Short-squeeze history aligns, but quality flags block the setup"
+    elif non_chart_checks_pass:
+        status, reason = "WAITING_FOR_1H_FAILED_BREAKOUT", "History and live-flow predicates pass; a fresh 1H failed-breakout confirmation is still required"
+    else:
+        status, reason = "NOT_MET", "Requires three distinct snapshots, material short liquidations, earlier non-bearish flow, a live F/S turn-down and 1H failed-breakout structure"
     out.append(_result(row, "SHORT E — Failed Short Squeeze", "SHORT", checks, status, reason, {"failed_breakout_rejection": technical.get("failed_breakout_rejection")}))
 
     return out
