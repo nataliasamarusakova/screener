@@ -125,7 +125,7 @@ def _confirmation_anchor(result: ScenarioResult) -> int | None:
         "LONG D": ("higher_low", "confirmation_close_time_ms"),
         "SHORT A": ("trend_retest_short", "retest_open_time_ms"),
         "SHORT B": ("trend_retest_short", "retest_open_time_ms"),
-        "SHORT C": ("bearish_structure_break", "break_open_time_ms"),
+        "SHORT C": ("trend_retest_short", "retest_open_time_ms"),
         "SHORT D": ("weak_bounce_rejection", "rejection_open_time_ms"),
         "SHORT E": ("failed_breakout_rejection", "failure_open_time_ms"),
     }.get(code)
@@ -172,7 +172,7 @@ def _signal_warnings(result: ScenarioResult, row: EnrichedRow, technical: dict[s
             warnings.append("Цена растёт при падающем OI 24H: движение может быть закрытием SHORT")
     if m.btc_corr7d is not None and m.btc_corr7d > 0.7 and _base_symbol(result.symbol) != "BTC":
         warnings.append(f"BTC Corr. 7D {_number(m.btc_corr7d, 2, signed=True)} — высокая связь с BTC")
-    return list(dict.fromkeys(warnings))[:2]
+    return list(dict.fromkeys(warnings))
 
 
 def _trigger_timestamp(result: ScenarioResult) -> str:

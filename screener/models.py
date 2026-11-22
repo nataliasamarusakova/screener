@@ -94,7 +94,7 @@ class ScenarioResult:
 
     @property
     def near_candidate(self) -> bool:
-        if self.status.startswith("BLOCKED_") or self.total_count <= 0:
+        if self.status.startswith("BLOCKED_") or self.quality_flags or self.total_count <= 0:
             return False
         return self.passed_count >= max(0, self.total_count - 1)
 

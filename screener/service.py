@@ -401,7 +401,7 @@ def _confirmation_anchor(result: ScenarioResult) -> int | None:
         "LONG D": ("higher_low", "confirmation_close_time_ms"),
         "SHORT A": ("trend_retest_short", "retest_open_time_ms"),
         "SHORT B": ("trend_retest_short", "retest_open_time_ms"),
-        "SHORT C": ("bearish_structure_break", "break_open_time_ms"),
+        "SHORT C": ("trend_retest_short", "retest_open_time_ms"),
         "SHORT D": ("weak_bounce_rejection", "rejection_open_time_ms"),
         "SHORT E": ("failed_breakout_rejection", "failure_open_time_ms"),
     }.get(code)
@@ -409,6 +409,35 @@ def _confirmation_anchor(result: ScenarioResult) -> int | None:
         return None
     value = (technical.get(fields[0]) or {}).get(fields[1])
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _reversal_new_state_needs_recovery(
+    latest_state: dict[str, Any] | None,
+    new_event_key: str,
+    marker_sent_at: str,
+) -> bool:
+    """Recover a reversal's new ACTIVE row only when its group state predates the marker.
+
+    A missing row means the process may have crashed between persisting the
+    Telegram reversal marker and the per-scenario lifecycle state. An older
+    row in the same group belongs to an earlier setup and must not mask that
+    partial write. A matching event key or a state at/after the marker is a
+    later lifecycle and must never be resurrected.
+    """
+    if latest_state is None:
+        return True
+    if str(latest_state.get("event_key") or "") == str(new_event_key):
+        return False
+    try:
+        previous_at = datetime.fromisoformat(str(latest_state["sent_at"]))
+        marker_at = datetime.fromisoformat(str(marker_sent_at))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if previous_at.tzinfo is None:
+        previous_at = previous_at.replace(tzinfo=timezone.utc)
+    if marker_at.tzinfo is None:
+        marker_at = marker_at.replace(tzinfo=timezone.utc)
+    return previous_at < marker_at
 
 
 def _confirmation_time(result: ScenarioResult) -> int | None:
@@ -717,9 +746,9 @@ def _collect_notifications(
             latest_new = store.latest_notification_state(
                 new_group, recipient_key=recipient_key, contract_type=contract_type
             )
-            # Only a missing new-state record is a partial-write recovery case.
-            # Never resurrect a setup whose later lifecycle was CANCELLED/REVERSED.
-            if latest_new is None:
+            # A missing row or an older lifecycle from a previous setup is a
+            # partial-write recovery case. Never resurrect a state at/after marker.
+            if _reversal_new_state_needs_recovery(latest_new, new_event_key, marker_sent_at):
                 marker_status = str((marker or {}).get("delivery_status") or "UNKNOWN").upper()
                 if marker_status not in {"SENT", "UNKNOWN"}:
                     marker_status = "UNKNOWN"
@@ -878,7 +907,10 @@ def _collect_notifications(
                     contract_type=marker_contract, delivery_status=marker_status,
                 )
 
-        if latest_new is None and marker_level is not None:
+        if (
+            _reversal_new_state_needs_recovery(latest_new, new_event_key, marker_sent_at)
+            and marker_level is not None
+        ):
             store.record_notification(
                 new_event_key, marker.get("telegram_message_id"),
                 recipient_key=recipient_key, event_group=new_group,

@@ -1041,7 +1041,26 @@ class Store:
                 str(item.get("recipient_key") or ""),
                 str(item.get("contract_type") or "").upper(),
             )
-            if state_key not in latest_state:
+            latest_new = latest_state.get(state_key)
+            if latest_new is None:
+                protected_ids.add(id(item))
+                continue
+            new_event_key = parts[4]
+            if str(latest_new.get("event_key") or "") == new_event_key:
+                continue
+            try:
+                previous_at = datetime.fromisoformat(str(latest_new["sent_at"]))
+                marker_at = datetime.fromisoformat(str(item["sent_at"]))
+                if previous_at.tzinfo is None:
+                    previous_at = previous_at.replace(tzinfo=timezone.utc)
+                if marker_at.tzinfo is None:
+                    marker_at = marker_at.replace(tzinfo=timezone.utc)
+            except (KeyError, TypeError, ValueError):
+                # If ordering cannot be established, retain the journal marker;
+                # pruning must not destroy the only possible recovery record.
+                protected_ids.add(id(item))
+                continue
+            if previous_at < marker_at:
                 protected_ids.add(id(item))
         kept_notifications: list[dict[str, Any]] = []
         for item in notifications:
