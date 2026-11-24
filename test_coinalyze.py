@@ -954,6 +954,18 @@ def test_javascript_next_control_is_deferred_to_browser_click_instead_of_skippin
     assert _pagination_next_url(html, base) is None
 
 
+def test_parse_table_accepts_unicode_coin_ticker_without_changing_identity():
+    html = FIXTURE_HTML.replace(
+        'data-coin="BTCUSDT_PERP.A"', 'data-coin="牛来"', 1
+    ).replace("<span>Bitcoin</span>", "<span>牛来</span>", 1)
+
+    rows, _, _, _ = parse_table(html)
+
+    assert rows[0].symbol == "牛来"
+    assert rows[0].source_symbol == "牛来"
+    assert rows[0].name == "牛来"
+
+
 def test_parse_table_rejects_symbol_delimiter_injection():
     html = """
     <table><thead><tr><th>Coin</th></tr></thead>

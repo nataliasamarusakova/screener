@@ -134,6 +134,13 @@ def test_binance_candles_keep_recent_contiguous_tail_after_an_old_gap(monkeypatc
     assert all(b.open_time_ms - a.open_time_ms == 60 * 60_000 for a, b in zip(candles, candles[1:]))
 
 
+def test_binance_resolves_unicode_coinalyze_ticker_to_listed_usdt_perpetual(monkeypatch):
+    client = BinanceClient("https://fapi.binance.com", min_interval_sec=0)
+    monkeypatch.setattr(client, "_load_symbols", lambda: {"牛来USDT", "BTCUSDT"})
+
+    assert client.resolve_symbol("牛来") == "牛来USDT"
+
+
 def test_binance_resolves_multiplier_contract_alias_only_when_unambiguous(monkeypatch):
     client = BinanceClient("https://fapi.binance.com", min_interval_sec=0)
     monkeypatch.setattr(client, "_load_symbols", lambda: {"1000PEPEUSDT", "BTCUSDT"})
