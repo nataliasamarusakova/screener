@@ -237,6 +237,21 @@ def _oi_value_unit(raw: str) -> str | None:
     return None
 
 
+def _is_safe_coinalyze_symbol(symbol: str) -> bool:
+    """Accept Unicode asset tickers while protecting delimiter-based event keys.
+
+    Coinalyze can expose non-Latin coin identifiers (for example 牛来).
+    Symbols remain restricted to letters/numbers plus the separators already
+    supported by the parser; whitespace, control characters and `|` are rejected.
+    """
+    return (
+        bool(symbol)
+        and len(symbol) <= 64
+        and symbol[0].isalnum()
+        and all(char.isalnum() or char in "._/-" for char in symbol)
+    )
+
+
 def _disambiguate_oi(cells: list[Any], indices: list[int]) -> tuple[float | None, float | None]:
     pct = usd = None
     for idx in indices:
@@ -295,7 +310,7 @@ def parse_table(html: str) -> tuple[list[MarketRow], list[str], list[str], list[
         cells = tr.find_all(["th", "td"], recursive=False)
         if not symbol or not cells:
             raise CoinalyzeError(f"Invalid Coinalyze row {row_idx}: missing symbol or cells; refusing partial universe")
-        if not re.fullmatch(r"[A-Z0-9][A-Z0-9._/-]{0,63}", symbol):
+        if not _is_safe_coinalyze_symbol(symbol):
             raise CoinalyzeError(
                 f"Invalid Coinalyze symbol {symbol!r} on row {row_idx}; refusing unsafe event identity"
             )
