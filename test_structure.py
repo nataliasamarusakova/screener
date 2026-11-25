@@ -550,4 +550,6 @@ def test_breakout_retest_accepts_a_fresh_bullish_reaction_within_extension_limit
 
     assert result["confirmed"] is True
     assert result["retest_open_time_ms"] == values[4].open_time_ms
+    assert result["retest_close_time_ms"] == values[4].close_time_ms
+    assert result["retest_age_bars"] == len(values) - 1 - 4
     assert result["extension_atr"] == 1.0

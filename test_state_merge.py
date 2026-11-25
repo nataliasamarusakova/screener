@@ -232,3 +232,77 @@ def test_pruning_after_state_merge_removes_expired_remote_snapshots(tmp_path):
         "BTCUSDT_PERP", limit=10, contract_type="PERPETUAL"
     )
     assert [item["_snapshot_id"] for item in history] == ["new-local"]
+
+
+def test_merge_monthly_evaluation_and_outcome_streams_independently(tmp_path):
+    remote, local, target = tmp_path / "remote", tmp_path / "local", tmp_path / "target"
+    evaluation = {
+        "contract_type": "PERPETUAL", "symbol": "BTCUSDT", "scenario": "LONG A",
+        "strategy_version": "1.1.0-p0", "status": "WAITING",
+        "last_closed_1h_open_time_ms": 1_798_761_600_000,
+        "evaluated_at": "2026-11-30T23:59:00+00:00",
+    }
+    outcome = {
+        "signal_id": "signal-1", "outcome_event": "SIGNAL_PROGRESS",
+        "evaluation_horizon": "LIVE", "exit_model_version": "STRUCTURAL_1H_V1",
+        "as_of_1h_open_time_ms": 1_798_761_600_000,
+        "event_at": "2026-11-30T23:59:59+00:00", "mfe_pct": 1.2,
+    }
+    _write_jsonl(remote / "signal_evaluations" / "2026-11.jsonl", [evaluation])
+    _write_jsonl(local / "signal_evaluations" / "2026-11.jsonl", [evaluation])
+    _write_jsonl(local / "signal_evaluations" / "2026-12.jsonl", [{
+        **evaluation, "last_closed_1h_open_time_ms": 1_798_876_800_000,
+        "evaluated_at": "2026-12-01T00:59:00+00:00", "status": "CONFIRMED",
+    }])
+    _write_jsonl(remote / "signal_outcomes" / "2026-11.jsonl", [outcome])
+    _write_jsonl(local / "signal_outcomes" / "2026-11.jsonl", [outcome])
+    _write_jsonl(local / "signal_outcomes" / "2026-12.jsonl", [{
+        **outcome, "as_of_1h_open_time_ms": 1_798_765_200_000,
+        "event_at": "2026-12-01T00:59:59+00:00", "mfe_pct": 2.0,
+    }])
+    remote.mkdir(exist_ok=True)
+    local.mkdir(exist_ok=True)
+    target.mkdir()
+    for folder in ("signal_evaluations", "signal_outcomes"):
+        (target / folder).mkdir()
+        for month_file in (remote / folder).glob("*.jsonl"):
+            _write_jsonl(target / folder / month_file.name, [json.loads(line) for line in month_file.read_text().splitlines()])
+
+    # Empty core state is sufficient: the new streams are independent append-only sets.
+    for folder in (remote, local, target):
+        _write_jsonl(folder / "snapshots.jsonl", [])
+        _write_jsonl(folder / "market_rows.jsonl", [])
+        _write_jsonl(folder / "notifications.jsonl", [])
+    merge_state(local, target)
+
+    store = Store(target, create_files=False)
+    assert len(store.signal_evaluations()) == 2
+    assert len(store.signal_outcomes()) == 2
+    assert len(list((target / "signal_evaluations").glob("*.jsonl"))) == 2
+    assert len(list((target / "signal_outcomes").glob("*.jsonl"))) == 2
+
+    before = [(path.name, path.read_bytes()) for path in sorted((target / "signal_outcomes").glob("*.jsonl"))]
+    merge_state(local, target)
+    after = [(path.name, path.read_bytes()) for path in sorted((target / "signal_outcomes").glob("*.jsonl"))]
+    assert after == before
+
+
+def test_merge_monthly_stream_rejects_conflicting_duplicate_identity(tmp_path):
+    remote, local, target = tmp_path / "remote", tmp_path / "local", tmp_path / "target"
+    common = {
+        "signal_id": "signal-1", "outcome_event": "SIGNAL_PROGRESS",
+        "evaluation_horizon": "LIVE", "exit_model_version": "STRUCTURAL_1H_V1",
+        "as_of_1h_open_time_ms": 1_798_761_600_000,
+        "event_at": "2026-11-30T23:59:59+00:00",
+    }
+    _write_jsonl(remote / "signal_outcomes" / "2026-11.jsonl", [{**common, "mfe_pct": 1.0}])
+    _write_jsonl(local / "signal_outcomes" / "2026-11.jsonl", [{**common, "mfe_pct": 2.0}])
+    for folder in (remote, local, target):
+        _write_jsonl(folder / "snapshots.jsonl", [])
+        _write_jsonl(folder / "market_rows.jsonl", [])
+        _write_jsonl(folder / "notifications.jsonl", [])
+    target.mkdir(exist_ok=True)
+    _write_jsonl(target / "signal_outcomes" / "2026-11.jsonl", [{**common, "mfe_pct": 1.0}])
+
+    with pytest.raises(ValueError, match="Conflicting outcome records"):
+        merge_state(local, target)

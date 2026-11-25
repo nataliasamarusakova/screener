@@ -116,11 +116,17 @@ def _enriched():
 
 def _activate_short(store: Store, row, *, level: float = 0.7659):
     group = f"{row.symbol}|SHORT D — Long Liquidation Cascade"
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    hour_open = (now_ms // 3_600_000) * 3_600_000 - 3_600_000
     store.record_notification(
         "old-short-event", 11, recipient_key=_recipient_key(), event_group=group,
         fingerprint="old-short-fingerprint", event_state="ACTIVE", direction="SHORT",
         invalidation_level=level, pair="FILUSDT", scenario_code="SHORT D",
         contract_type="PERPETUAL", delivery_status="SENT",
+        entry_reference=0.7660, entry_reference_time_ms=hour_open + 3_599_999,
+        entry_reference_1h_open_time_ms=hour_open,
+        entry_reference_type="BINANCE_FUTURES_LAST_CLOSED_1H_CLOSE",
+        strategy_version="1.0.28",
     )
     return group
 
@@ -231,6 +237,18 @@ def test_confirmed_opposite_scenario_sends_one_reversal_post_not_a_second_signal
     assert len(active) == 1
     assert active[0]["event_group"] == f"{row.symbol}|LONG A — Trend Continuation"
     assert active[0]["direction"] == "LONG"
+    opened_signal_id = __import__("hashlib").sha256(
+        f"PERPETUAL|old-short-event".encode("utf-8")
+    ).hexdigest()
+    old_signal_outcomes = [
+        item for item in store.signal_outcomes() if item["signal_id"] == opened_signal_id
+    ]
+    assert {item["outcome_event"] for item in old_signal_outcomes} == {
+        "SIGNAL_OPENED", "SIGNAL_REVERSED"
+    }
+    assert next(item for item in old_signal_outcomes if item["outcome_event"] == "SIGNAL_REVERSED")[
+        "as_of_1h_open_time_ms"
+    ] == new_long.technical["last_closed_1h"]["open_time_ms"]
     assert _collect_notifications([new_long], rows, _settings(), store, True, False) == []
     assert len(FakeTelegram.sent) == 1
 

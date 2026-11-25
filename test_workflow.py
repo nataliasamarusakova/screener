@@ -44,6 +44,10 @@ def test_workflow_queues_pending_runs_and_does_not_commit_per_run_journal():
     assert "git add data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl" in workflow
     assert 'if [[ -f data/poll_state.json ]]; then' in workflow
     assert 'git add data/poll_state.json' in workflow
+    assert 'for journal in signal_evaluations signal_outcomes' in workflow
+    assert 'git add "data/$journal/"' in workflow
+    assert 'cp -a "data/$journal/." "$state_backup/$journal/"' in workflow
+    assert 'rm -rf "$state_backup/$journal"' in workflow
     assert "git add data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl data/runs.jsonl" not in workflow
     assert "touch data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl" in workflow
     assert "git rm --cached -f data/runs.jsonl" in workflow

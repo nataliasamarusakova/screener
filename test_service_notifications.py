@@ -198,6 +198,19 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
         "weak_bounce_rejection": {"confirmed": False},
         "execution_cost_assumptions": {"taker_fee_bps_per_side": None},
     })
+    # P0 on-demand context providers are isolated in this workflow test;
+    # unit tests below exercise their request/parse contracts separately.
+    monkeypatch.setattr(service.BinanceClient, "fetch_open_interest_history", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(service.BinanceClient, "fetch_funding_rate_history", lambda *_args, **_kwargs: [])
+
+    class _NoSpot:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def resolve_symbol(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(service, "SpotMarketClient", _NoSpot)
 
     first = service.run_scan_once(settings, dry_run=True)
     assert first["status"] == "OK"
@@ -291,13 +304,14 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
     assert redelivered["no_new_coinalyze_data"] is False
     assert redelivered["poll_state_updated"] is True
 
-    # A table missing a required P1 column must never become a committed 4H observation.
+    # A global missing-column diagnostic must not block unrelated scenarios
+    # or durable history. The affected scenario's own missing value is UNKNOWN.
     markets[0].price += 0.04
     scraped.fetched_at = fixed_time + timedelta(hours=8)
     scraped.missing_required_columns = ["oi_usd"]
     incomplete = service.run_scan_once(settings, dry_run=True)
-    assert incomplete["snapshot_saved"] is False
-    assert any("Snapshot not committed" in warning for warning in incomplete["stats"].warnings)
+    assert incomplete["snapshot_saved"] is False  # dry-run remains read-only
+    assert any("legacy P1 diagnostic fields are missing" in warning for warning in incomplete["stats"].warnings)
     assert len(Store(settings.data_dir).recent_symbol_history("ALT0USDT_PERP.A", limit=10)) == 1
 
 
@@ -1378,3 +1392,127 @@ def test_signal_warnings_are_not_silently_capped_at_two():
     assert any("OI 4H мало" in warning for warning in warnings)
     assert any("Цена растёт при падающем OI" in warning for warning in warnings)
     assert any("BTC Corr. 7D" in warning for warning in warnings)
+
+
+def test_active_signal_progress_records_cumulative_mfe_mae_and_unknown_intrabar_order(tmp_path):
+    from screener.models import Candle
+    from screener.service import _record_signal_progress
+    from screener.storage import Store
+
+    store = Store(tmp_path / "data")
+    event_key = "BTCUSDT_PERP.A|LONG A|1790000000000"
+    store.record_notification(
+        event_key, recipient_key="recipient", contract_type="PERPETUAL",
+        event_group="BTCUSDT_PERP.A|LONG A", fingerprint="fp",
+        event_state="ACTIVE", direction="LONG", invalidation_level=99.0,
+        pair="BTCUSDT", scenario_code="LONG_A", delivery_status="SENT",
+        entry_reference=100.0, entry_reference_time_ms=1_790_000_000_000,
+        entry_reference_1h_open_time_ms=1_789_996_400_000,
+        entry_reference_type="BINANCE_FUTURES_LAST_CLOSED_1H_CLOSE",
+        strategy_version="1.1.0-p0",
+    )
+    active = store.active_notification_states(recipient_keys=["recipient"], contract_type="PERPETUAL")
+    first = Candle(
+        open_time_ms=1_790_003_600_000, close_time_ms=1_790_007_199_999,
+        open=100.0, high=103.0, low=98.0, close=101.0,
+        volume=100.0, quote_volume=10_000.0, trades=10,
+    )
+    assert _record_signal_progress(store, active, {"BTCUSDT": [first]}) == 1
+    progress = store.latest_signal_outcome(
+        store.signal_outcomes()[0]["signal_id"], outcome_event="SIGNAL_PROGRESS"
+    )
+    assert abs(progress["mfe_pct"] - 3.0) < 1e-9
+    assert abs(progress["mae_pct"] + 2.0) < 1e-9
+    assert progress["first_touch_invalidation_bar_open_time_ms"] == first.open_time_ms
+    assert progress["first_touch_invalidation_time_precision"] == "WITHIN_1H_BAR_UNKNOWN"
+    assert progress["data_quality"]["intrabar_order"] == "UNKNOWN"
+
+    second = Candle(
+        open_time_ms=1_790_007_200_000, close_time_ms=1_790_010_799_999,
+        open=101.0, high=105.0, low=97.0, close=102.0,
+        volume=100.0, quote_volume=10_000.0, trades=10,
+    )
+    assert _record_signal_progress(store, active, {"BTCUSDT": [second]}) == 1
+    updated = store.latest_signal_outcome(progress["signal_id"], outcome_event="SIGNAL_PROGRESS")
+    assert abs(updated["mfe_pct"] - 5.0) < 1e-9
+    assert abs(updated["mae_pct"] + 3.0) < 1e-9
+    assert updated["first_touch_invalidation_bar_open_time_ms"] == first.open_time_ms
+
+
+def test_market_context_does_not_promote_stale_oi_or_spot_flow_to_current_features():
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from screener.models import Candle
+    from screener.service import _market_context_for_symbol
+
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    class FuturesClient:
+        def fetch_open_interest_history(self, symbol, *, period, limit):
+            return [
+                {"symbol": symbol, "timestamp": now_ms - 30 * 60_000, "sumOpenInterest": "100", "sumOpenInterestValue": "1000"},
+                {"symbol": symbol, "timestamp": now_ms - 25 * 60_000, "sumOpenInterest": "101", "sumOpenInterestValue": "1010"},
+            ]
+
+        def fetch_funding_rate_history(self, symbol, *, limit):
+            return []
+
+    class SpotClient:
+        def resolve_symbol(self, symbol):
+            return SimpleNamespace(
+                spot_symbol="ALTUSDT", spot_base_asset="ALT", futures_base_asset="ALT",
+                quote_asset="USDT", base_multiplier=1.0,
+            )
+
+        def fetch_candles(self, symbol, interval, *, limit):
+            last_open = (now_ms // 300_000) * 300_000 - 25 * 60_000
+            return [
+                Candle(
+                    open_time_ms=last_open - (11 - i) * 300_000,
+                    close_time_ms=last_open - (11 - i) * 300_000 + 299_999,
+                    open=1.0, high=1.1, low=0.9, close=1.0,
+                    volume=100.0, quote_volume=100.0, trades=10,
+                    taker_buy_base_volume=60.0, taker_buy_quote_volume=60.0,
+                )
+                for i in range(12)
+            ]
+
+    settings = SimpleNamespace(p1={"scanner": {
+        "market_context_oi_limit": 500,
+        "market_context_funding_limit": 200,
+        "market_context_kline_limit": 300,
+    }})
+    futures_candle = Candle(
+        open_time_ms=now_ms - 3_600_000, close_time_ms=now_ms - 1,
+        open=1.0, high=1.1, low=0.9, close=1.0,
+        volume=100.0, quote_volume=100.0, trades=10,
+        taker_buy_base_volume=60.0, taker_buy_quote_volume=60.0,
+    )
+
+    context = _market_context_for_symbol(
+        FuturesClient(), SpotClient(), "ALTUSDT", [futures_candle], settings,
+    )
+
+    assert context["oi_history_status"] == "STALE"
+    assert context["oi_change_base_1h_pct"] is None
+    assert context["oi_change_usd_1h_pct"] is None
+    assert context["spot_status"] == "STALE"
+    assert context["spot_flow_1h"] is None
+
+
+def test_global_missing_required_columns_do_not_disable_other_scenarios():
+    from types import SimpleNamespace
+
+    from screener.service import _can_send_alerts
+
+    scrape = SimpleNamespace(
+        contract_type="PERPETUAL",
+        missing_required_columns=["oi_usd", "vol_mktcap_ratio"],
+    )
+    settings = SimpleNamespace(p1={"universe": {
+        "expected_contract_type": "PERPETUAL",
+        "allow_unknown_contract_type_for_alerts": False,
+    }})
+
+    assert _can_send_alerts(scrape, settings) == (True, "OK")

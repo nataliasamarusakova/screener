@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from screener.models import MarketRow
 from screener.storage import Store
 
@@ -291,6 +293,42 @@ def test_spot_sequence_requires_latest_samples_and_freshness(tmp_path):
     latest_negative.spot_imbalance_4h = -9.0
     store.add_snapshot(now, "PERPETUAL", [latest_negative])
     assert store.spot_sequence_status("BTCUSDT_PERP.A", as_of=now) is False
+
+
+def test_long_b_spot_sequence_accepts_late_snapshot_but_not_early_or_over_30m_late(tmp_path):
+    base = datetime(2026, 11, 22, 0, 0, tzinfo=timezone.utc)
+
+    def add_positive(store, stamp):
+        row = _row()
+        row.spot_imbalance_4h = 2.0
+        store.add_snapshot(stamp, "PERPETUAL", [row])
+
+    late_store = Store(tmp_path / "long-b-late")
+    add_positive(late_store, base)
+    add_positive(late_store, base + timedelta(hours=4))
+    latest = base + timedelta(hours=8, minutes=14, seconds=38)
+    add_positive(late_store, latest)
+    assert late_store.spot_sequence_status(
+        "BTCUSDT_PERP.A", as_of=latest, tolerance_minutes=30,
+    ) is True
+
+    early_store = Store(tmp_path / "long-b-early")
+    add_positive(early_store, base)
+    add_positive(early_store, base + timedelta(hours=3, minutes=59))
+    add_positive(early_store, base + timedelta(hours=7, minutes=58))
+    early_as_of = base + timedelta(hours=7, minutes=58)
+    assert early_store.spot_sequence_status(
+        "BTCUSDT_PERP.A", as_of=early_as_of, tolerance_minutes=30,
+    ) is None
+
+    over_late_store = Store(tmp_path / "long-b-over-late")
+    add_positive(over_late_store, base)
+    add_positive(over_late_store, base + timedelta(hours=4))
+    over_late = base + timedelta(hours=8, minutes=31)
+    add_positive(over_late_store, over_late)
+    assert over_late_store.spot_sequence_status(
+        "BTCUSDT_PERP.A", as_of=over_late, tolerance_minutes=30,
+    ) is None
 
 
 def test_history_index_rejects_snapshot_with_hash_or_row_count_mismatch(tmp_path):
@@ -788,3 +826,115 @@ def test_prune_keeps_reversal_marker_when_new_group_has_only_older_cancelled_sta
 
     retained = list(Store._read_jsonl_strict(store.notifications_path))
     assert [item["event_key"] for item in retained] == [marker_key]
+
+
+def test_signal_evaluation_and_outcome_monthly_journals_dedupe_across_months(tmp_path):
+    store = Store(tmp_path / "data")
+    evaluation = {
+        "contract_type": "PERPETUAL", "symbol": "BTCUSDT", "scenario": "LONG A",
+        "strategy_version": "1.1.0-p0", "status": "WAITING_FOR_RETEST",
+        "last_closed_1h_open_time_ms": 1_798_761_600_000,
+        "evaluated_at": "2026-11-30T23:59:00+00:00",
+    }
+    assert store.record_signal_evaluation(evaluation) is True
+    assert store.record_signal_evaluation(evaluation) is False
+    changed_status = {**evaluation, "status": "CONFIRMED_SIGNAL"}
+    assert store.record_signal_evaluation(changed_status) is True
+    next_month = {**evaluation, "evaluated_at": "2026-12-01T00:05:00+00:00", "last_closed_1h_open_time_ms": 1_798_876_800_000}
+    assert store.record_signal_evaluation(next_month) is True
+
+    outcome = {
+        "signal_id": "signal-1", "outcome_event": "SIGNAL_PROGRESS", "evaluation_horizon": "LIVE",
+        "exit_model_version": "STRUCTURAL_1H_V1", "as_of_1h_open_time_ms": 1_798_761_600_000,
+        "event_at": "2026-11-30T23:59:59+00:00", "mfe_pct": 2.0,
+    }
+    assert store.record_signal_outcome(outcome) is True
+    assert store.record_signal_outcome(outcome) is False
+    next_hour = {**outcome, "as_of_1h_open_time_ms": 1_798_765_200_000, "event_at": "2026-12-01T00:59:59+00:00", "mfe_pct": 3.0}
+    assert store.record_signal_outcome(next_hour) is True
+
+    assert (tmp_path / "data" / "signal_evaluations" / "2026-11.jsonl").exists()
+    assert (tmp_path / "data" / "signal_evaluations" / "2026-12.jsonl").exists()
+    assert (tmp_path / "data" / "signal_outcomes" / "2026-11.jsonl").exists()
+    assert (tmp_path / "data" / "signal_outcomes" / "2026-12.jsonl").exists()
+    assert len(store.signal_evaluations()) == 3
+    assert len(store.signal_outcomes()) == 2
+    assert store.latest_signal_outcome("signal-1")["mfe_pct"] == 3.0
+
+
+def test_signal_evaluation_requires_closed_candle_timestamp(tmp_path):
+    store = Store(tmp_path / "data")
+    with pytest.raises(ValueError, match="closed 1H candle"):
+        store.record_signal_evaluation({
+            "contract_type": "PERPETUAL", "symbol": "BTCUSDT", "scenario": "LONG A",
+            "strategy_version": "1.1.0-p0", "status": "WAIT", "last_closed_1h_open_time_ms": None,
+            "evaluated_at": "2026-11-25T00:00:00+00:00",
+        })
+
+
+def test_notification_lifecycle_initializes_and_closes_signal_outcome(tmp_path):
+    store = Store(tmp_path / "data")
+    event_key = "BTCUSDT_PERP.A|LONG A|1710000000000"
+    common = {
+        "contract_type": "PERPETUAL",
+        "event_group": "BTCUSDT_PERP.A|LONG A", "fingerprint": "fingerprint",
+        "direction": "LONG", "invalidation_level": 99.0,
+        "pair": "BTCUSDT", "scenario_code": "LONG_A",
+    }
+    store.record_notification(
+        event_key, recipient_key="recipient", event_state="ACTIVE",
+        delivery_status="SENT", entry_reference=100.0,
+        entry_reference_time_ms=1_790_000_000_000,
+        entry_reference_1h_open_time_ms=1_789_996_400_000,
+        entry_reference_type="BINANCE_FUTURES_LAST_CLOSED_1H_CLOSE",
+        strategy_version="1.1.0-p0", **common,
+    )
+    signal_id = store.signal_outcomes()[0]["signal_id"]
+    assert store.signal_outcomes()[0]["outcome_event"] == "SIGNAL_OPENED"
+
+    store.record_notification(
+        "CANCEL|" + event_key + "|1790003600000", recipient_key="recipient",
+        event_state="CANCELLED", delivery_status="SENT",
+        related_event_keys=[event_key], outcome_as_of_1h_open_time_ms=1_790_000_000_000,
+        **common,
+    )
+    outcomes = [item for item in store.signal_outcomes() if item["signal_id"] == signal_id]
+    assert {item["outcome_event"] for item in outcomes} == {"SIGNAL_OPENED", "SIGNAL_CANCELLED"}
+
+
+def test_prune_preserves_outcomes_for_still_active_signal_beyond_retention(tmp_path):
+    store = Store(tmp_path / "active-outcome-retention")
+    old_sent = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat()
+    entry_open_ms = int((datetime.now(timezone.utc) - timedelta(days=400)).timestamp() * 1000)
+    event_key = "BTCUSDT_PERP.A|LONG A|old-trigger"
+    store.record_notification(
+        event_key, recipient_key="recipient", contract_type="PERPETUAL",
+        event_group="BTCUSDT_PERP.A|LONG A", fingerprint="old-fingerprint",
+        event_state="ACTIVE", direction="LONG", invalidation_level=99.0,
+        pair="BTCUSDT", scenario_code="LONG_A", delivery_status="SENT",
+        entry_reference=100.0, entry_reference_time_ms=entry_open_ms,
+        entry_reference_1h_open_time_ms=entry_open_ms - 3_600_000,
+    )
+    signal_id = store.signal_outcomes()[0]["signal_id"]
+    store.record_signal_outcome({
+        "signal_id": signal_id, "outcome_event": "SIGNAL_PROGRESS",
+        "evaluation_horizon": "LIVE", "exit_model_version": "STRUCTURAL_1H_V1",
+        "as_of_1h_open_time_ms": entry_open_ms,
+        "event_at": old_sent, "mfe_pct": 4.0, "mae_pct": -1.0,
+    })
+
+    store.prune(signal_outcome_retention_days=365)
+
+    records = [item for item in store.signal_outcomes() if item["signal_id"] == signal_id]
+    assert {item["outcome_event"] for item in records} == {"SIGNAL_OPENED", "SIGNAL_PROGRESS"}
+
+
+def test_failed_active_notification_does_not_open_signal_outcome(tmp_path):
+    store = Store(tmp_path / "data")
+    store.record_notification(
+        "event-1", recipient_key="recipient", contract_type="PERPETUAL",
+        event_group="BTC|LONG A", fingerprint="fp", event_state="ACTIVE",
+        direction="LONG", invalidation_level=99.0, pair="BTCUSDT",
+        scenario_code="LONG_A", delivery_status="FAILED",
+    )
+    assert store.signal_outcomes() == []

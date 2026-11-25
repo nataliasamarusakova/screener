@@ -532,3 +532,91 @@ def test_run_scan_aborts_before_later_symbol_after_binance_ip_ban(tmp_path, monk
     assert fetch_kwargs["page_attempts"] == 3
     assert fetch_kwargs["retry_backoff_sec"] == 3.0
     assert Store(settings.data_dir).binance_cooldown_remaining() > 0
+
+
+def test_binance_candles_preserve_taker_buy_base_and_quote_volume(monkeypatch):
+    client = BinanceClient("https://fapi.binance.com", min_interval_sec=0)
+    monkeypatch.setattr(client, "resolve_symbol", lambda _: "BTCUSDT")
+    rows, _ = _valid_closed_klines("1h", count=21)
+    rows[-1][9] = "4.5"
+    rows[-1][10] = "454.5"
+    monkeypatch.setattr(client, "_get_json", lambda *_args, **_kwargs: rows)
+
+    candles = client.fetch_candles("BTCUSDT", "1h")
+
+    assert candles[-1].taker_buy_base_volume == 4.5
+    assert candles[-1].taker_buy_quote_volume == 454.5
+
+
+def test_binance_open_interest_history_keeps_base_and_usd_separate(monkeypatch):
+    client = BinanceClient("https://fapi.binance.com", min_interval_sec=0)
+    captured = {}
+
+    def fake_get_json(path, params):
+        captured.update(path=path, params=params)
+        return [
+            {"symbol": "BTCUSDT", "sumOpenInterest": "12.5", "sumOpenInterestValue": "1250000", "timestamp": 2000},
+            {"symbol": "BTCUSDT", "sumOpenInterest": "11.0", "sumOpenInterestValue": "1210000", "timestamp": 1000},
+        ]
+
+    monkeypatch.setattr(client, "_get_json", fake_get_json)
+    rows = client.fetch_open_interest_history("btcusdt", period="5m", limit=900)
+
+    assert captured["path"] == "/futures/data/openInterestHist"
+    assert captured["params"]["limit"] == 500
+    assert rows[0]["sumOpenInterest"] == "11.0"
+    assert rows[0]["sumOpenInterestValue"] == "1210000"
+    assert rows[1]["sumOpenInterest"] == "12.5"
+    assert rows[1]["sumOpenInterestValue"] == "1250000"
+
+
+def test_binance_funding_history_preserves_rate_type(monkeypatch):
+    client = BinanceClient("https://fapi.binance.com", min_interval_sec=0)
+    monkeypatch.setattr(client, "_get_json", lambda *_args, **_kwargs: [
+        {"symbol": "BTCUSDT", "fundingTime": 3000, "fundingRate": "0.0001", "markPrice": "100", "rateType": "Special"},
+        {"symbol": "BTCUSDT", "fundingTime": 1000, "fundingRate": "0.00001", "markPrice": "99", "rateType": "Regular"},
+    ])
+
+    rows = client.fetch_funding_rate_history("BTCUSDT", limit=1200)
+
+    assert rows[0]["rateType"] == "Regular"
+    assert rows[1]["rateType"] == "Special"
+    assert rows[1]["markPrice"] == "100"
+
+
+def test_spot_client_uses_direct_session_and_resolves_multiplier_alias(monkeypatch):
+    from screener.binance import SpotMarketClient
+
+    client = SpotMarketClient(min_interval_sec=0)
+    captured = {}
+
+    def fake_get_json(path, params=None):
+        captured.update(path=path, params=params)
+        return {"symbols": [
+            {"symbol": "PEPEUSDT", "status": "TRADING", "baseAsset": "PEPE", "quoteAsset": "USDT"},
+            {"symbol": "OLDUSDT", "status": "BREAK", "baseAsset": "OLD", "quoteAsset": "USDT"},
+        ]}
+
+    monkeypatch.setattr(client, "_get_json", fake_get_json)
+    resolved = client.resolve_symbol("1000PEPEUSDT")
+
+    assert client.session.trust_env is False
+    assert client.session.proxies == {}
+    assert captured["path"] == "/api/v3/exchangeInfo"
+    assert captured["params"] == {
+        "permissions": "SPOT", "symbolStatus": "TRADING", "showPermissionSets": "false",
+    }
+    assert resolved is not None
+    assert resolved.spot_symbol == "PEPEUSDT"
+    assert resolved.base_multiplier == 1000.0
+
+
+def test_spot_resolver_returns_unavailable_for_missing_active_pair(monkeypatch):
+    from screener.binance import SpotMarketClient
+
+    client = SpotMarketClient(min_interval_sec=0)
+    monkeypatch.setattr(client, "_get_json", lambda *_args, **_kwargs: {"symbols": [
+        {"symbol": "OLDUSDT", "status": "BREAK", "baseAsset": "OLD", "quoteAsset": "USDT"},
+    ]})
+
+    assert client.resolve_symbol("OLDUSDT") is None
