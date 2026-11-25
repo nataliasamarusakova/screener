@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -104,6 +105,14 @@ class Settings:
     telegram_storage_hash_key: str = ""
     coinalyze_page_attempts: int = 3
     coinalyze_retry_backoff_sec: float = 3.0
+    # Explicit shadow execution assumptions. Rates are per side and applied to
+    # traded notional, never margin. The $1,000 default is a research reference,
+    # not an order size or an estimate of the user's future position size.
+    maker_fee_bps: float = 2.0
+    taker_fee_bps: float = 5.0
+    shadow_entry_execution_type: str = "TAKER"
+    shadow_exit_execution_type: str = "TAKER"
+    shadow_notional_usd: float = 1_000.0
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -127,6 +136,26 @@ def load_settings(root: Path = ROOT) -> Settings:
         data_dir = root / data_dir
 
     fee_value = os.getenv("TRADING_FEE_BPS_PER_SIDE", "").strip()
+    legacy_fee = float(fee_value) if fee_value else None
+
+    def fee_setting(env_name: str, default: float, *, legacy_taker_fallback: bool = False) -> float:
+        raw = os.getenv(env_name, "").strip()
+        fallback = legacy_fee if legacy_taker_fallback and legacy_fee is not None else default
+        value = float(raw) if raw else fallback
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{env_name} must be a finite non-negative number of basis points")
+        return value
+
+    entry_execution_type = os.getenv("SHADOW_ENTRY_EXECUTION_TYPE", "TAKER").strip().upper() or "TAKER"
+    exit_execution_type = os.getenv("SHADOW_EXIT_EXECUTION_TYPE", "TAKER").strip().upper() or "TAKER"
+    if entry_execution_type not in {"MAKER", "TAKER"}:
+        raise ValueError("SHADOW_ENTRY_EXECUTION_TYPE must be MAKER or TAKER")
+    if exit_execution_type not in {"MAKER", "TAKER"}:
+        raise ValueError("SHADOW_EXIT_EXECUTION_TYPE must be MAKER or TAKER")
+    shadow_notional = float(os.getenv("SHADOW_NOTIONAL_USD", "1000"))
+    if not math.isfinite(shadow_notional) or shadow_notional <= 0:
+        raise ValueError("SHADOW_NOTIONAL_USD must be a finite positive number")
+
     settings = Settings(
         coinalyze_url=os.getenv("COINALYZE_URL", "").strip(),
         coinalyze_p_sid=os.getenv("COINALYZE_P_SID", "").strip(),
@@ -154,6 +183,11 @@ def load_settings(root: Path = ROOT) -> Settings:
         coinalyze_retry_backoff_sec=max(
             0.0, min(30.0, float(os.getenv("COINALYZE_RETRY_BACKOFF_SEC", "3")))
         ),
+        maker_fee_bps=fee_setting("MAKER_FEE_BPS", 2.0),
+        taker_fee_bps=fee_setting("TAKER_FEE_BPS", 5.0, legacy_taker_fallback=True),
+        shadow_entry_execution_type=entry_execution_type,
+        shadow_exit_execution_type=exit_execution_type,
+        shadow_notional_usd=shadow_notional,
     )
 
     settings.p1.setdefault("scanner", {})["fetch_15m_context"] = _bool_env(

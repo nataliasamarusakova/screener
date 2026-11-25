@@ -81,6 +81,90 @@ class ScenarioResult:
     status: str
     reason: str = ""
     technical: dict[str, Any] = field(default_factory=dict)
+    reason_code: str = ""
+    diagnostic_status: str = ""
+    failed_checks: list[dict[str, Any]] = field(default_factory=list)
+    unknown_checks: list[dict[str, Any]] = field(default_factory=list)
+    summary: str = ""
+
+    def __post_init__(self) -> None:
+        """Attach durable diagnostics without changing legacy scenario status semantics."""
+        self.failed_checks = [
+            {"name": check.name, "passed": False, "actual": check.actual, "rule": check.rule}
+            for check in self.checks if check.passed is False
+        ]
+        self.unknown_checks = [
+            {"name": check.name, "passed": None, "actual": check.actual, "rule": check.rule}
+            for check in self.checks if check.passed is None
+        ]
+
+        if self.failed_checks:
+            self.diagnostic_status = "FAILED"
+        elif self.unknown_checks:
+            self.diagnostic_status = "UNKNOWN"
+        elif self.checks:
+            self.diagnostic_status = "PASS"
+        else:
+            self.diagnostic_status = "NO_CHECKS"
+
+        if len(self.failed_checks) == 1:
+            failed_name = self.failed_checks[0]["name"].strip().lower()
+            reason_codes = {
+                "price change 24h": "PRICE_CHANGE_24H_OUT_OF_RANGE",
+                "strong positive spot": "SPOT_FLOW_CONFIRMATION_FAILED",
+                "spot positive": "SPOT_FLOW_CONFIRMATION_FAILED",
+                "s negative": "SPOT_FLOW_CONFIRMATION_FAILED",
+                "f/s positive; at least one strong": "FLOW_CONFIRMATION_FAILED",
+                "f/s negative; at least one strong": "FLOW_CONFIRMATION_FAILED",
+                "quality flags": "QUALITY_GATE_FAILED",
+                "oi 4h growth": "OI_4H_GROWTH_OUT_OF_RANGE",
+                "oi 24h decline material": "OI_24H_DECLINE_NOT_MATERIAL",
+            }
+            inferred_reason_code = reason_codes.get(failed_name, "CHECK_FAILED")
+        elif len(self.failed_checks) > 1:
+            inferred_reason_code = "MULTIPLE_CHECKS_FAILED"
+        elif self.unknown_checks:
+            inferred_reason_code = "REQUIRED_CHECKS_UNKNOWN"
+        elif not self.checks:
+            inferred_reason_code = "NO_CHECKS_AVAILABLE"
+        else:
+            inferred_reason_code = "SCENARIO_STATUS_" + (self.status or "UNKNOWN").upper()
+
+        if not self.reason_code:
+            self.reason_code = inferred_reason_code
+
+        failed_text = [
+            f"{item['name']} (actual: {item['actual']}; rule: {item['rule']})"
+            for item in self.failed_checks
+        ]
+        unknown_text = [
+            f"{item['name']} (actual: {item['actual']}; required: {item['rule']})"
+            for item in self.unknown_checks
+        ]
+        parts: list[str] = []
+        if failed_text:
+            parts.append("Failed checks: " + "; ".join(failed_text))
+        if unknown_text:
+            parts.append("Unknown checks: " + "; ".join(unknown_text))
+
+        if self.status == "NOT_MET":
+            # The public status remains NOT_MET for backwards compatibility.
+            # diagnostic_status distinguishes a known failure from an unknown-only result.
+            if parts:
+                self.summary = ". ".join(parts) + "."
+                self.reason = self.summary
+            elif not self.reason:
+                self.reason = "No scenario predicate passed or failed decisively; inspect the scenario-level gate."
+                self.summary = self.reason
+            else:
+                self.summary = self.reason
+        elif self.reason:
+            self.summary = self.reason
+        elif parts:
+            self.summary = ". ".join(parts) + "."
+            self.reason = self.summary
+        else:
+            self.summary = f"Scenario status: {self.status}."
 
     @property
     def passed_count(self) -> int:
@@ -117,6 +201,11 @@ class ScenarioResult:
             "quality_flags": list(self.quality_flags),
             "status": self.status,
             "reason": self.reason,
+            "reason_code": self.reason_code,
+            "diagnostic_status": self.diagnostic_status,
+            "failed_checks": list(self.failed_checks),
+            "unknown_checks": list(self.unknown_checks),
+            "summary": self.summary,
             "technical": self.technical,
         }
 

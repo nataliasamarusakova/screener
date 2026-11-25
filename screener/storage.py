@@ -893,6 +893,11 @@ class Store:
         entry_reference_type: str | None = None,
         strategy_version: str | None = None,
         outcome_as_of_1h_open_time_ms: int | None = None,
+        shadow_maker_fee_bps: float | None = None,
+        shadow_taker_fee_bps: float | None = None,
+        shadow_entry_execution_type: str | None = None,
+        shadow_exit_execution_type: str | None = None,
+        shadow_notional_usd: float | None = None,
     ) -> None:
         """Append a notification using the current recipient/contract schema."""
         if not str(event_key).strip():
@@ -958,6 +963,30 @@ class Store:
             record["entry_reference_type"] = str(entry_reference_type)
         if strategy_version:
             record["strategy_version"] = str(strategy_version)
+
+        for field_name, raw_value in (
+            ("shadow_maker_fee_bps", shadow_maker_fee_bps),
+            ("shadow_taker_fee_bps", shadow_taker_fee_bps),
+        ):
+            if raw_value is not None:
+                value = float(raw_value)
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError(f"{field_name} must be finite and non-negative")
+                record[field_name] = value
+        for field_name, raw_value in (
+            ("shadow_entry_execution_type", shadow_entry_execution_type),
+            ("shadow_exit_execution_type", shadow_exit_execution_type),
+        ):
+            if raw_value is not None:
+                value = str(raw_value).upper()
+                if value not in {"MAKER", "TAKER"}:
+                    raise ValueError(f"{field_name} must be MAKER or TAKER")
+                record[field_name] = value
+        if shadow_notional_usd is not None:
+            value = float(shadow_notional_usd)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("shadow_notional_usd must be finite and positive")
+            record["shadow_notional_usd"] = value
         if error:
             record["error"] = str(error)[:500]
         cache_was_current = (
@@ -1006,7 +1035,16 @@ class Store:
                 "entry_reference_type": record.get("entry_reference_type"),
                 "invalidation_level": record.get("invalidation_level"),
                 "strategy_version": record.get("strategy_version"),
-                "data_quality": {"entry_reference_available": record.get("entry_reference") is not None},
+                "shadow_maker_fee_bps": record.get("shadow_maker_fee_bps"),
+                "shadow_taker_fee_bps": record.get("shadow_taker_fee_bps"),
+                "shadow_entry_execution_type": record.get("shadow_entry_execution_type"),
+                "shadow_exit_execution_type": record.get("shadow_exit_execution_type"),
+                "shadow_notional_usd": record.get("shadow_notional_usd"),
+                "data_quality": {
+                    "entry_reference_available": record.get("entry_reference") is not None,
+                    "execution_assumptions": "SNAPSHOTTED_AT_SIGNAL_OPEN"
+                    if record.get("shadow_notional_usd") is not None else "NOT_AVAILABLE",
+                },
             })
         elif (
             normalized_state in {"CANCELLED", "CANCELED", "REVERSED"}

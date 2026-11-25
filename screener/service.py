@@ -216,7 +216,25 @@ def _technical_for_symbol(
             raise
         except Exception as exc:
             result["orderbook"] = {"error": str(exc)}
-    result["execution_cost_assumptions"] = {"taker_fee_bps_per_side": settings.trading_fee_bps_per_side}
+    maker_fee_bps = float(getattr(settings, "maker_fee_bps", 2.0))
+    taker_fee_bps = float(getattr(settings, "taker_fee_bps", 5.0))
+    legacy_fee_bps = getattr(settings, "trading_fee_bps_per_side", None)
+    if legacy_fee_bps is not None:
+        # Settings loaded from the legacy environment variable map that value
+        # to both maker/taker only when the new variables were not specified.
+        maker_fee_bps = float(getattr(settings, "maker_fee_bps", legacy_fee_bps))
+        taker_fee_bps = float(getattr(settings, "taker_fee_bps", legacy_fee_bps))
+    result["execution_cost_assumptions"] = {
+        "maker_fee_bps_per_side": maker_fee_bps,
+        "taker_fee_bps_per_side": taker_fee_bps,
+        "entry_execution_type": str(getattr(settings, "shadow_entry_execution_type", "TAKER")),
+        "exit_execution_type": str(getattr(settings, "shadow_exit_execution_type", "TAKER")),
+        "shadow_notional_usd": float(getattr(settings, "shadow_notional_usd", 1000.0)),
+        "execution_type_status": "ASSUMED",
+        "notional_status": "ASSUMED_FIXED_NOTIONAL",
+        "funding_included": False,
+        "slippage_included": False,
+    }
     if bool(settings.p1.get("scanner", {}).get("fetch_15m_context", True)):
         try:
             candles15m = client.fetch_candles(fetch_symbol, "15m", settings.binance_kline_limit)
@@ -519,13 +537,148 @@ def _market_context_quality(context: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _fee_bps_for_execution(
+    execution_type: str,
+    *,
+    maker_fee_bps: float,
+    taker_fee_bps: float,
+) -> float:
+    normalized = str(execution_type or "").upper()
+    if normalized == "MAKER":
+        return float(maker_fee_bps)
+    if normalized == "TAKER":
+        return float(taker_fee_bps)
+    raise ValueError("Execution type must be MAKER or TAKER")
+
+
+def _shadow_fee_accounting(
+    *,
+    entry: float,
+    exit_legs: list[tuple[float, float]] | None,
+    risk_abs: float,
+    direction: str,
+    notional_usd: float,
+    entry_fee_bps: float,
+    exit_fee_bps: float,
+    entry_execution_type: str,
+    exit_execution_type: str,
+) -> dict[str, Any]:
+    """Calculate assumed fees and realized PnL from traded notional.
+
+    ``exit_legs`` contains (fraction of original quantity, execution price).
+    An empty list means no exit yet; ``None`` means an ambiguous/unresolved
+    intrabar path, so no exit fee or PnL is imputed.
+    """
+    values = (entry, risk_abs, notional_usd, entry_fee_bps, exit_fee_bps)
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("Shadow fee inputs must be finite")
+    if entry <= 0 or risk_abs <= 0 or notional_usd <= 0:
+        raise ValueError("Entry, initial risk and fixed notional must be positive")
+    if entry_fee_bps < 0 or exit_fee_bps < 0:
+        raise ValueError("Fee rates cannot be negative")
+    if direction not in {"LONG", "SHORT"}:
+        raise ValueError("Direction must be LONG or SHORT")
+
+    quantity = notional_usd / entry
+    initial_risk_usd = quantity * risk_abs
+    entry_fee_usd = notional_usd * entry_fee_bps / 10_000.0
+    base: dict[str, Any] = {
+        "entry_execution_type": entry_execution_type,
+        "exit_execution_type": exit_execution_type,
+        "entry_execution_type_status": "ASSUMED",
+        "exit_execution_type_status": "ASSUMED",
+        "execution_type_status": "ASSUMED",
+        "entry_fee_bps": entry_fee_bps,
+        "exit_fee_bps": exit_fee_bps,
+        "entry_notional_usd": notional_usd,
+        "exit_notional_usd": None,
+        "entry_fee_usd": entry_fee_usd,
+        "exit_fee_usd": None,
+        "total_fee_usd": None,
+        "gross_pnl_usd": None,
+        "net_pnl_usd": None,
+        "initial_risk_usd": initial_risk_usd,
+        "position_quantity_assumed": quantity,
+        "gross_r": None,
+        "net_r": None,
+        "notional_assumption": "ASSUMED_FIXED_NOTIONAL",
+        "pnl_basis": "REALIZED_ONLY_EXCLUDES_UNREALIZED_PNL",
+        "funding_included": False,
+        "slippage_included": False,
+    }
+    if exit_legs is None:
+        base["fee_accounting_status"] = "AMBIGUOUS_EXIT_NOT_PRICED"
+        return base
+
+    normalized_legs: list[tuple[float, float]] = []
+    for fraction, price in exit_legs:
+        fraction = float(fraction)
+        price = float(price)
+        if not math.isfinite(fraction) or not math.isfinite(price):
+            raise ValueError("Exit leg values must be finite")
+        if fraction < 0 or fraction > 1 or price <= 0:
+            raise ValueError("Exit fraction must be in [0, 1] and price positive")
+        normalized_legs.append((fraction, price))
+
+    exit_notional_usd = sum(quantity * fraction * price for fraction, price in normalized_legs)
+    exit_fee_usd = exit_notional_usd * exit_fee_bps / 10_000.0
+    total_fee_usd = entry_fee_usd + exit_fee_usd
+    base.update({
+        "exit_notional_usd": exit_notional_usd,
+        "exit_fee_usd": exit_fee_usd,
+        "total_fee_usd": total_fee_usd,
+    })
+    if not normalized_legs:
+        base["fee_accounting_status"] = "ENTRY_FEE_KNOWN_EXIT_PENDING"
+        return base
+
+    direction_sign = 1.0 if direction == "LONG" else -1.0
+    gross_pnl_usd = sum(
+        direction_sign * (price - entry) * quantity * fraction
+        for fraction, price in normalized_legs
+    )
+    net_pnl_usd = gross_pnl_usd - total_fee_usd
+    base.update({
+        "gross_pnl_usd": gross_pnl_usd,
+        "net_pnl_usd": net_pnl_usd,
+        "gross_r": gross_pnl_usd / initial_risk_usd,
+        "net_r": net_pnl_usd / initial_risk_usd,
+        "fee_accounting_status": "REALIZED_TO_DATE",
+    })
+    return base
+
+
+def _resolve_shadow_fee_inputs(
+    *,
+    fee_bps_per_side: float | None,
+    maker_fee_bps: float | None,
+    taker_fee_bps: float | None,
+    entry_execution_type: str,
+    exit_execution_type: str,
+) -> tuple[float, float, str, str]:
+    """Resolve new side-specific rates while preserving the old test/API argument."""
+    if fee_bps_per_side is not None:
+        # Backwards-compatible legacy mode: the single rate applies to each side.
+        entry_bps = exit_bps = float(fee_bps_per_side)
+    else:
+        maker = 2.0 if maker_fee_bps is None else float(maker_fee_bps)
+        taker = 5.0 if taker_fee_bps is None else float(taker_fee_bps)
+        entry_bps = _fee_bps_for_execution(
+            entry_execution_type, maker_fee_bps=maker, taker_fee_bps=taker,
+        )
+        exit_bps = _fee_bps_for_execution(
+            exit_execution_type, maker_fee_bps=maker, taker_fee_bps=taker,
+        )
+    return entry_bps, exit_bps, entry_execution_type.upper(), exit_execution_type.upper()
+
+
 def _estimated_shadow_fee_r(
     entry: float,
     exit_legs: list[tuple[float, float]],
     risk_abs: float,
     fee_bps_per_side: float | None,
 ) -> float | None:
-    """Estimate entry/exit taker fees in initial-risk units; excludes slippage/funding."""
+    """Legacy unit-quantity fee estimate retained for external compatibility."""
     if fee_bps_per_side is None:
         return None
     try:
@@ -548,13 +701,26 @@ def _record_shadow_exit_outcomes(
     invalidation: float,
     direction: str,
     risk_abs: float,
-    fee_bps_per_side: float | None,
+    fee_bps_per_side: float | None = None,
+    maker_fee_bps: float | None = None,
+    taker_fee_bps: float | None = None,
+    entry_execution_type: str = "TAKER",
+    exit_execution_type: str = "TAKER",
+    notional_usd: float = 1_000.0,
+    fee_assumption_source: str = "CURRENT_CONFIG_FOR_LEGACY_SIGNAL",
 ) -> int:
-    """Append conservative 1H-only shadow exit states for three fixed models.
+    """Append conservative 1H-only shadow exits for the three existing models.
 
-    These are observational simulations only. Same-candle target/stop conflicts
-    are recorded as ambiguous and never resolved by assuming a favorable path.
+    Same-candle TP/SL conflicts remain AMBIGUOUS. All execution types and the
+    fixed notional are assumptions; funding and slippage remain separate.
     """
+    entry_bps, exit_bps, entry_type, exit_type = _resolve_shadow_fee_inputs(
+        fee_bps_per_side=fee_bps_per_side,
+        maker_fee_bps=maker_fee_bps,
+        taker_fee_bps=taker_fee_bps,
+        entry_execution_type=entry_execution_type,
+        exit_execution_type=exit_execution_type,
+    )
     is_long = direction == "LONG"
     stop_hit = candle.low <= invalidation if is_long else candle.high >= invalidation
     event_at = datetime.fromtimestamp(candle.close_time_ms / 1000.0, tz=timezone.utc).isoformat()
@@ -579,12 +745,24 @@ def _record_shadow_exit_outcomes(
             "intrabar_order": "UNKNOWN_WHEN_LEVELS_SHARE_BAR",
             "slippage_included": False,
             "funding_included": False,
-            "fee_model": "taker_fee_per_side_only" if fee_bps_per_side is not None else "not_configured",
+            "fee_model": "SIDE_SPECIFIC_MAKER_TAKER",
+            "execution_type_status": "ASSUMED",
+            "notional_status": "ASSUMED_FIXED_NOTIONAL",
+            "fee_assumption_source": fee_assumption_source,
         },
+        "fee_assumption_source": fee_assumption_source,
         "strategy_version": active.get("strategy_version"),
     }
-    written = 0
 
+    def accounting(exit_legs: list[tuple[float, float]] | None) -> dict[str, Any]:
+        return _shadow_fee_accounting(
+            entry=entry, exit_legs=exit_legs, risk_abs=risk_abs,
+            direction=direction, notional_usd=notional_usd,
+            entry_fee_bps=entry_bps, exit_fee_bps=exit_bps,
+            entry_execution_type=entry_type, exit_execution_type=exit_type,
+        )
+
+    written = 0
     for model, target_r in (
         ("FIXED_TP_1_5R_STOP_1R_V1", 1.5),
         ("FIXED_TP_2R_STOP_1R_V1", 2.0),
@@ -597,20 +775,18 @@ def _record_shadow_exit_outcomes(
         target = entry + target_r * risk_abs if is_long else entry - target_r * risk_abs
         target_hit = candle.high >= target if is_long else candle.low <= target
         if target_hit and stop_hit:
-            status, terminal, gross_r = "AMBIGUOUS_SAME_1H_BAR", True, None
-            fee_r = None
+            status, terminal, legacy_gross_r, exit_legs = "AMBIGUOUS_SAME_1H_BAR", True, None, None
         elif target_hit:
-            status, terminal, gross_r = "TARGET_HIT", True, target_r
-            fee_r = _estimated_shadow_fee_r(
-                entry, [(1.0, target)], risk_abs, fee_bps_per_side,
-            )
+            status, terminal, legacy_gross_r, exit_legs = "TARGET_HIT", True, target_r, [(1.0, target)]
         elif stop_hit:
-            status, terminal, gross_r = "STOP_HIT", True, -1.0
-            fee_r = _estimated_shadow_fee_r(
-                entry, [(1.0, invalidation)], risk_abs, fee_bps_per_side,
-            )
+            status, terminal, legacy_gross_r, exit_legs = "STOP_HIT", True, -1.0, [(1.0, invalidation)]
         else:
-            status, terminal, gross_r, fee_r = "OPEN", False, None, None
+            status, terminal, legacy_gross_r, exit_legs = "OPEN", False, None, []
+        costs = accounting(exit_legs)
+        fee_r = (
+            costs["total_fee_usd"] / costs["initial_risk_usd"]
+            if costs.get("total_fee_usd") is not None else None
+        )
         record = {
             **common,
             "exit_model_version": model,
@@ -619,10 +795,12 @@ def _record_shadow_exit_outcomes(
             "stop_price": invalidation,
             "exit_status": status,
             "terminal": terminal,
-            "gross_realized_r": gross_r,
+            # Kept as a final-outcome-only legacy field.
+            "gross_realized_r": legacy_gross_r,
             "estimated_fee_r": fee_r,
-            "fee_adjusted_r": gross_r - fee_r if gross_r is not None and fee_r is not None else None,
+            "fee_adjusted_r": legacy_gross_r - fee_r if legacy_gross_r is not None and fee_r is not None else None,
             "same_bar_target_stop_conflict": bool(target_hit and stop_hit),
+            **costs,
         }
         written += int(store.record_signal_outcome(record))
 
@@ -638,29 +816,29 @@ def _record_shadow_exit_outcomes(
         prior_status = str((previous_partial or {}).get("exit_status") or "OPEN")
         if prior_status == "PARTIAL_TP1_5R_BE_ACTIVE":
             if be_hit:
-                status, terminal, gross_r = "BREAKEVEN_STOP_HIT", True, 0.75
-                fee_r = _estimated_shadow_fee_r(
-                    entry, [(0.5, target), (0.5, entry)], risk_abs, fee_bps_per_side,
-                )
+                status, terminal, legacy_gross_r = "BREAKEVEN_STOP_HIT", True, 0.75
+                exit_legs = [(0.5, target), (0.5, entry)]
             else:
-                status, terminal, gross_r, fee_r = "PARTIAL_TP1_5R_BE_ACTIVE", False, 0.75, None
+                status, terminal, legacy_gross_r = "PARTIAL_TP1_5R_BE_ACTIVE", False, 0.75
+                exit_legs = [(0.5, target)]
         elif stop_hit:
             if target_hit:
-                status, terminal, gross_r, fee_r = "AMBIGUOUS_INITIAL_STOP_AND_TARGET", True, None, None
+                status, terminal, legacy_gross_r, exit_legs = "AMBIGUOUS_INITIAL_STOP_AND_TARGET", True, None, None
             else:
-                status, terminal, gross_r = "STOP_HIT", True, -1.0
-                fee_r = _estimated_shadow_fee_r(
-                    entry, [(1.0, invalidation)], risk_abs, fee_bps_per_side,
-                )
+                status, terminal, legacy_gross_r, exit_legs = "STOP_HIT", True, -1.0, [(1.0, invalidation)]
         elif target_hit and be_hit:
-            # The partial target and the subsequently active break-even stop
-            # may both have traded inside this 1H candle; ordering is unknowable.
-            status, terminal, gross_r, fee_r = "AMBIGUOUS_TP_AND_BE_SAME_1H_BAR", True, None, None
+            status, terminal, legacy_gross_r, exit_legs = "AMBIGUOUS_TP_AND_BE_SAME_1H_BAR", True, None, None
         elif target_hit:
-            status, terminal, gross_r, fee_r = "PARTIAL_TP1_5R_BE_ACTIVE", False, 0.75, None
+            status, terminal, legacy_gross_r = "PARTIAL_TP1_5R_BE_ACTIVE", False, 0.75
+            exit_legs = [(0.5, target)]
         else:
-            status, terminal, gross_r, fee_r = "OPEN", False, None, None
+            status, terminal, legacy_gross_r, exit_legs = "OPEN", False, None, []
 
+        costs = accounting(exit_legs)
+        fee_r = (
+            costs["total_fee_usd"] / costs["initial_risk_usd"]
+            if costs.get("total_fee_usd") is not None else None
+        )
         record = {
             **common,
             "exit_model_version": partial_model,
@@ -671,10 +849,11 @@ def _record_shadow_exit_outcomes(
             "partial_fraction": 0.5,
             "exit_status": status,
             "terminal": terminal,
-            "gross_realized_r": gross_r,
+            "gross_realized_r": legacy_gross_r,
             "estimated_fee_r": fee_r,
-            "fee_adjusted_r": gross_r - fee_r if gross_r is not None and fee_r is not None else None,
+            "fee_adjusted_r": legacy_gross_r - fee_r if legacy_gross_r is not None and fee_r is not None else None,
             "same_bar_target_be_conflict": bool(target_hit and be_hit),
+            **costs,
         }
         written += int(store.record_signal_outcome(record))
 
@@ -687,6 +866,11 @@ def _record_signal_progress(
     candles_by_symbol: dict[str, list[Candle]],
     *,
     fee_bps_per_side: float | None = None,
+    maker_fee_bps: float | None = None,
+    taker_fee_bps: float | None = None,
+    entry_execution_type: str = "TAKER",
+    exit_execution_type: str = "TAKER",
+    notional_usd: float = 1_000.0,
 ) -> int:
     """Append cumulative signal and shadow-exit observations for each new closed 1H bar."""
     written = 0
@@ -715,7 +899,6 @@ def _record_signal_progress(
             continue
         risk_pct = (entry - level) / entry * 100.0 if direction == "LONG" else (level - entry) / entry * 100.0
         risk_abs = abs(entry - level)
-        # Refuse malformed legacy states with the stop on the wrong side.
         if not math.isfinite(risk_pct) or risk_pct <= 0 or not math.isfinite(risk_abs) or risk_abs <= 0:
             continue
 
@@ -784,10 +967,47 @@ def _record_signal_progress(
             if store.record_signal_outcome(record):
                 written += 1
             previous_mfe, previous_mae = mfe_pct, mae_pct
+            if fee_bps_per_side is not None:
+                active_fee_source = "LEGACY_PER_SIDE_CALL_OVERRIDE"
+                active_maker_fee = maker_fee_bps
+                active_taker_fee = taker_fee_bps
+                active_entry_type = entry_execution_type
+                active_exit_type = exit_execution_type
+                active_notional = notional_usd
+            else:
+                # SIGNAL_OPENED is immutable under outcome idempotency, unlike a
+                # notification row which may be refreshed on a retry/reminder.
+                # Always read the first durable fee snapshot from that marker.
+                opened_record = store.latest_signal_outcome(
+                    signal_id, outcome_event="SIGNAL_OPENED",
+                ) or {}
+                snapshot_fields = (
+                    "shadow_maker_fee_bps", "shadow_taker_fee_bps",
+                    "shadow_entry_execution_type", "shadow_exit_execution_type", "shadow_notional_usd",
+                )
+                has_snapshot = all(opened_record.get(field) is not None for field in snapshot_fields)
+                if has_snapshot:
+                    active_fee_source = "SNAPSHOTTED_AT_SIGNAL_OPEN"
+                    active_maker_fee = float(opened_record["shadow_maker_fee_bps"])
+                    active_taker_fee = float(opened_record["shadow_taker_fee_bps"])
+                    active_entry_type = str(opened_record["shadow_entry_execution_type"])
+                    active_exit_type = str(opened_record["shadow_exit_execution_type"])
+                    active_notional = float(opened_record["shadow_notional_usd"])
+                else:
+                    active_fee_source = "CURRENT_CONFIG_FOR_LEGACY_SIGNAL"
+                    active_maker_fee = maker_fee_bps
+                    active_taker_fee = taker_fee_bps
+                    active_entry_type = entry_execution_type
+                    active_exit_type = exit_execution_type
+                    active_notional = notional_usd
             _record_shadow_exit_outcomes(
                 store, signal_id=signal_id, active=active, candle=candle,
                 entry=entry, invalidation=level, direction=direction,
                 risk_abs=risk_abs, fee_bps_per_side=fee_bps_per_side,
+                maker_fee_bps=active_maker_fee, taker_fee_bps=active_taker_fee,
+                entry_execution_type=active_entry_type,
+                exit_execution_type=active_exit_type, notional_usd=active_notional,
+                fee_assumption_source=active_fee_source,
             )
     return written
 
@@ -1108,18 +1328,28 @@ def _has_required_confirmation(result: ScenarioResult, row: EnrichedRow) -> bool
     return True
 
 
-def _signal_entry_metadata(result: ScenarioResult) -> dict[str, Any]:
+def _signal_entry_metadata(result: ScenarioResult, settings: Settings | None = None) -> dict[str, Any]:
+    """Persist the signal's entry reference and frozen shadow fee assumptions."""
     last = (result.technical or {}).get("last_closed_1h") or {}
     close = last.get("close")
     close_time = last.get("close_time_ms")
     open_time = last.get("open_time_ms")
-    return {
+    metadata: dict[str, Any] = {
         "entry_reference": float(close) if isinstance(close, (int, float)) and math.isfinite(float(close)) and close > 0 else None,
         "entry_reference_time_ms": int(close_time) if isinstance(close_time, int) else None,
         "entry_reference_1h_open_time_ms": int(open_time) if isinstance(open_time, int) else None,
         "entry_reference_type": "BINANCE_FUTURES_LAST_CLOSED_1H_CLOSE",
         "strategy_version": __version__,
     }
+    if settings is not None:
+        metadata.update({
+            "shadow_maker_fee_bps": float(getattr(settings, "maker_fee_bps", 2.0)),
+            "shadow_taker_fee_bps": float(getattr(settings, "taker_fee_bps", 5.0)),
+            "shadow_entry_execution_type": str(getattr(settings, "shadow_entry_execution_type", "TAKER")).upper(),
+            "shadow_exit_execution_type": str(getattr(settings, "shadow_exit_execution_type", "TAKER")).upper(),
+            "shadow_notional_usd": float(getattr(settings, "shadow_notional_usd", 1000.0)),
+        })
+    return metadata
 
 
 def _notification_group(result: ScenarioResult) -> str:
@@ -1364,7 +1594,7 @@ def _collect_notifications(
                     pair=str((new_result.technical or {}).get("binance_symbol") or symbol),
                     scenario_code=_scenario_code(new_result.scenario), contract_type=contract_type,
                     delivery_status=marker_status,
-                    **_signal_entry_metadata(new_result),
+                    **_signal_entry_metadata(new_result, settings),
                 )
             continue
         if len(old_codes) > 1:
@@ -1393,7 +1623,7 @@ def _collect_notifications(
                 related_event_keys=[str(old["event_key"]) for old in old_actives],
                 contract_type=contract_type, delivery_status=delivery_status,
                 error=str(delivery.get("error") or "") or None,
-                **_signal_entry_metadata(new_result),
+                **_signal_entry_metadata(new_result, settings),
             )
             reversal_close_open_ms = (new_result.technical or {}).get("last_closed_1h", {}).get("open_time_ms")
             for old in old_actives:
@@ -1417,7 +1647,7 @@ def _collect_notifications(
                 direction=new_direction, invalidation_level=new_level, pair=pair,
                 scenario_code=_scenario_code(new_result.scenario), contract_type=contract_type,
                 delivery_status=delivery_status,
-                **_signal_entry_metadata(new_result),
+                **_signal_entry_metadata(new_result, settings),
             )
         elif not delivery.get("permanent_failure"):
             # Do not send a separate cancellation for the same old setup in this
@@ -1675,7 +1905,7 @@ def _collect_notifications(
                     scenario_code=_scenario_code(result.scenario), contract_type=contract_type,
                     delivery_status="SENT" if delivery.get("sent") else "UNKNOWN",
                     error=str(delivery.get("error") or "") or None,
-                    **_signal_entry_metadata(result),
+                    **_signal_entry_metadata(result, settings),
                 )
             outcomes.append({
                 "type": "confirmed_signal",
@@ -1963,6 +2193,11 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
                     "evaluated_at": scrape.fetched_at.isoformat(),
                     "direction": item.direction,
                     "reason": item.reason,
+                    "reason_code": item.reason_code,
+                    "diagnostic_status": item.diagnostic_status,
+                    "failed_checks": list(item.failed_checks),
+                    "unknown_checks": list(item.unknown_checks),
+                    "summary": item.summary,
                     "checks": [
                         {"name": check.name, "passed": check.passed, "actual": check.actual, "rule": check.rule}
                         for check in item.checks
@@ -1984,7 +2219,11 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         if not use_dry_run and active_states_before_scan:
             _record_signal_progress(
                 store, active_states_before_scan, candles_1h_by_symbol,
-                fee_bps_per_side=settings.trading_fee_bps_per_side,
+                maker_fee_bps=float(getattr(settings, "maker_fee_bps", 2.0)),
+                taker_fee_bps=float(getattr(settings, "taker_fee_bps", 5.0)),
+                entry_execution_type=str(getattr(settings, "shadow_entry_execution_type", "TAKER")),
+                exit_execution_type=str(getattr(settings, "shadow_exit_execution_type", "TAKER")),
+                notional_usd=float(getattr(settings, "shadow_notional_usd", 1000.0)),
             )
 
         allowed, guard_reason = _can_send_alerts(scrape, settings)
