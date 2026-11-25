@@ -292,6 +292,8 @@ def breakout_and_retest(
                 "tolerance": tolerance,
                 "breakout_open_time_ms": candles[breakout_idx].open_time_ms,
                 "retest_open_time_ms": candles[retest_idx].open_time_ms,
+                "retest_close_time_ms": candles[retest_idx].close_time_ms,
+                "retest_age_bars": max(0, last_index - retest_idx),
                 "last_close": candles[-1].close,
                 "extension_atr": extension_atr,
                 "max_extension_atr": max_extension_atr,

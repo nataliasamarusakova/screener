@@ -5,6 +5,7 @@ import math
 import re
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -17,6 +18,27 @@ from .models import Candle
 log = logging.getLogger(__name__)
 
 _DEPTH_LIMITS = (5, 10, 20, 50, 100, 500, 1000)
+_SPOT_MULTIPLIER_PREFIXES: tuple[tuple[str, float], ...] = (
+    ("1000000", 1_000_000.0),
+    ("100000", 100_000.0),
+    ("10000", 10_000.0),
+    ("1000", 1_000.0),
+    ("1M", 1_000_000.0),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SpotSymbolResolution:
+    futures_symbol: str
+    spot_symbol: str
+    futures_base_asset: str
+    spot_base_asset: str
+    quote_asset: str
+    base_multiplier: float = 1.0
+
+
+class SpotDataError(RuntimeError):
+    """A non-fatal Spot market-data error; it must not abort the Futures scan."""
 
 
 class BinanceDataError(RuntimeError):
@@ -239,7 +261,123 @@ class BinanceClient:
         matches = sorted(aliases & symbols)
         return matches[0] if len(matches) == 1 else None
 
-    def fetch_candles(self, coinalyze_symbol: str, interval: str, limit: int = 300) -> list[Candle]:
+    def fetch_open_interest_history(
+        self,
+        symbol: str,
+        *,
+        period: str = "5m",
+        limit: int = 500,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch USDⓈ-M open-interest history without an API key.
+
+        Base-unit OI and USD-valued OI are kept as separate source fields. The
+        response is not forward-filled: missing intervals remain missing.
+        """
+        valid_periods = {"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"}
+        if period not in valid_periods:
+            raise ValueError(f"Unsupported Binance OI period: {period}")
+        safe_limit = min(max(int(limit), 1), 500)
+        params: dict[str, Any] = {"symbol": str(symbol).upper(), "period": period, "limit": safe_limit}
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+        rows = self._get_json("/futures/data/openInterestHist", params)
+        if not isinstance(rows, list):
+            raise BinanceDataError(f"Unexpected Binance openInterestHist response for {symbol}")
+        result: list[dict[str, Any]] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            try:
+                timestamp = int(item["timestamp"])
+                oi_base_raw = str(item["sumOpenInterest"])
+                oi_usd_raw = str(item["sumOpenInterestValue"])
+                oi_base = float(oi_base_raw)
+                oi_usd = float(oi_usd_raw)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if (
+                timestamp < 0 or not math.isfinite(oi_base) or not math.isfinite(oi_usd)
+                or oi_base < 0 or oi_usd < 0
+            ):
+                continue
+            result.append({
+                "symbol": str(item.get("symbol") or symbol).upper(),
+                "timestamp": timestamp,
+                "sumOpenInterest": oi_base_raw,
+                "sumOpenInterestValue": oi_usd_raw,
+            })
+        unique = {item["timestamp"]: item for item in result}
+        return [unique[key] for key in sorted(unique)]
+
+    def fetch_funding_rate_history(
+        self,
+        symbol: str,
+        *,
+        limit: int = 200,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch historical funding records, preserving Regular/Special rateType."""
+        params: dict[str, Any] = {"symbol": str(symbol).upper(), "limit": min(max(int(limit), 1), 1000)}
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+        rows = self._get_json("/fapi/v1/fundingRate", params)
+        if not isinstance(rows, list):
+            raise BinanceDataError(f"Unexpected Binance fundingRate response for {symbol}")
+        result: list[dict[str, Any]] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            try:
+                funding_time = int(item["fundingTime"])
+                rate_raw = str(item["fundingRate"])
+                rate = float(rate_raw)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if funding_time < 0 or not math.isfinite(rate):
+                continue
+            mark_price_raw = item.get("markPrice")
+            if mark_price_raw not in (None, ""):
+                try:
+                    mark_price = float(mark_price_raw)
+                except (TypeError, ValueError, OverflowError):
+                    mark_price = math.nan
+                if not math.isfinite(mark_price) or mark_price < 0:
+                    mark_price_raw = None
+                else:
+                    mark_price_raw = str(mark_price_raw)
+            else:
+                mark_price_raw = None
+            rate_type = item.get("rateType")
+            if rate_type is not None:
+                rate_type = str(rate_type)
+                if rate_type not in {"Regular", "Special"}:
+                    log.warning("Unknown Binance funding rateType=%r for %s; preserving raw value", rate_type, symbol)
+            result.append({
+                "symbol": str(item.get("symbol") or symbol).upper(),
+                "fundingTime": funding_time,
+                "fundingRate": rate_raw,
+                "markPrice": mark_price_raw,
+                "rateType": rate_type,
+            })
+        unique = {item["fundingTime"]: item for item in result}
+        return [unique[key] for key in sorted(unique)]
+
+    def fetch_candles(
+        self,
+        coinalyze_symbol: str,
+        interval: str,
+        limit: int = 300,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list[Candle]:
         resolved = self.resolve_symbol(coinalyze_symbol)
         if not resolved:
             raise BinanceDataError(f"No active Binance USDT perpetual for Coinalyze symbol {coinalyze_symbol}")
@@ -251,7 +389,15 @@ class BinanceClient:
         if interval not in durations:
             raise ValueError(f"Unsupported Binance candle interval: {interval}")
         duration_ms = durations[interval]
-        rows = self._get_json("/fapi/v1/klines", {"symbol": resolved, "interval": interval, "limit": min(max(int(limit), 100), 1500)})
+        params: dict[str, Any] = {
+            "symbol": resolved, "interval": interval,
+            "limit": min(max(int(limit), 1), 1500),
+        }
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+        rows = self._get_json("/fapi/v1/klines", params)
         if not isinstance(rows, list):
             raise BinanceDataError(f"Unexpected Binance klines response for {resolved}/{interval}")
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -270,14 +416,23 @@ class BinanceClient:
                     volume=float(raw[5]),
                     quote_volume=float(raw[7]),
                     trades=int(raw[8]),
+                    taker_buy_base_volume=float(raw[9]) if len(raw) > 9 else None,
+                    taker_buy_quote_volume=float(raw[10]) if len(raw) > 10 else None,
                 )
             except (TypeError, ValueError):
                 continue
-            numeric = (candle.open, candle.high, candle.low, candle.close, candle.volume, candle.quote_volume)
+            numeric = (
+                candle.open, candle.high, candle.low, candle.close,
+                candle.volume, candle.quote_volume,
+                *(() if candle.taker_buy_base_volume is None else (candle.taker_buy_base_volume,)),
+                *(() if candle.taker_buy_quote_volume is None else (candle.taker_buy_quote_volume,)),
+            )
             sane = (
                 all(math.isfinite(value) for value in numeric)
                 and candle.open > 0 and candle.high > 0 and candle.low > 0 and candle.close > 0
                 and candle.volume >= 0 and candle.quote_volume >= 0 and candle.trades >= 0
+                and (candle.taker_buy_base_volume is None or 0 <= candle.taker_buy_base_volume <= candle.volume)
+                and (candle.taker_buy_quote_volume is None or 0 <= candle.taker_buy_quote_volume <= candle.quote_volume)
                 and candle.high >= max(candle.open, candle.close, candle.low)
                 and candle.low <= min(candle.open, candle.close, candle.high)
                 and candle.close_time_ms == candle.open_time_ms + duration_ms - 1
@@ -400,3 +555,207 @@ class BinanceClient:
             "estimated_only": True,
         }
 
+
+
+class SpotMarketClient:
+    """Unauthenticated Binance Spot market-data client using a direct session.
+
+    It deliberately does not inherit BinanceClient's WireProxy configuration.
+    Spot availability/errors are non-fatal and must never cancel a Futures scan.
+    """
+
+    def __init__(
+        self,
+        base_url: str = "https://data-api.binance.vision",
+        min_interval_sec: float = 0.08,
+        timeout_sec: float = 10.0,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.min_interval_sec = max(0.0, float(min_interval_sec))
+        self.timeout_sec = max(1.0, float(timeout_sec))
+        self.session = requests.Session()
+        self.session.trust_env = False
+        self.session.headers.update({"Accept": "application/json", "User-Agent": f"Market-Screener/{__version__}"})
+        self._last_request = 0.0
+        self._lock = threading.Lock()
+        self._exchange_info: list[dict[str, Any]] | None = None
+        self._symbols_by_base_quote: dict[tuple[str, str], list[str]] | None = None
+
+    def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        with self._lock:
+            wait = self.min_interval_sec - (time.monotonic() - self._last_request)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request = time.monotonic()
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = self.session.get(
+                    f"{self.base_url}{path}", params=params or {}, timeout=self.timeout_sec
+                )
+                if response.status_code in {418, 429}:
+                    raise SpotDataError(f"Binance Spot rate limit HTTP {response.status_code} for {path}")
+                if response.status_code == 400:
+                    try:
+                        payload = response.json()
+                    except ValueError:
+                        payload = {}
+                    if isinstance(payload, dict) and payload.get("code") == -1121:
+                        raise SpotDataError(f"SPOT_UNAVAILABLE: Invalid symbol (-1121) for {params or {}}")
+                    raise SpotDataError(f"Binance Spot rejected {path}: {payload}")
+                response.raise_for_status()
+                return response.json()
+            except SpotDataError:
+                raise
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                if attempt == 2:
+                    break
+                time.sleep(0.25 * (2 ** attempt))
+        raise SpotDataError(f"Binance Spot request failed for {path}: {last_error}") from last_error
+
+    def _load_exchange_info(self) -> list[dict[str, Any]]:
+        if self._exchange_info is not None:
+            return self._exchange_info
+        payload = self._get_json("/api/v3/exchangeInfo", {
+            "permissions": "SPOT",
+            "symbolStatus": "TRADING",
+            "showPermissionSets": "false",
+        })
+        if not isinstance(payload, dict) or not isinstance(payload.get("symbols"), list):
+            raise SpotDataError("Unexpected Binance Spot exchangeInfo response")
+        entries: list[dict[str, Any]] = []
+        by_base_quote: dict[tuple[str, str], list[str]] = {}
+        for item in payload["symbols"]:
+            if not isinstance(item, dict) or item.get("status") != "TRADING":
+                continue
+            permissions = item.get("permissions")
+            if isinstance(permissions, list) and "SPOT" not in permissions:
+                continue
+            if permissions is None:
+                # The request filters SPOT on the server. If an older response
+                # still includes permissionSets, use it as a defensive check.
+                permission_sets = item.get("permissionSets")
+                if permission_sets and not any(
+                    "SPOT" in group for group in permission_sets if isinstance(group, list)
+                ):
+                    continue
+            symbol = item.get("symbol")
+            base = item.get("baseAsset")
+            quote = item.get("quoteAsset")
+            if not all(isinstance(value, str) and value for value in (symbol, base, quote)):
+                continue
+            symbol = symbol.upper()
+            base, quote = base.upper(), quote.upper()
+            entries.append({"symbol": symbol, "baseAsset": base, "quoteAsset": quote})
+            by_base_quote.setdefault((base, quote), []).append(symbol)
+        # An empty (but well-formed) TRADING/SPOT universe means no Spot
+        # mapping is available; it is not a Futures scan failure.
+        self._exchange_info = entries
+        self._symbols_by_base_quote = by_base_quote
+        return entries
+
+    @staticmethod
+    def _futures_base_asset(futures_symbol: str) -> str:
+        value = str(futures_symbol or "").upper().strip()
+        for quote in ("USDT", "USDC", "BUSD", "USD"):
+            if value.endswith(quote):
+                return value[:-len(quote)]
+        return value
+
+    def resolve_symbol(self, futures_symbol: str, *, quote_asset: str = "USDT") -> SpotSymbolResolution | None:
+        """Map a tradable Futures contract to one active Spot pair.
+
+        A known multiplier prefix is resolved to its unscaled underlying first;
+        exact base-asset matching is the fallback. Either candidate is accepted
+        only when exchangeInfo confirms one active Spot symbol for base/quote.
+        """
+        entries = self._load_exchange_info()
+        assert self._symbols_by_base_quote is not None
+        futures = str(futures_symbol or "").upper().strip()
+        base = self._futures_base_asset(futures)
+        candidates: list[tuple[str, float]] = []
+        for prefix, multiplier in _SPOT_MULTIPLIER_PREFIXES:
+            if base.startswith(prefix) and len(base) > len(prefix):
+                # Prefer the unscaled underlying Spot asset for multiplier
+                # Futures contracts (e.g. 1000PEPE -> PEPE).
+                candidates.append((base[len(prefix):], multiplier))
+                break
+        candidates.append((base, 1.0))
+        for candidate_base, multiplier in candidates:
+            matches = self._symbols_by_base_quote.get((candidate_base, quote_asset.upper()), [])
+            if len(matches) == 1:
+                return SpotSymbolResolution(
+                    futures_symbol=futures,
+                    spot_symbol=matches[0],
+                    futures_base_asset=base,
+                    spot_base_asset=candidate_base,
+                    quote_asset=quote_asset.upper(),
+                    base_multiplier=multiplier,
+                )
+            if len(matches) > 1:
+                # Ambiguous exchange metadata is not resolved by guessing.
+                return None
+        return None
+
+    def fetch_candles(
+        self,
+        symbol: str,
+        interval: str = "5m",
+        *,
+        limit: int = 300,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list[Candle]:
+        durations = {
+            "1m": 60_000, "3m": 180_000, "5m": 300_000,
+            "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000,
+            "2h": 7_200_000, "4h": 14_400_000, "6h": 21_600_000,
+            "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000,
+        }
+        if interval not in durations:
+            raise ValueError(f"Unsupported Binance Spot candle interval: {interval}")
+        params: dict[str, Any] = {"symbol": str(symbol).upper(), "interval": interval, "limit": min(max(int(limit), 1), 1000)}
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+        rows = self._get_json("/api/v3/klines", params)
+        if not isinstance(rows, list):
+            raise SpotDataError(f"Unexpected Binance Spot klines response for {symbol}/{interval}")
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        candles: list[Candle] = []
+        duration_ms = durations[interval]
+        for raw in rows:
+            if not isinstance(raw, (list, tuple)) or len(raw) < 9:
+                continue
+            try:
+                candle = Candle(
+                    open_time_ms=int(raw[0]), close_time_ms=int(raw[6]),
+                    open=float(raw[1]), high=float(raw[2]), low=float(raw[3]), close=float(raw[4]),
+                    volume=float(raw[5]), quote_volume=float(raw[7]), trades=int(raw[8]),
+                    taker_buy_base_volume=float(raw[9]) if len(raw) > 9 else None,
+                    taker_buy_quote_volume=float(raw[10]) if len(raw) > 10 else None,
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            values = [candle.open, candle.high, candle.low, candle.close, candle.volume, candle.quote_volume]
+            values.extend(value for value in (candle.taker_buy_base_volume, candle.taker_buy_quote_volume) if value is not None)
+            sane = (
+                all(math.isfinite(value) for value in values)
+                and candle.open > 0 and candle.high >= max(candle.open, candle.close, candle.low)
+                and candle.low <= min(candle.open, candle.close, candle.high)
+                and candle.close > 0 and candle.volume >= 0 and candle.quote_volume >= 0 and candle.trades >= 0
+                and (candle.taker_buy_base_volume is None or 0 <= candle.taker_buy_base_volume <= candle.volume)
+                and (candle.taker_buy_quote_volume is None or 0 <= candle.taker_buy_quote_volume <= candle.quote_volume)
+                and candle.close_time_ms == candle.open_time_ms + duration_ms - 1
+            )
+            if sane and candle.close_time_ms < now_ms:
+                candles.append(candle)
+        unique = {item.open_time_ms: item for item in candles}
+        result = [unique[key] for key in sorted(unique)]
+        last_gap = next((idx for idx in range(len(result) - 1, 0, -1)
+                         if result[idx].open_time_ms - result[idx - 1].open_time_ms != duration_ms), None)
+        if last_gap is not None:
+            result = result[last_gap:]
+        return result

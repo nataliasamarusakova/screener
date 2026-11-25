@@ -9,7 +9,11 @@ import statistics
 from datetime import datetime, timezone
 from typing import Any
 
-from .binance import BinanceClient, BinanceCooldownActiveError, BinanceScanAbortError
+from . import __version__
+from .binance import (
+    BinanceClient, BinanceCooldownActiveError, BinanceScanAbortError,
+    BinanceDataError, SpotDataError, SpotMarketClient,
+)
 from .coinalyze import IncompleteUniverseError, ScrapeResult, fetch_table
 from .config import Settings
 from .metrics import EnrichedRow, analyze_universe
@@ -87,7 +91,9 @@ def _context_4h(
     }
 
 
-def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings) -> dict[str, Any]:
+def _technical_for_symbol(
+    client: BinanceClient, symbol: str, settings: Settings, *, include_outcome_history: bool = False
+) -> dict[str, Any]:
     structure_cfg = settings.p1.get("structure", {})
     left = int(structure_cfg.get("swing_left_bars", 2))
     right = int(structure_cfg.get("swing_right_bars", 2))
@@ -118,7 +124,11 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
     except Exception as exc:
         result["context_4h"] = {"trend": f"unavailable: {exc}"}
     try:
-        candles1h = client.fetch_candles(fetch_symbol, "1h", settings.binance_kline_limit)
+        candles1h = client.fetch_candles(
+            fetch_symbol, "1h", 1000 if include_outcome_history else settings.binance_kline_limit
+        )
+        if include_outcome_history:
+            result["_candles_1h"] = candles1h
         result["higher_low"] = higher_low(
             candles1h, left, right, lookback,
             max_age_bars=int(structure_cfg.get("higher_low_max_age_bars", 24)),
@@ -229,9 +239,279 @@ def _technical_for_symbol(client: BinanceClient, symbol: str, settings: Settings
     return result
 
 
+def _taker_flow_imbalance(candles: list[Candle]) -> float | None:
+    """Return quote-volume taker imbalance for complete source candles."""
+    valid = [
+        candle for candle in candles
+        if candle.quote_volume > 0
+        and candle.taker_buy_quote_volume is not None
+        and math.isfinite(candle.taker_buy_quote_volume)
+        and 0 <= candle.taker_buy_quote_volume <= candle.quote_volume
+    ]
+    if not valid:
+        return None
+    quote_volume = sum(item.quote_volume for item in valid)
+    buy_quote = sum(float(item.taker_buy_quote_volume) for item in valid)
+    if quote_volume <= 0:
+        return None
+    return 2.0 * (buy_quote / quote_volume) - 1.0
+
+
+def _oi_change_1h(records: list[dict[str, Any]], field: str) -> float | None:
+    """Compare the newest OI observation to the closest point about one hour earlier."""
+    if len(records) < 2:
+        return None
+    latest = records[-1]
+    try:
+        latest_time = int(latest["timestamp"])
+        latest_value = float(latest[field])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    target = latest_time - 60 * 60_000
+    candidates: list[tuple[int, float]] = []
+    for item in records[:-1]:
+        try:
+            timestamp = int(item["timestamp"])
+            value = float(item[field])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if timestamp <= target and math.isfinite(value) and value > 0:
+            candidates.append((timestamp, value))
+    if not candidates or latest_value <= 0 or not math.isfinite(latest_value):
+        return None
+    timestamp, previous_value = max(candidates, key=lambda pair: pair[0])
+    # A sparse history is UNKNOWN, not an inferred unchanged OI value.
+    if target - timestamp > 15 * 60_000:
+        return None
+    return (latest_value / previous_value - 1.0) * 100.0
+
+
+def _market_context_for_symbol(
+    futures_client: BinanceClient,
+    spot_client: SpotMarketClient,
+    symbol: str,
+    futures_candles_1h: list[Candle],
+    settings: Settings,
+) -> dict[str, Any]:
+    """Collect bounded on-demand Spot/OI/Funding context for one finalist."""
+    context: dict[str, Any] = {
+        "futures_symbol": symbol.upper(),
+        "futures_flow_1h": _taker_flow_imbalance(futures_candles_1h[-1:]),
+        "spot_status": "UNKNOWN",
+        "spot_symbol": None,
+        "base_multiplier": None,
+        "spot_flow_1h": None,
+        "oi_history_status": "UNKNOWN",
+        "oi_change_base_1h_pct": None,
+        "oi_change_usd_1h_pct": None,
+        "oi_latest_base": None,
+        "oi_latest_usd": None,
+        "funding_status": "UNKNOWN",
+        "funding_latest_regular": None,
+        "funding_average_regular": None,
+        "funding_latest_special": None,
+    }
+    oi_limit = int(settings.p1.get("scanner", {}).get("market_context_oi_limit", 500))
+    funding_limit = int(settings.p1.get("scanner", {}).get("market_context_funding_limit", 200))
+    kline_limit = int(settings.p1.get("scanner", {}).get("market_context_kline_limit", 300))
+
+    try:
+        oi_rows = futures_client.fetch_open_interest_history(symbol, period="5m", limit=oi_limit)
+        if oi_rows:
+            latest_oi_timestamp = int(oi_rows[-1].get("timestamp") or 0)
+            oi_is_fresh = 0 <= int(datetime.now(timezone.utc).timestamp() * 1000) - latest_oi_timestamp <= 15 * 60_000
+            context.update({
+                "oi_history_status": "AVAILABLE" if oi_is_fresh else "STALE",
+                "oi_change_base_1h_pct": _oi_change_1h(oi_rows, "sumOpenInterest") if oi_is_fresh else None,
+                "oi_change_usd_1h_pct": _oi_change_1h(oi_rows, "sumOpenInterestValue") if oi_is_fresh else None,
+                # Preserve raw last values for diagnostics, but consumers must
+                # respect oi_history_status before treating them as current.
+                "oi_latest_base": oi_rows[-1].get("sumOpenInterest"),
+                "oi_latest_usd": oi_rows[-1].get("sumOpenInterestValue"),
+                "oi_latest_timestamp_ms": latest_oi_timestamp,
+                "oi_observation_count": len(oi_rows),
+            })
+        else:
+            context["oi_history_status"] = "NO_DATA"
+    except BinanceScanAbortError:
+        raise
+    except BinanceDataError as exc:
+        context["oi_history_status"] = "ERROR"
+        context["oi_error"] = str(exc)[:300]
+
+    try:
+        funding_rows = futures_client.fetch_funding_rate_history(symbol, limit=funding_limit)
+        regular = [item for item in funding_rows if item.get("rateType") == "Regular"]
+        special = [item for item in funding_rows if item.get("rateType") == "Special"]
+        if funding_rows:
+            context["funding_status"] = "AVAILABLE"
+            context["funding_latest_regular"] = regular[-1] if regular else None
+            context["funding_average_regular"] = (
+                sum(float(item["fundingRate"]) for item in regular[-3:]) / len(regular[-3:])
+                if regular else None
+            )
+            context["funding_latest_special"] = special[-1] if special else None
+            context["funding_unknown_rate_type_count"] = sum(
+                item.get("rateType") not in {"Regular", "Special"} for item in funding_rows
+            )
+            context["funding_observation_count"] = len(funding_rows)
+        else:
+            context["funding_status"] = "NO_DATA"
+    except BinanceScanAbortError:
+        raise
+    except BinanceDataError as exc:
+        context["funding_status"] = "ERROR"
+        context["funding_error"] = str(exc)[:300]
+
+    try:
+        resolution = spot_client.resolve_symbol(symbol)
+    except SpotDataError as exc:
+        context["spot_status"] = "ERROR"
+        context["spot_error"] = str(exc)[:300]
+        return context
+    if resolution is None:
+        context["spot_status"] = "SPOT_UNAVAILABLE"
+        return context
+    context.update({
+        "spot_status": "AVAILABLE",
+        "spot_symbol": resolution.spot_symbol,
+        "spot_base_asset": resolution.spot_base_asset,
+        "futures_base_asset": resolution.futures_base_asset,
+        "base_multiplier": resolution.base_multiplier,
+    })
+    try:
+        spot_candles = spot_client.fetch_candles(
+            resolution.spot_symbol, "5m", limit=kline_limit
+        )
+        if len(spot_candles) >= 12:
+            last_hour = spot_candles[-12:]
+            continuous = all(
+                later.open_time_ms - earlier.open_time_ms == 5 * 60_000
+                for earlier, later in zip(last_hour, last_hour[1:])
+            )
+            age_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - spot_candles[-1].close_time_ms
+            if not continuous:
+                context["spot_status"] = "DATA_GAP"
+            elif age_ms < 0 or age_ms > 7 * 60_000:
+                context["spot_status"] = "STALE"
+                context["spot_last_closed_5m_open_time_ms"] = spot_candles[-1].open_time_ms
+                context["spot_latest_candle_age_ms"] = age_ms
+            else:
+                context["spot_flow_1h"] = _taker_flow_imbalance(last_hour)
+                context["spot_last_closed_5m_open_time_ms"] = spot_candles[-1].open_time_ms
+                context["spot_observation_count"] = len(spot_candles)
+                context["spot_latest_candle_age_ms"] = age_ms
+        else:
+            context["spot_status"] = "NO_DATA"
+    except SpotDataError as exc:
+        # A stale/de-listed/missing Spot pair is isolated from the Futures scan.
+        context["spot_status"] = "SPOT_UNAVAILABLE" if "-1121" in str(exc) else "ERROR"
+        context["spot_error"] = str(exc)[:300]
+    return context
+
+
+def _record_signal_progress(
+    store: Store,
+    active_states: list[dict[str, Any]],
+    candles_by_symbol: dict[str, list[Candle]],
+) -> int:
+    """Append one cumulative outcome observation per active signal/new closed 1H candle."""
+    written = 0
+    seen_signals: set[str] = set()
+    for active in active_states:
+        event_key = str(active.get("event_key") or "")
+        contract_type = str(active.get("contract_type") or "").upper()
+        if not event_key or not contract_type:
+            continue
+        signal_id = hashlib.sha256(f"{contract_type}|{event_key}".encode("utf-8")).hexdigest()
+        if signal_id in seen_signals:
+            continue
+        seen_signals.add(signal_id)
+        symbol = str(active.get("pair") or "").upper()
+        candles = candles_by_symbol.get(symbol, [])
+        if not candles:
+            continue
+        try:
+            entry = float(active["entry_reference"])
+            level = float(active["invalidation_level"])
+            entry_close_ms = int(active["entry_reference_time_ms"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        direction = str(active.get("direction") or "").upper()
+        if direction not in {"LONG", "SHORT"} or not all(math.isfinite(x) and x > 0 for x in (entry, level)):
+            continue
+        latest = candles[-1]
+        if latest.open_time_ms <= entry_close_ms:
+            continue
+        previous = store.latest_signal_outcome(signal_id)
+        if previous and int(previous.get("as_of_1h_open_time_ms") or 0) >= latest.open_time_ms:
+            continue
+        if direction == "LONG":
+            current_mfe_pct = (latest.high / entry - 1.0) * 100.0
+            current_mae_pct = (latest.low / entry - 1.0) * 100.0
+            touched = latest.low <= level
+            breached = latest.close < level
+            risk_pct = (entry - level) / entry * 100.0
+        else:
+            current_mfe_pct = (entry / latest.low - 1.0) * 100.0 if latest.low > 0 else 0.0
+            current_mae_pct = (entry / latest.high - 1.0) * 100.0 if latest.high > 0 else 0.0
+            touched = latest.high >= level
+            breached = latest.close > level
+            risk_pct = (level - entry) / entry * 100.0
+        # A malformed legacy state can contain an invalidation on the wrong
+        # side of the reference entry. Do not manufacture R multiples from it.
+        if not math.isfinite(risk_pct) or risk_pct <= 0:
+            continue
+        mfe_pct = max(float(previous.get("mfe_pct", 0.0)), current_mfe_pct) if previous else max(0.0, current_mfe_pct)
+        mae_pct = min(float(previous.get("mae_pct", 0.0)), current_mae_pct) if previous else min(0.0, current_mae_pct)
+        risk_fraction = risk_pct / 100.0
+        mfe_r = (mfe_pct / 100.0) / risk_fraction if risk_fraction > 0 else None
+        mae_r = (mae_pct / 100.0) / risk_fraction if risk_fraction > 0 else None
+        first_touch = (previous or {}).get("first_touch_invalidation_at_ms")
+        if first_touch is None and touched:
+            first_touch = latest.open_time_ms
+        first_breach = (previous or {}).get("first_1h_close_breach_at_ms")
+        if first_breach is None and breached:
+            first_breach = latest.close_time_ms
+        event_at = datetime.fromtimestamp(latest.close_time_ms / 1000.0, tz=timezone.utc).isoformat()
+        record = {
+            "signal_id": signal_id,
+            "outcome_event": "SIGNAL_PROGRESS",
+            "evaluation_horizon": "LIVE",
+            "exit_model_version": "STRUCTURAL_1H_V1",
+            "as_of_1h_open_time_ms": latest.open_time_ms,
+            "event_at": event_at,
+            "symbol": symbol,
+            "scenario": active.get("scenario_code"),
+            "contract_type": contract_type,
+            "direction": direction,
+            "entry_reference": entry,
+            "entry_reference_time_ms": entry_close_ms,
+            "invalidation_level": level,
+            "risk_pct": risk_pct,
+            "mfe_pct": mfe_pct,
+            "mae_pct": mae_pct,
+            "mfe_r": mfe_r,
+            "mae_r": mae_r,
+            "first_touch_invalidation_at_ms": first_touch,
+            "first_touch_invalidation_bar_open_time_ms": first_touch,
+            "first_touch_invalidation_time_precision": "WITHIN_1H_BAR_UNKNOWN",
+            "first_1h_close_breach_at_ms": first_breach,
+            "data_quality": {
+                "path_resolution": "1H_OHLC",
+                "intrabar_order": "UNKNOWN",
+                "first_touch_time_is_bar_open_not_exact_execution_time": True,
+            },
+            "strategy_version": active.get("strategy_version"),
+        }
+        written += int(store.record_signal_outcome(record))
+    return written
+
+
 def _preliminary_candidate_symbols(
     enriched: list[EnrichedRow], stats: Any, settings: Settings, store: Store,
     *, contract_type: str | None = None, as_of: datetime | None = None,
+    current_observations: dict[str, dict[str, Any]] | None = None,
 ) -> set[str]:
     symbols: set[str] = set()
     # Continue monitoring 1H invalidation for every previously delivered active
@@ -268,9 +548,10 @@ def _preliminary_candidate_symbols(
             row.symbol,
             required=int(settings.p1.get("scenario", {}).get("spot_accumulation_required_snapshots", 3)),
             interval_hours=float(settings.p1.get("scenario", {}).get("snapshot_interval_hours", 4.0)),
-            tolerance_minutes=int(settings.p1.get("scenario", {}).get("snapshot_interval_tolerance_minutes", 10)),
+            tolerance_minutes=int(settings.p1.get("scenario", {}).get("spot_accumulation_snapshot_tolerance_minutes", 30)),
             as_of=as_of,
             contract_type=contract_type,
+            current_observation=(current_observations or {}).get(row.symbol),
         )
         draft = evaluate_scenarios(
             row, stats, settings.p1,
@@ -325,8 +606,8 @@ def _can_send_alerts(scrape: ScrapeResult, settings: Settings) -> tuple[bool, st
         return False, "Could not verify Perpetual contracts view; notifications blocked"
     if scrape.contract_type != expected and scrape.contract_type != "UNKNOWN":
         return False, f"Contract type {scrape.contract_type} does not match expected {expected}"
-    if scrape.missing_required_columns:
-        return False, "Required P1 table columns missing: " + ", ".join(scrape.missing_required_columns)
+    # Missing metrics are evaluated per scenario as UNKNOWN by its own checks.
+    # A global Coinalyze column gate would block unrelated scenarios.
     return True, "OK"
 
 
@@ -542,6 +823,20 @@ def _has_required_confirmation(result: ScenarioResult, row: EnrichedRow) -> bool
     # 4H context is descriptive only; requiring a 4H pivot here creates an
     # undocumented delivery veto on scenarios already confirmed on closed 1H data.
     return True
+
+
+def _signal_entry_metadata(result: ScenarioResult) -> dict[str, Any]:
+    last = (result.technical or {}).get("last_closed_1h") or {}
+    close = last.get("close")
+    close_time = last.get("close_time_ms")
+    open_time = last.get("open_time_ms")
+    return {
+        "entry_reference": float(close) if isinstance(close, (int, float)) and math.isfinite(float(close)) and close > 0 else None,
+        "entry_reference_time_ms": int(close_time) if isinstance(close_time, int) else None,
+        "entry_reference_1h_open_time_ms": int(open_time) if isinstance(open_time, int) else None,
+        "entry_reference_type": "BINANCE_FUTURES_LAST_CLOSED_1H_CLOSE",
+        "strategy_version": __version__,
+    }
 
 
 def _notification_group(result: ScenarioResult) -> str:
@@ -762,6 +1057,11 @@ def _collect_notifications(
                         scenario_code=_scenario_code(_event_group_parts(old_group)[1]),
                         contract_type=contract_type,
                         delivery_status=str(latest_old["delivery_status"]),
+                        related_event_keys=[str(latest_old.get("event_key") or "")],
+                        outcome_as_of_1h_open_time_ms=(
+                            marker.get("entry_reference_1h_open_time_ms")
+                            if isinstance(marker.get("entry_reference_1h_open_time_ms"), int) else None
+                        ),
                     )
                 reversed_groups.add((old_group, recipient_key))
             latest_new = store.latest_notification_state(
@@ -781,6 +1081,7 @@ def _collect_notifications(
                     pair=str((new_result.technical or {}).get("binance_symbol") or symbol),
                     scenario_code=_scenario_code(new_result.scenario), contract_type=contract_type,
                     delivery_status=marker_status,
+                    **_signal_entry_metadata(new_result),
                 )
             continue
         if len(old_codes) > 1:
@@ -809,7 +1110,9 @@ def _collect_notifications(
                 related_event_keys=[str(old["event_key"]) for old in old_actives],
                 contract_type=contract_type, delivery_status=delivery_status,
                 error=str(delivery.get("error") or "") or None,
+                **_signal_entry_metadata(new_result),
             )
+            reversal_close_open_ms = (new_result.technical or {}).get("last_closed_1h", {}).get("open_time_ms")
             for old in old_actives:
                 old_group = str(old.get("event_group") or "")
                 store.record_notification(
@@ -819,6 +1122,10 @@ def _collect_notifications(
                     invalidation_level=float(old["invalidation_level"]),
                     pair=str(old.get("pair") or pair), scenario_code=_event_group_parts(old_group)[1].split(" — ", 1)[0],
                     contract_type=contract_type, delivery_status=delivery_status,
+                    related_event_keys=[str(old.get("event_key") or "")],
+                    outcome_as_of_1h_open_time_ms=(
+                        int(reversal_close_open_ms) if isinstance(reversal_close_open_ms, int) else None
+                    ),
                 )
                 reversed_groups.add((old_group, recipient_key))
             store.record_notification(
@@ -827,6 +1134,7 @@ def _collect_notifications(
                 direction=new_direction, invalidation_level=new_level, pair=pair,
                 scenario_code=_scenario_code(new_result.scenario), contract_type=contract_type,
                 delivery_status=delivery_status,
+                **_signal_entry_metadata(new_result),
             )
         elif not delivery.get("permanent_failure"):
             # Do not send a separate cancellation for the same old setup in this
@@ -926,6 +1234,11 @@ def _collect_notifications(
                     pair=str(latest_old.get("pair") or symbol),
                     scenario_code=str(latest_old.get("scenario_code") or "UNKNOWN"),
                     contract_type=marker_contract, delivery_status=marker_status,
+                    related_event_keys=[str(latest_old.get("event_key") or "")],
+                    outcome_as_of_1h_open_time_ms=(
+                        marker.get("entry_reference_1h_open_time_ms")
+                        if isinstance(marker.get("entry_reference_1h_open_time_ms"), int) else None
+                    ),
                 )
 
         if (
@@ -941,6 +1254,11 @@ def _collect_notifications(
                 pair=str(marker.get("pair") or symbol),
                 scenario_code=str(marker.get("scenario_code") or "UNKNOWN"),
                 contract_type=marker_contract, delivery_status=marker_status,
+                entry_reference=marker.get("entry_reference"),
+                entry_reference_time_ms=marker.get("entry_reference_time_ms"),
+                entry_reference_1h_open_time_ms=marker.get("entry_reference_1h_open_time_ms"),
+                entry_reference_type=marker.get("entry_reference_type"),
+                strategy_version=marker.get("strategy_version"),
             )
 
     # Invalidate remaining ACTIVE scenarios by the exact 1H level saved when
@@ -989,6 +1307,10 @@ def _collect_notifications(
                 pair=pair, scenario_code=_scenario_code(scenario), contract_type=active_contract_type,
                 delivery_status="SENT" if delivery.get("sent") else "UNKNOWN",
                 error=str(delivery.get("error") or "") or None,
+                related_event_keys=[str(active.get("event_key") or "")],
+                outcome_as_of_1h_open_time_ms=(
+                    last.get("open_time_ms") if isinstance(last.get("open_time_ms"), int) else None
+                ),
             )
         if not delivery.get("permanent_failure"):
             outcomes.append({"type": "cancellation", "symbol": symbol, "sent": bool(delivery.get("sent")), "delivery": delivery})
@@ -1070,6 +1392,7 @@ def _collect_notifications(
                     scenario_code=_scenario_code(result.scenario), contract_type=contract_type,
                     delivery_status="SENT" if delivery.get("sent") else "UNKNOWN",
                     error=str(delivery.get("error") or "") or None,
+                    **_signal_entry_metadata(result),
                 )
             outcomes.append({
                 "type": "confirmed_signal",
@@ -1118,24 +1441,35 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         snapshot_interval_hours = float(snapshot_cfg.get("snapshot_interval_hours", 4.0))
         snapshot_tolerance_minutes = int(snapshot_cfg.get("snapshot_interval_tolerance_minutes", 10))
         snapshot_saved = False
-        if scrape.missing_required_columns:
-            log.warning(
-                "Skipping P1 history snapshot because required columns are missing: %s",
-                ", ".join(scrape.missing_required_columns),
+        snapshot_pending = (
+            not use_dry_run
+            and not unchanged
+            and store.snapshot_due(
+                scrape.fetched_at,
+                interval_hours=snapshot_interval_hours,
+                tolerance_minutes=snapshot_tolerance_minutes,
+                contract_type=scrape.contract_type,
             )
-        elif not use_dry_run and not unchanged and store.snapshot_due(
-            scrape.fetched_at,
-            interval_hours=snapshot_interval_hours,
-            tolerance_minutes=snapshot_tolerance_minutes,
-            contract_type=scrape.contract_type,
-        ):
-            store.add_snapshot(scrape.fetched_at, scrape.contract_type, scrape.rows)
-            snapshot_saved = True
+        )
+        # Keep the current due observation separate until all scenario decisions
+        # have consumed the preceding committed history. This is required by
+        # SHORT E: the live F/S turn-down must not replace the last non-bearish
+        # historical row before its historical predicates are checked.
+        current_observations: dict[str, dict[str, Any]] = {}
+        if snapshot_pending:
+            current_observations = {
+                row.symbol: {
+                    **row.to_dict(),
+                    "snapshot_at": scrape.fetched_at.isoformat(),
+                    "contract_type": scrape.contract_type,
+                }
+                for row in scrape.rows
+            }
         enriched, stats = analyze_universe(scrape.rows, settings.p1)
         if unchanged:
             stats.warnings.append("No new Coinalyze table data: parsed values fully match the previous saved snapshot")
             log.info("Coinalyze values unchanged vs the previous saved snapshot")
-        elif not snapshot_saved:
+        elif not snapshot_pending:
             stats.warnings.append(
                 f"Market values changed, but durable history is sampled every ~{snapshot_interval_hours:g}h; "
                 "this poll is not counted as an independent P1 snapshot"
@@ -1143,12 +1477,15 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
         if scrape.missing_columns:
             stats.warnings.append("Missing recognized optional/required columns: " + ", ".join(scrape.missing_columns))
         if scrape.missing_required_columns:
-            stats.warnings.append("Missing REQUIRED P1 columns: " + ", ".join(scrape.missing_required_columns))
-            stats.warnings.append("Snapshot not committed to P1 history because the required schema is incomplete")
+            stats.warnings.append(
+                "Some legacy P1 diagnostic fields are missing; affected scenario checks remain UNKNOWN: "
+                + ", ".join(scrape.missing_required_columns)
+            )
         if scrape.contract_type == "UNKNOWN":
             stats.warnings.append("Perpetual vs All Contracts could not be verified")
         candidate_symbols = _preliminary_candidate_symbols(
-            enriched, stats, settings, store, contract_type=scrape.contract_type, as_of=scrape.fetched_at
+            enriched, stats, settings, store, contract_type=scrape.contract_type,
+            as_of=scrape.fetched_at, current_observations=current_observations,
         )
         binance = BinanceClient(
             settings.binance_base_url,
@@ -1156,10 +1493,38 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             http_proxy=settings.binance_http_proxy,
             vpn_enabled=settings.binance_vpn_enabled,
         )
+        recipient_keys = [
+            key for chat_id in settings.telegram_chat_ids
+            if (key := _recipient_storage_key(str(chat_id), settings)) is not None
+        ]
+        active_states_before_scan = store.active_notification_states(
+            recipient_keys=recipient_keys, contract_type=scrape.contract_type
+        )
+        # Active notification event groups use Coinalyze symbols, while
+        # their ``pair`` field stores the resolved Binance USD-M symbol.
+        active_coinalyze_symbols = {
+            str(item.get("event_group") or "").split("|", 1)[0].upper()
+            for item in active_states_before_scan
+            if str(item.get("event_group") or "").split("|", 1)[0]
+        }
         technical_by_symbol: dict[str, dict[str, Any]] = {}
+        candles_1h_by_symbol: dict[str, list[Candle]] = {}
         for index, symbol in enumerate(sorted(candidate_symbols), start=1):
             log.info("Fetching candles for chart candidate %d/%d: %s", index, len(candidate_symbols), symbol)
-            technical_by_symbol[symbol] = _technical_for_symbol(binance, symbol, settings)
+            if symbol.upper() in active_coinalyze_symbols:
+                technical = _technical_for_symbol(
+                    binance, symbol, settings, include_outcome_history=True
+                )
+            else:
+                # Keep the established call shape for the common path and
+                # existing integrations that wrap this function.
+                technical = _technical_for_symbol(binance, symbol, settings)
+            outcome_candles = technical.pop("_candles_1h", [])
+            candles_1h_by_symbol[symbol.upper()] = outcome_candles
+            resolved_pair = str(technical.get("binance_symbol") or "").upper()
+            if resolved_pair and symbol.upper() in active_coinalyze_symbols:
+                candles_1h_by_symbol[resolved_pair] = outcome_candles
+            technical_by_symbol[symbol] = technical
         chart_ready = sum(
             isinstance(item.get("last_closed_1h"), dict)
             and isinstance((context := item.get("context_4h")), dict)
@@ -1184,9 +1549,10 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
                 row.symbol,
                 required=int(settings.p1.get("scenario", {}).get("spot_accumulation_required_snapshots", 3)),
                 interval_hours=float(settings.p1.get("scenario", {}).get("snapshot_interval_hours", 4.0)),
-                tolerance_minutes=int(settings.p1.get("scenario", {}).get("snapshot_interval_tolerance_minutes", 10)),
+                tolerance_minutes=int(settings.p1.get("scenario", {}).get("spot_accumulation_snapshot_tolerance_minutes", 30)),
                 as_of=scrape.fetched_at,
                 contract_type=scrape.contract_type,
+                current_observation=current_observations.get(row.symbol),
             )
             technical = {"spot_sequence_ok": spot_sequence, **technical_by_symbol.get(row.symbol, {})}
             scenario_results = evaluate_scenarios(
@@ -1196,6 +1562,127 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
                 # Preserve both global diagnostics (order book/context) and scenario-specific predicates.
                 scenario_result.technical = {**technical, **scenario_result.technical}
             results.extend(scenario_results)
+
+        if snapshot_pending:
+            store.add_snapshot(scrape.fetched_at, scrape.contract_type, scrape.rows)
+            snapshot_saved = True
+
+        # Persist only pre-screened/near-confirmation candidates. The evaluation
+        # key includes strategy/status/last closed 1H candle, so an unchanged
+        # NOT_MET universe never creates 97 x 9 records every five minutes.
+        rows_by_symbol = {item.market.symbol: item for item in enriched}
+        evaluation_results = [
+            item for item in results
+            if item.near_candidate or item.status in {"CONFIRMED_SIGNAL", "CONFIRMED_SIGNAL_WITH_WARNING"}
+        ]
+        evaluation_symbols: list[str] = []
+        evaluation_symbol_priority: dict[str, tuple[float, float]] = {}
+        if not use_dry_run:
+            for item in evaluation_results:
+                symbol = item.symbol.upper()
+                row = rows_by_symbol.get(symbol)
+                if row is None:
+                    continue
+                last = (technical_by_symbol.get(symbol, {}).get("last_closed_1h") or {})
+                last_open = last.get("open_time_ms") if isinstance(last.get("open_time_ms"), int) else None
+                if last_open is None:
+                    # No closed 1H candle means no stable evaluation identity.
+                    continue
+                if store.has_signal_evaluation(
+                    contract_type=scrape.contract_type,
+                    symbol=symbol,
+                    scenario=_scenario_code(item.scenario),
+                    strategy_version=__version__,
+                    status=item.status,
+                    last_closed_1h_open_time_ms=last_open,
+                ):
+                    continue
+                evaluation_symbol_priority[symbol] = max(
+                    evaluation_symbol_priority.get(symbol, (0.0, 0.0)),
+                    (float(row.market.volume24_usd or 0.0), float(row.market.oi_usd or 0.0)),
+                )
+            max_context = max(0, int(settings.p1.get("scanner", {}).get("market_context_max_candidates", 20)))
+            evaluation_symbols = sorted(
+                evaluation_symbol_priority,
+                key=lambda symbol: evaluation_symbol_priority[symbol],
+                reverse=True,
+            )[:max_context]
+
+        market_context_by_symbol: dict[str, dict[str, Any]] = {}
+        if evaluation_symbols:
+            spot_client = SpotMarketClient(min_interval_sec=settings.binance_request_interval_sec)
+            for symbol in evaluation_symbols:
+                futures_symbol = str(technical_by_symbol.get(symbol, {}).get("binance_symbol") or "")
+                if not futures_symbol:
+                    market_context_by_symbol[symbol] = {"status": "FUTURES_SYMBOL_UNAVAILABLE"}
+                    continue
+                try:
+                    market_context_by_symbol[symbol] = _market_context_for_symbol(
+                        binance, spot_client, futures_symbol,
+                        candles_1h_by_symbol.get(symbol, []), settings,
+                    )
+                except BinanceScanAbortError as exc:
+                    market_context_by_symbol[symbol] = {
+                        "status": "BINANCE_CONTEXT_ABORT",
+                        "futures_symbol": futures_symbol,
+                        "error": str(exc)[:300],
+                    }
+                    if exc.retry_after_seconds is not None and exc.retry_after_seconds > 0:
+                        try:
+                            store.record_binance_cooldown(exc.retry_after_seconds)
+                        except Exception:
+                            log.exception("Could not persist Binance cooldown after optional context request")
+                    log.error("Optional market-context collection stopped after Binance guard: %s", exc)
+                    break
+                except BinanceDataError as exc:
+                    market_context_by_symbol[symbol] = {
+                        "status": "PARTIAL", "futures_symbol": futures_symbol,
+                        "error": str(exc)[:300],
+                    }
+                except Exception as exc:
+                    market_context_by_symbol[symbol] = {
+                        "status": "PARTIAL", "futures_symbol": futures_symbol,
+                        "error": str(exc)[:300],
+                    }
+
+        if not use_dry_run:
+            for item in evaluation_results:
+                symbol = item.symbol.upper()
+                row = rows_by_symbol.get(symbol)
+                if row is None:
+                    continue
+                last = technical_by_symbol.get(symbol, {}).get("last_closed_1h") or {}
+                if not isinstance(last.get("open_time_ms"), int):
+                    continue
+                market_record = row.market.to_dict()
+                market_record.pop("raw", None)
+                store.record_signal_evaluation({
+                    "contract_type": scrape.contract_type,
+                    "symbol": symbol,
+                    "scenario": _scenario_code(item.scenario),
+                    "strategy_version": __version__,
+                    "status": item.status,
+                    "last_closed_1h_open_time_ms": last.get("open_time_ms"),
+                    "evaluated_at": scrape.fetched_at.isoformat(),
+                    "direction": item.direction,
+                    "reason": item.reason,
+                    "checks": [
+                        {"name": check.name, "passed": check.passed, "actual": check.actual, "rule": check.rule}
+                        for check in item.checks
+                    ],
+                    "features": market_record,
+                    "technical": item.technical,
+                    "market_context": market_context_by_symbol.get(symbol),
+                    "data_quality": {
+                        "unknown_checks": item.unknown_count,
+                        "quality_flags": list(item.quality_flags),
+                    },
+                })
+
+        # Active-signal progress is sampled once per newly closed 1H candle.
+        # OHLC paths are hourly and do not claim intrabar event ordering.
+        if not use_dry_run and active_states_before_scan:
+            _record_signal_progress(store, active_states_before_scan, candles_1h_by_symbol)
 
         allowed, guard_reason = _can_send_alerts(scrape, settings)
         # A fresh closed Binance 1H candle can confirm a new trigger even when

@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -38,13 +39,20 @@ class Store:
         self.notifications_path = self.data_dir / "notifications.jsonl"
         self.poll_state_path = self.data_dir / "poll_state.json"
         self.runs_path = self.data_dir / "runs.jsonl"
+        self.signal_evaluations_dir = self.data_dir / "signal_evaluations"
+        self.signal_outcomes_dir = self.data_dir / "signal_outcomes"
         if create_files:
             for path in self.paths:
                 path.touch(exist_ok=True)
+            # Analytical directories are created lazily on the first append so
+            # legacy dry-runs do not change the persisted data tree.
         self._manifests_cache: list[dict[str, Any]] | None = None
         self._history_cache: dict[str, list[dict[str, Any]]] | None = None
         self._notification_cache: list[dict[str, Any]] | None = None
         self._notification_cache_signature: tuple[int, int] | None = None
+        self._signal_evaluation_keys: set[tuple[Any, ...]] | None = None
+        self._signal_outcome_keys: set[tuple[Any, ...]] | None = None
+        self._signal_outcomes_cache: list[dict[str, Any]] | None = None
 
     @property
     def paths(self) -> tuple[Path, Path, Path, Path]:
@@ -184,6 +192,60 @@ class Store:
             except FileNotFoundError:
                 pass
             raise
+
+    @staticmethod
+    def _as_utc_datetime(value: Any) -> datetime:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            parsed = datetime.fromtimestamp(float(value) / 1000.0, tz=timezone.utc)
+        else:
+            parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @classmethod
+    def _monthly_jsonl_path(cls, directory: Path, timestamp: Any) -> Path:
+        stamp = cls._as_utc_datetime(timestamp)
+        return directory / f"{stamp:%Y-%m}.jsonl"
+
+    @staticmethod
+    def _monthly_files(directory: Path) -> list[Path]:
+        if not directory.exists():
+            return []
+        return sorted(
+            path for path in directory.iterdir()
+            if path.is_file() and re.fullmatch(r"\d{4}-\d{2}\.jsonl", path.name)
+        )
+
+    @classmethod
+    def _read_monthly_jsonl(cls, directory: Path) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for path in cls._monthly_files(directory):
+            records.extend(cls._read_jsonl_strict(path))
+        return records
+
+    @staticmethod
+    def _signal_evaluation_key(record: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            str(record.get("contract_type") or "").upper(),
+            str(record.get("symbol") or "").upper(),
+            str(record.get("scenario") or "").upper(),
+            str(record.get("strategy_version") or ""),
+            str(record.get("status") or "").upper(),
+            record.get("last_closed_1h_open_time_ms"),
+        )
+
+    @staticmethod
+    def _signal_outcome_key(record: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            str(record.get("signal_id") or ""),
+            str(record.get("outcome_event") or "").upper(),
+            str(record.get("evaluation_horizon") or "").upper(),
+            str(record.get("exit_model_version") or ""),
+            record.get("as_of_1h_open_time_ms"),
+        )
 
     @staticmethod
     def _utc_iso(value: datetime) -> str:
@@ -533,10 +595,11 @@ class Store:
         symbol: str,
         required: int = 3,
         interval_hours: float = 4.0,
-        tolerance_minutes: int = 10,
+        tolerance_minutes: int = 30,
         *,
         as_of: datetime | None = None,
         contract_type: str | None = None,
+        current_observation: dict[str, Any] | None = None,
     ) -> bool | None:
         """Evaluate the latest consecutive positive Spot observations only.
 
@@ -549,9 +612,17 @@ class Store:
         history = self.recent_symbol_history(
             symbol, limit=max(100, required * 12), contract_type=contract_type
         )
-        if len(history) < required:
-            return None
         if contract_type and not self.symbol_history_is_current(symbol, contract_type=contract_type):
+            return None
+        if current_observation is not None:
+            # A not-yet-committed due snapshot is supplied virtually so LONG B
+            # can use it without making SHORT E read the same bearish poll as
+            # its own preceding historical observation.
+            current = dict(current_observation)
+            current.setdefault("symbol", symbol)
+            if not history or str(history[-1].get("snapshot_at")) != str(current.get("snapshot_at")):
+                history = [*history, current]
+        if len(history) < required:
             return None
 
         target_seconds = float(interval_hours) * 3600.0
@@ -795,6 +866,12 @@ class Store:
         related_event_keys: list[str] | None = None,
         delivery_status: str = "SENT",
         error: str | None = None,
+        entry_reference: float | None = None,
+        entry_reference_time_ms: int | None = None,
+        entry_reference_1h_open_time_ms: int | None = None,
+        entry_reference_type: str | None = None,
+        strategy_version: str | None = None,
+        outcome_as_of_1h_open_time_ms: int | None = None,
     ) -> None:
         """Append a notification using the current recipient/contract schema."""
         if not str(event_key).strip():
@@ -848,6 +925,18 @@ class Store:
             record["scenario_code"] = str(scenario_code).upper()
         if related_event_keys is not None:
             record["related_event_keys"] = [str(value) for value in related_event_keys if str(value)]
+        if entry_reference is not None:
+            value = float(entry_reference)
+            if math.isfinite(value) and value > 0:
+                record["entry_reference"] = value
+        if entry_reference_time_ms is not None:
+            record["entry_reference_time_ms"] = int(entry_reference_time_ms)
+        if entry_reference_1h_open_time_ms is not None:
+            record["entry_reference_1h_open_time_ms"] = int(entry_reference_1h_open_time_ms)
+        if entry_reference_type:
+            record["entry_reference_type"] = str(entry_reference_type)
+        if strategy_version:
+            record["strategy_version"] = str(strategy_version)
         if error:
             record["error"] = str(error)[:500]
         cache_was_current = (
@@ -863,6 +952,183 @@ class Store:
         else:
             self._notification_cache = None
             self._notification_cache_signature = None
+
+        # A new ACTIVE notification is also the durable start marker for its
+        # outcome stream. event_key contains the 1H confirmation anchor and is
+        # shared across recipients, so multiple Telegram recipients still map
+        # to one analytical signal_id.
+        if normalized_state == "ACTIVE" and normalized_status in {"SENT", "UNKNOWN"}:
+            signal_id = hashlib.sha256(
+                f"{record['contract_type']}|{record.get('event_key')}".encode("utf-8")
+            ).hexdigest()
+            sent_at = record["sent_at"]
+            try:
+                opened_at_ms = int(entry_reference_1h_open_time_ms) if entry_reference_1h_open_time_ms is not None else int(
+                    self._as_utc_datetime(sent_at).timestamp() * 1000
+                )
+            except (TypeError, ValueError, OverflowError):
+                opened_at_ms = int(self._as_utc_datetime(sent_at).timestamp() * 1000)
+            self.record_signal_outcome({
+                "signal_id": signal_id,
+                "outcome_event": "SIGNAL_OPENED",
+                "evaluation_horizon": "LIVE",
+                "exit_model_version": "STRUCTURAL_1H_V1",
+                "as_of_1h_open_time_ms": opened_at_ms,
+                "event_at": sent_at,
+                "symbol": record.get("pair"),
+                "scenario": record.get("scenario_code"),
+                "contract_type": record.get("contract_type"),
+                "direction": record.get("direction"),
+                "entry_reference": record.get("entry_reference"),
+                "entry_reference_time_ms": record.get("entry_reference_time_ms"),
+                "entry_reference_1h_open_time_ms": record.get("entry_reference_1h_open_time_ms"),
+                "entry_reference_type": record.get("entry_reference_type"),
+                "invalidation_level": record.get("invalidation_level"),
+                "strategy_version": record.get("strategy_version"),
+                "data_quality": {"entry_reference_available": record.get("entry_reference") is not None},
+            })
+        elif (
+            normalized_state in {"CANCELLED", "CANCELED", "REVERSED"}
+            and normalized_status in {"SENT", "UNKNOWN"}
+            and related_event_keys
+            and outcome_as_of_1h_open_time_ms is not None
+        ):
+            original_event_key = str(related_event_keys[0])
+            signal_id = hashlib.sha256(
+                f"{record['contract_type']}|{original_event_key}".encode("utf-8")
+            ).hexdigest()
+            self.record_signal_outcome({
+                "signal_id": signal_id,
+                "outcome_event": "SIGNAL_REVERSED" if normalized_state == "REVERSED" else "SIGNAL_CANCELLED",
+                "evaluation_horizon": "LIVE",
+                "exit_model_version": "STRUCTURAL_1H_V1",
+                "as_of_1h_open_time_ms": int(outcome_as_of_1h_open_time_ms),
+                "event_at": record["sent_at"],
+                "symbol": record.get("pair"),
+                "scenario": record.get("scenario_code"),
+                "contract_type": record.get("contract_type"),
+                "direction": record.get("direction"),
+                "invalidation_level": record.get("invalidation_level"),
+                "related_event_key": original_event_key,
+                "data_quality": {"closure_source": "TELEGRAM_LIFECYCLE"},
+            })
+
+    def has_signal_evaluation(
+        self,
+        *,
+        contract_type: str,
+        symbol: str,
+        scenario: str,
+        strategy_version: str,
+        status: str,
+        last_closed_1h_open_time_ms: int | None,
+    ) -> bool:
+        if self._signal_evaluation_keys is None:
+            self._signal_evaluation_keys = {
+                self._signal_evaluation_key(item)
+                for item in self._read_monthly_jsonl(self.signal_evaluations_dir)
+            }
+        key = (
+            str(contract_type).upper(), str(symbol).upper(), str(scenario).upper(),
+            str(strategy_version), str(status).upper(), last_closed_1h_open_time_ms,
+        )
+        return key in self._signal_evaluation_keys
+
+    def record_signal_evaluation(self, record: dict[str, Any]) -> bool:
+        """Append a significant candidate evaluation once per state/candle tuple."""
+        required = (
+            "contract_type", "symbol", "scenario", "strategy_version", "status",
+            "last_closed_1h_open_time_ms", "evaluated_at",
+        )
+        missing = [field for field in required if field not in record]
+        if missing:
+            raise ValueError(f"Signal evaluation missing required fields: {', '.join(missing)}")
+        normalized = dict(record)
+        normalized["contract_type"] = str(normalized["contract_type"]).upper()
+        normalized["symbol"] = str(normalized["symbol"]).upper()
+        normalized["scenario"] = str(normalized["scenario"]).upper()
+        normalized["status"] = str(normalized["status"]).upper()
+        if not normalized["symbol"] or not normalized["scenario"] or not normalized["strategy_version"]:
+            raise ValueError("Signal evaluation identity fields must be non-empty")
+        stamp = self._as_utc_datetime(normalized["evaluated_at"])
+        normalized["evaluated_at"] = stamp.isoformat()
+        candle_time = normalized["last_closed_1h_open_time_ms"]
+        if candle_time is None:
+            raise ValueError("Signal evaluation requires a closed 1H candle timestamp")
+        normalized["last_closed_1h_open_time_ms"] = int(candle_time)
+        key = self._signal_evaluation_key(normalized)
+        if self._signal_evaluation_keys is None:
+            self._signal_evaluation_keys = {
+                self._signal_evaluation_key(item)
+                for item in self._read_monthly_jsonl(self.signal_evaluations_dir)
+            }
+        if key in self._signal_evaluation_keys:
+            return False
+        path = self._monthly_jsonl_path(self.signal_evaluations_dir, stamp)
+        self._append_jsonl(path, normalized)
+        self._signal_evaluation_keys.add(key)
+        return True
+
+    def record_signal_outcome(self, record: dict[str, Any]) -> bool:
+        """Append an outcome event once per signal/event/horizon/model/1H candle."""
+        required = (
+            "signal_id", "outcome_event", "evaluation_horizon", "exit_model_version",
+            "as_of_1h_open_time_ms",
+        )
+        missing = [field for field in required if field not in record]
+        if missing:
+            raise ValueError(f"Signal outcome missing required fields: {', '.join(missing)}")
+        normalized = dict(record)
+        for field in ("signal_id", "outcome_event", "evaluation_horizon", "exit_model_version"):
+            normalized[field] = str(normalized[field]).strip()
+        if not all(normalized[field] for field in ("signal_id", "outcome_event", "evaluation_horizon", "exit_model_version")):
+            raise ValueError("Signal outcome identity fields must be non-empty")
+        normalized["as_of_1h_open_time_ms"] = int(normalized["as_of_1h_open_time_ms"])
+        stamp = normalized.get("event_at")
+        if stamp is None:
+            stamp = normalized.get("as_of_1h_open_time_ms")
+        parsed_stamp = self._as_utc_datetime(stamp)
+        normalized.setdefault("event_at", parsed_stamp.isoformat())
+        key = self._signal_outcome_key(normalized)
+        if self._signal_outcome_keys is None:
+            self._signal_outcome_keys = {
+                self._signal_outcome_key(item)
+                for item in self._read_monthly_jsonl(self.signal_outcomes_dir)
+            }
+        if key in self._signal_outcome_keys:
+            return False
+        path = self._monthly_jsonl_path(self.signal_outcomes_dir, parsed_stamp)
+        self._append_jsonl(path, normalized)
+        self._signal_outcome_keys.add(key)
+        if self._signal_outcomes_cache is not None:
+            self._signal_outcomes_cache.append(normalized)
+        return True
+
+    def signal_evaluations(self) -> list[dict[str, Any]]:
+        return sorted(
+            self._read_monthly_jsonl(self.signal_evaluations_dir),
+            key=lambda item: (str(item.get("evaluated_at") or ""), self._signal_evaluation_key(item)),
+        )
+
+    def signal_outcomes(self) -> list[dict[str, Any]]:
+        if self._signal_outcomes_cache is None:
+            self._signal_outcomes_cache = self._read_monthly_jsonl(self.signal_outcomes_dir)
+        return sorted(
+            self._signal_outcomes_cache,
+            key=lambda item: (int(item.get("as_of_1h_open_time_ms") or 0), self._signal_outcome_key(item)),
+        )
+
+    def latest_signal_outcome(
+        self, signal_id: str, *, outcome_event: str = "SIGNAL_PROGRESS",
+        exit_model_version: str = "STRUCTURAL_1H_V1",
+    ) -> dict[str, Any] | None:
+        records = [
+            item for item in self.signal_outcomes()
+            if str(item.get("signal_id") or "") == str(signal_id)
+            and str(item.get("outcome_event") or "").upper() == outcome_event.upper()
+            and str(item.get("exit_model_version") or "") == exit_model_version
+        ]
+        return max(records, key=lambda item: int(item.get("as_of_1h_open_time_ms") or 0), default=None)
 
     def active_notification_states(
         self,
@@ -942,6 +1208,8 @@ class Store:
         snapshot_retention_days: int = 30,
         run_retention_days: int = 90,
         notification_retention_days: int = 180,
+        signal_evaluation_retention_days: int = 180,
+        signal_outcome_retention_days: int = 365,
     ) -> dict[str, int]:
         """Compact expired JSONL history without changing retained observations."""
         now = datetime.now(timezone.utc)
@@ -1012,8 +1280,8 @@ class Store:
             ):
                 continue
             latest_state[(group, recipient, contract_scope)] = item
-        protected_ids = {
-            id(item) for item in latest_state.values()
+        active_signal_records = [
+            item for item in latest_state.values()
             if str(item.get("event_state") or "").upper() == "ACTIVE"
             and str(item.get("delivery_status") or "").upper() in {"SENT", "UNKNOWN"}
             and str(item.get("direction") or "").upper() in {"LONG", "SHORT"}
@@ -1021,6 +1289,17 @@ class Store:
             and not isinstance(item.get("invalidation_level"), bool)
             and math.isfinite(float(item["invalidation_level"]))
             and float(item["invalidation_level"]) > 0
+        ]
+        protected_ids = {id(item) for item in active_signal_records}
+        # Keep outcome history for every still-active signal. A position may
+        # outlive the normal outcome retention window; dropping its accumulated
+        # MFE/MAE would reset the path when the next 1H candle arrives.
+        active_signal_ids = {
+            hashlib.sha256(
+                f"{str(item.get('contract_type') or '').upper()}|{item.get('event_key') or ''}".encode("utf-8")
+            ).hexdigest()
+            for item in active_signal_records
+            if item.get("event_key")
         }
         # A reversal marker is a durable transaction journal entry. Keep it
         # beyond normal notification retention until its new event lifecycle
@@ -1080,8 +1359,59 @@ class Store:
         ]
         self._notification_cache_signature = self._notification_file_signature()
 
+        deleted_evaluations = self._prune_monthly_records(
+            self.signal_evaluations_dir, timestamp_field="evaluated_at",
+            cutoff=now - timedelta(days=max(1, signal_evaluation_retention_days)),
+        )
+        deleted_outcomes = self._prune_monthly_records(
+            self.signal_outcomes_dir, timestamp_field="event_at",
+            cutoff=now - timedelta(days=max(1, signal_outcome_retention_days)),
+            preserve_signal_ids=active_signal_ids,
+        )
+        self._signal_evaluation_keys = None
+        self._signal_outcome_keys = None
+        self._signal_outcomes_cache = None
+
         return {
             "snapshots_deleted": deleted_snapshots,
             "runs_deleted": deleted_runs,
             "notifications_deleted": deleted_notifications,
+            "signal_evaluations_deleted": deleted_evaluations,
+            "signal_outcomes_deleted": deleted_outcomes,
         }
+
+    def _prune_monthly_records(
+        self, directory: Path, *, timestamp_field: str, cutoff: datetime,
+        preserve_signal_ids: set[str] | None = None,
+    ) -> int:
+        deleted = 0
+        for path in self._monthly_files(directory):
+            records = self._read_jsonl_strict(path)
+            kept: list[dict[str, Any]] = []
+            for item in records:
+                value = item.get(timestamp_field)
+                if value is None and timestamp_field == "event_at":
+                    value = item.get("as_of_1h_open_time_ms")
+                try:
+                    stamp = self._as_utc_datetime(value)
+                except (TypeError, ValueError, OverflowError):
+                    # Invalid timestamps are retained for manual inspection;
+                    # pruning must not silently destroy malformed audit data.
+                    kept.append(item)
+                    continue
+                if (
+                    stamp >= cutoff
+                    or (
+                        timestamp_field == "event_at"
+                        and str(item.get("signal_id") or "") in (preserve_signal_ids or set())
+                    )
+                ):
+                    kept.append(item)
+                else:
+                    deleted += 1
+            if len(kept) != len(records):
+                if kept:
+                    self._rewrite_jsonl(path, kept)
+                else:
+                    path.unlink(missing_ok=True)
+        return deleted

@@ -444,9 +444,9 @@ def evaluate_scenarios(
         "entry_alert_enabled": False,
     }))
 
-    # SHORT E — Failed Short Squeeze. Three distinct, recent saved table
-    # observations are required. The rolling 4H windows must not overlap, so
-    # tolerance only allows a late poll, never an early one.
+    # SHORT E — Failed Short Squeeze. Three distinct, recent committed table
+    # observations are required. The current live poll is evaluated separately;
+    # service.py deliberately commits a due snapshot only after this evaluation.
     latest_three = history[-3:] if len(history) >= 3 else []
     interval_hours = max(0.0, float(s.get("snapshot_interval_hours", 4.0)))
     tolerance_seconds = max(0, int(s.get("snapshot_interval_tolerance_minutes", 10))) * 60.0
@@ -525,8 +525,8 @@ def evaluate_scenarios(
         else (m.futures_imbalance_4h < 0 and m.spot_imbalance_4h < 0)
     )
     # The historical snapshots establish that flow was not already bearish.
-    # The live Coinalyze poll confirms the turn; waiting for another 4H archive
-    # snapshot would delay a valid SHORT E by up to one full sampling interval.
+    # The live Coinalyze poll confirms the turn. A due live poll must not first
+    # overwrite the latest historical observation before this evaluation.
     checks = [
         _check("Three fresh comparable 4H snapshots available", history_ready, f"latest 3 spacing valid={spacing_ok}; latest fresh={fresh_latest}", "three consecutive observations spaced 4h..4h + late-poll tolerance; latest age <= interval + tolerance"),
         _check("Earlier short liquidations dominated", initial_short_dominant, str(initial_short_dominant), "Snapshot t−2: Short Liqs > Long Liqs"),

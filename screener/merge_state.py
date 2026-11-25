@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -231,6 +232,80 @@ def _merge_poll_state(remote_path: Path, local_path: Path) -> str:
     return _canonical(merged) + "\n"
 
 
+
+def _monthly_record_timestamp(record: dict[str, Any], *, record_type: str) -> datetime:
+    field = "evaluated_at" if record_type == "evaluation" else "event_at"
+    value = record.get(field)
+    if value is None and record_type == "outcome":
+        value = record.get("as_of_1h_open_time_ms")
+    return _record_time({field: value}, field, f"signal_{record_type}s")
+
+
+def _monthly_identity(record: dict[str, Any], *, record_type: str) -> tuple[Any, ...]:
+    if record_type == "evaluation":
+        return (
+            str(record.get("contract_type") or "").upper(),
+            str(record.get("symbol") or "").upper(),
+            str(record.get("scenario") or "").upper(),
+            str(record.get("strategy_version") or ""),
+            str(record.get("status") or "").upper(),
+            record.get("last_closed_1h_open_time_ms"),
+        )
+    return (
+        str(record.get("signal_id") or ""),
+        str(record.get("outcome_event") or "").upper(),
+        str(record.get("evaluation_horizon") or "").upper(),
+        str(record.get("exit_model_version") or ""),
+        record.get("as_of_1h_open_time_ms"),
+    )
+
+
+def _merge_monthly_append_only(
+    source_dir: Path, target_dir: Path, *, record_type: str,
+) -> dict[str, str]:
+    """Merge independent monthly audit streams by their domain identity.
+
+    These streams are not part of snapshot manifests or SHA-256 validation.
+    Conflicting outcome identities fail closed. Evaluation identities collapse
+    repeated polls in the same closed 1H candle and retain the first branch copy.
+    """
+    filename_pattern = re.compile(r"^\d{4}-\d{2}\.jsonl$")
+    records_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for folder in (target_dir, source_dir):
+        if not folder.exists():
+            continue
+        for path in sorted(folder.iterdir()):
+            if not path.is_file() or not filename_pattern.fullmatch(path.name):
+                continue
+            for record in _read_jsonl(path, strict_tail=True):
+                key = _monthly_identity(record, record_type=record_type)
+                if not all(key[:5] if record_type == "evaluation" else key[:4]) or key[-1] is None:
+                    raise ValueError(f"Invalid {record_type} identity in {path}: {key!r}")
+                previous = records_by_key.get(key)
+                if previous is not None and _canonical(previous) != _canonical(record):
+                    if record_type == "outcome":
+                        raise ValueError(f"Conflicting {record_type} records for identity={key!r}")
+                    # Evaluation identity intentionally collapses multiple polls
+                    # within one closed 1H candle. Keep the first (target/remote)
+                    # record; it is an immutable diagnostic observation.
+                    continue
+                records_by_key.setdefault(key, record)
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in records_by_key.values():
+        stamp = _monthly_record_timestamp(record, record_type=record_type)
+        month = f"{stamp:%Y-%m}.jsonl"
+        grouped.setdefault(month, []).append(record)
+
+    result: dict[str, str] = {}
+    for month, records in grouped.items():
+        records.sort(key=lambda item: (
+            _monthly_record_timestamp(item, record_type=record_type),
+            _canonical(_monthly_identity(item, record_type=record_type)),
+        ))
+        result[month] = "".join(_canonical(item) + "\n" for item in records)
+    return result
+
 def merge_state(source_dir: Path, target_dir: Path) -> None:
     source_dir = Path(source_dir)
     target_dir = Path(target_dir)
@@ -253,11 +328,25 @@ def merge_state(source_dir: Path, target_dir: Path) -> None:
         # Validate and prepare every state file before replacing any target.
         poll_state_content = _merge_poll_state(target_poll, source_poll)
 
+    # New analytic streams are independent append-only sets, not snapshot rows.
+    evaluation_months = _merge_monthly_append_only(
+        source_dir / "signal_evaluations", target_dir / "signal_evaluations",
+        record_type="evaluation",
+    )
+    outcome_months = _merge_monthly_append_only(
+        source_dir / "signal_outcomes", target_dir / "signal_outcomes",
+        record_type="outcome",
+    )
+
     _write_atomic(target_dir / "snapshots.jsonl", "".join(_canonical(row) + "\n" for row in manifests))
     _write_atomic(target_dir / "market_rows.jsonl", "".join(_canonical(row) + "\n" for row in market_rows))
     _write_atomic(target_dir / "notifications.jsonl", "".join(_canonical(row) + "\n" for row in notifications))
     if poll_state_content is not None:
         _write_atomic(target_poll, poll_state_content)
+    for month, content in evaluation_months.items():
+        _write_atomic(target_dir / "signal_evaluations" / month, content)
+    for month, content in outcome_months.items():
+        _write_atomic(target_dir / "signal_outcomes" / month, content)
 
 
 def main() -> None:

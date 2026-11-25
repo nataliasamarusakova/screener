@@ -42,7 +42,11 @@ DEFAULT_P1_CONFIG: dict[str, Any] = {
         "short_squeeze_min_short_liqs_usd": 0.0,
         "spot_accumulation_required_snapshots": 3,
         "snapshot_interval_hours": 4.0,
+        # SHORT E keeps its original strict spacing tolerance.
         "snapshot_interval_tolerance_minutes": 10,
+        # LONG B spot-accumulation snapshots can arrive late on Actions;
+        # this tolerance is one-sided and never allows early/overlapping samples.
+        "spot_accumulation_snapshot_tolerance_minutes": 30,
     },
     "structure": {
         "swing_left_bars": 2,
@@ -66,6 +70,10 @@ DEFAULT_P1_CONFIG: dict[str, Any] = {
     "scanner": {
         "max_chart_candidates": 100,
         "fetch_15m_context": False,
+        "market_context_max_candidates": 20,
+        "market_context_oi_limit": 500,
+        "market_context_funding_limit": 200,
+        "market_context_kline_limit": 300,
     },
 }
 

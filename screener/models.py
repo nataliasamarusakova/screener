@@ -58,6 +58,8 @@ class Candle:
     volume: float
     quote_volume: float
     trades: int
+    taker_buy_base_volume: float | None = None
+    taker_buy_quote_volume: float | None = None
 
 
 @dataclass(slots=True)
