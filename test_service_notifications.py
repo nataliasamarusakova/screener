@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from datetime import timedelta
 
+import pytest
+
 from screener.metrics import analyze_universe
 from screener.models import Check, ScenarioResult, MarketRow
 from screener.service import _collect_notifications
@@ -1679,9 +1681,30 @@ def test_shadow_exit_models_catch_up_each_closed_candle_and_apply_fee_estimates(
     assert tp15["gross_realized_r"] == 1.5
     assert tp15["fee_adjusted_r"] < tp15["gross_realized_r"]
     assert tp15["data_quality"]["slippage_included"] is False
+    assert tp15["entry_execution_type"] == "TAKER"
+    assert tp15["exit_execution_type"] == "TAKER"
+    assert tp15["entry_fee_bps"] == 5.0
+    assert tp15["exit_fee_bps"] == 5.0
+    assert tp15["entry_notional_usd"] == 1_000.0
+    assert tp15["exit_notional_usd"] == pytest.approx(1_015.0)
+    assert tp15["entry_fee_usd"] == pytest.approx(0.5)
+    assert tp15["exit_fee_usd"] == pytest.approx(0.5075)
+    assert tp15["total_fee_usd"] == pytest.approx(1.0075)
+    assert tp15["gross_pnl_usd"] == pytest.approx(15.0)
+    assert tp15["net_pnl_usd"] == pytest.approx(13.9925)
+    assert tp15["gross_r"] == pytest.approx(1.5)
+    assert tp15["net_r"] == pytest.approx(1.39925)
+    assert tp15["execution_type_status"] == "ASSUMED"
+    assert tp15["notional_assumption"] == "ASSUMED_FIXED_NOTIONAL"
     assert tp2["exit_status"] == "OPEN"
+    assert tp2["entry_fee_usd"] == pytest.approx(0.5)
+    assert tp2["exit_notional_usd"] == 0.0
+    assert tp2["total_fee_usd"] == pytest.approx(0.5)
+    assert tp2["net_r"] is None  # unrealized PnL is not fabricated
     assert partial["exit_status"] == "BREAKEVEN_STOP_HIT"
     assert partial["gross_realized_r"] == 0.75
+    assert partial["gross_pnl_usd"] == pytest.approx(7.5)
+    assert partial["net_pnl_usd"] == pytest.approx(6.49625)
     assert partial["fee_adjusted_r"] < partial["gross_realized_r"]
 
 
@@ -1753,3 +1776,144 @@ def test_taker_flow_status_distinguishes_missing_volume_and_hourly_gaps():
         [base, base], now_ms=now_ms, max_age_ms=70 * 60_000,
         expected_count=2, interval_ms=300_000,
     ) == "DATA_GAP"
+
+
+def test_shadow_fee_accounting_uses_actual_entry_and_exit_notionals_for_each_execution_pair():
+    from screener.service import _shadow_fee_accounting
+
+    expected = {
+        ("MAKER", "MAKER"): (0.20, 0.203, 0.403, 1.4597),
+        ("MAKER", "TAKER"): (0.20, 0.5075, 0.7075, 1.42925),
+        ("TAKER", "MAKER"): (0.50, 0.203, 0.703, 1.4297),
+        ("TAKER", "TAKER"): (0.50, 0.5075, 1.0075, 1.39925),
+    }
+    for (entry_type, exit_type), (entry_fee, exit_fee, total_fee, net_r) in expected.items():
+        result = _shadow_fee_accounting(
+            entry=100.0,
+            exit_legs=[(1.0, 101.5)],
+            risk_abs=1.0,
+            direction="LONG",
+            notional_usd=1_000.0,
+            entry_fee_bps=2.0 if entry_type == "MAKER" else 5.0,
+            exit_fee_bps=2.0 if exit_type == "MAKER" else 5.0,
+            entry_execution_type=entry_type,
+            exit_execution_type=exit_type,
+        )
+        assert result["entry_fee_usd"] == pytest.approx(entry_fee)
+        assert result["exit_notional_usd"] == pytest.approx(1_015.0)
+        assert result["exit_fee_usd"] == pytest.approx(exit_fee)
+        assert result["total_fee_usd"] == pytest.approx(total_fee)
+        assert result["gross_pnl_usd"] == pytest.approx(15.0)
+        assert result["net_pnl_usd"] == pytest.approx(15.0 - total_fee)
+        assert result["gross_r"] == pytest.approx(1.5)
+        assert result["net_r"] == pytest.approx(net_r)
+        assert result["execution_type_status"] == "ASSUMED"
+        assert result["notional_assumption"] == "ASSUMED_FIXED_NOTIONAL"
+        assert result["funding_included"] is False
+        assert result["slippage_included"] is False
+
+
+def test_shadow_fee_accounting_partial_exit_and_ambiguous_exit_are_explicit():
+    from screener.service import _shadow_fee_accounting
+
+    partial = _shadow_fee_accounting(
+        entry=100.0,
+        exit_legs=[(0.5, 101.5)],
+        risk_abs=1.0,
+        direction="LONG",
+        notional_usd=1_000.0,
+        entry_fee_bps=5.0,
+        exit_fee_bps=5.0,
+        entry_execution_type="TAKER",
+        exit_execution_type="TAKER",
+    )
+    assert partial["exit_notional_usd"] == pytest.approx(507.5)
+    assert partial["gross_pnl_usd"] == pytest.approx(7.5)
+    assert partial["total_fee_usd"] == pytest.approx(0.75375)
+    assert partial["net_pnl_usd"] == pytest.approx(6.74625)
+    assert partial["gross_r"] == pytest.approx(0.75)
+    assert partial["net_r"] == pytest.approx(0.674625)
+
+    ambiguous = _shadow_fee_accounting(
+        entry=100.0,
+        exit_legs=None,
+        risk_abs=1.0,
+        direction="LONG",
+        notional_usd=1_000.0,
+        entry_fee_bps=5.0,
+        exit_fee_bps=5.0,
+        entry_execution_type="TAKER",
+        exit_execution_type="TAKER",
+    )
+    assert ambiguous["entry_fee_usd"] == pytest.approx(0.5)
+    assert ambiguous["exit_notional_usd"] is None
+    assert ambiguous["exit_fee_usd"] is None
+    assert ambiguous["total_fee_usd"] is None
+    assert ambiguous["gross_pnl_usd"] is None
+    assert ambiguous["net_pnl_usd"] is None
+    assert ambiguous["fee_accounting_status"] == "AMBIGUOUS_EXIT_NOT_PRICED"
+
+
+def test_shadow_fee_assumptions_are_frozen_when_signal_opens(tmp_path):
+    from screener.models import Candle
+    from screener.service import _record_signal_progress
+    from screener.storage import Store
+
+    store = Store(tmp_path / "frozen-fees")
+    entry_close_ms = 1_790_000_000_000
+    store.record_notification(
+        "SOLUSDT_PERP.A|LONG A|frozen", recipient_key="recipient",
+        contract_type="PERPETUAL", event_group="SOLUSDT_PERP.A|LONG A",
+        fingerprint="frozen-fp", event_state="ACTIVE", direction="LONG",
+        invalidation_level=99.0, pair="SOLUSDT", scenario_code="LONG_A",
+        delivery_status="SENT", entry_reference=100.0,
+        entry_reference_time_ms=entry_close_ms,
+        entry_reference_1h_open_time_ms=entry_close_ms - 3_600_000,
+        entry_reference_type="BINANCE_FUTURES_LAST_CLOSED_1H_CLOSE",
+        strategy_version="1.1.1-p2-shadow",
+        shadow_maker_fee_bps=2.0, shadow_taker_fee_bps=5.0,
+        shadow_entry_execution_type="MAKER", shadow_exit_execution_type="MAKER",
+        shadow_notional_usd=2_000.0,
+    )
+    opened = store.signal_outcomes()[0]
+    assert opened["shadow_entry_execution_type"] == "MAKER"
+    assert opened["shadow_notional_usd"] == 2_000.0
+    active = store.active_notification_states(recipient_keys=["recipient"], contract_type="PERPETUAL")
+    # A later notification retry may carry different metadata; the first
+    # SIGNAL_OPENED marker, not the newest notification row, anchors the model.
+    active[0]["shadow_maker_fee_bps"] = 8.0
+    active[0]["shadow_taker_fee_bps"] = 9.0
+    active[0]["shadow_entry_execution_type"] = "TAKER"
+    active[0]["shadow_exit_execution_type"] = "TAKER"
+    active[0]["shadow_notional_usd"] = 500.0
+    candle = Candle(
+        open_time_ms=entry_close_ms + 1, close_time_ms=entry_close_ms + 3_600_000,
+        open=100.0, high=101.6, low=100.1, close=101.5,
+        volume=100.0, quote_volume=10_000.0, trades=10,
+    )
+
+    _record_signal_progress(
+        store, active, {"SOLUSDT": [candle]},
+        maker_fee_bps=9.0, taker_fee_bps=10.0,
+        entry_execution_type="TAKER", exit_execution_type="TAKER",
+        notional_usd=500.0,
+    )
+
+    signal_id = opened["signal_id"]
+    tp15 = store.latest_signal_outcome(
+        signal_id, outcome_event="SHADOW_EXIT_PROGRESS",
+        exit_model_version="FIXED_TP_1_5R_STOP_1R_V1",
+    )
+    assert tp15["entry_execution_type"] == "MAKER"
+    assert tp15["exit_execution_type"] == "MAKER"
+    assert tp15["entry_fee_bps"] == 2.0
+    assert tp15["exit_fee_bps"] == 2.0
+    assert tp15["entry_notional_usd"] == 2_000.0
+    assert tp15["entry_fee_usd"] == pytest.approx(0.4)
+    assert tp15["exit_notional_usd"] == pytest.approx(2_030.0)
+    assert tp15["exit_fee_usd"] == pytest.approx(0.406)
+    assert tp15["total_fee_usd"] == pytest.approx(0.806)
+    assert tp15["gross_pnl_usd"] == pytest.approx(30.0)
+    assert tp15["net_pnl_usd"] == pytest.approx(29.194)
+    assert tp15["net_r"] == pytest.approx(1.4597)
+    assert tp15["fee_assumption_source"] == "SNAPSHOTTED_AT_SIGNAL_OPEN"

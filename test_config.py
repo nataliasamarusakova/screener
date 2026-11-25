@@ -124,3 +124,58 @@ def test_coinalyze_retry_settings_are_clamped_to_safe_ranges(tmp_path: Path, mon
     assert settings.coinalyze_timeout_ms == 120_000
     assert settings.coinalyze_page_attempts == 5
     assert settings.coinalyze_retry_backoff_sec == 30.0
+
+
+def test_shadow_fee_defaults_and_side_specific_overrides(tmp_path: Path, monkeypatch):
+    _set_required_secrets(monkeypatch)
+    for name in (
+        "TRADING_FEE_BPS_PER_SIDE", "MAKER_FEE_BPS", "TAKER_FEE_BPS",
+        "SHADOW_ENTRY_EXECUTION_TYPE", "SHADOW_EXIT_EXECUTION_TYPE", "SHADOW_NOTIONAL_USD",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    defaults = load_settings(tmp_path)
+    assert defaults.maker_fee_bps == 2.0
+    assert defaults.taker_fee_bps == 5.0
+    assert defaults.shadow_entry_execution_type == "TAKER"
+    assert defaults.shadow_exit_execution_type == "TAKER"
+    assert defaults.shadow_notional_usd == 1_000.0
+
+    monkeypatch.setenv("MAKER_FEE_BPS", "1.5")
+    monkeypatch.setenv("TAKER_FEE_BPS", "4.5")
+    monkeypatch.setenv("SHADOW_ENTRY_EXECUTION_TYPE", "maker")
+    monkeypatch.setenv("SHADOW_EXIT_EXECUTION_TYPE", "taker")
+    monkeypatch.setenv("SHADOW_NOTIONAL_USD", "2500")
+    configured = load_settings(tmp_path)
+    assert configured.maker_fee_bps == 1.5
+    assert configured.taker_fee_bps == 4.5
+    assert configured.shadow_entry_execution_type == "MAKER"
+    assert configured.shadow_exit_execution_type == "TAKER"
+    assert configured.shadow_notional_usd == 2_500.0
+
+
+def test_legacy_fee_environment_variable_remains_a_both_sides_fallback(tmp_path: Path, monkeypatch):
+    _set_required_secrets(monkeypatch)
+    for name in ("MAKER_FEE_BPS", "TAKER_FEE_BPS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TRADING_FEE_BPS_PER_SIDE", "3.25")
+
+    settings = load_settings(tmp_path)
+
+    assert settings.trading_fee_bps_per_side == 3.25
+    assert settings.maker_fee_bps == 2.0
+    # The old setting described the legacy taker-only model, so it remains a
+    # fallback for taker fees without overwriting the separate maker schedule.
+    assert settings.taker_fee_bps == 3.25
+
+
+def test_shadow_fee_configuration_rejects_invalid_execution_type_and_notional(tmp_path: Path, monkeypatch):
+    _set_required_secrets(monkeypatch)
+    monkeypatch.setenv("SHADOW_ENTRY_EXECUTION_TYPE", "UNKNOWN")
+    with pytest.raises(ValueError, match="SHADOW_ENTRY_EXECUTION_TYPE"):
+        load_settings(tmp_path)
+
+    monkeypatch.setenv("SHADOW_ENTRY_EXECUTION_TYPE", "TAKER")
+    monkeypatch.setenv("SHADOW_NOTIONAL_USD", "0")
+    with pytest.raises(ValueError, match="SHADOW_NOTIONAL_USD"):
+        load_settings(tmp_path)

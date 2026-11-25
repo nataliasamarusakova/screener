@@ -563,3 +563,81 @@ def test_short_e_rejects_dominant_but_immaterial_short_liquidations():
     assert next(check for check in short_e.checks if check.name == "Earlier short liquidations dominated").passed is True
     assert next(check for check in short_e.checks if check.name == "Earlier short liquidations material").passed is False
     assert short_e.status == "NOT_MET"
+
+
+def test_not_met_results_preserve_legacy_status_and_expose_failed_diagnostics():
+    from screener.models import Check, ScenarioResult
+
+    result = ScenarioResult(
+        symbol="MONUSDT", name="MON", scenario="LONG A — Trend Continuation",
+        direction="LONG",
+        checks=[
+            Check("Price change 24H", False, "-17.96%", "+1%..+12%"),
+            Check("OI 24H", True, "+3.0%", ">= 0%"),
+        ],
+        quality_flags=[], status="NOT_MET",
+    )
+
+    payload = result.to_dict()
+    assert payload["status"] == "NOT_MET"
+    assert payload["diagnostic_status"] == "FAILED"
+    assert payload["reason_code"] == "PRICE_CHANGE_24H_OUT_OF_RANGE"
+    assert payload["failed_checks"] == [{
+        "name": "Price change 24H", "passed": False,
+        "actual": "-17.96%", "rule": "+1%..+12%",
+    }]
+    assert payload["unknown_checks"] == []
+    assert "Price change 24H" in payload["reason"]
+    assert payload["summary"] == payload["reason"]
+
+
+def test_not_met_with_unknown_only_checks_is_diagnosed_as_unknown_not_failure():
+    from screener.models import Check, ScenarioResult
+
+    result = ScenarioResult(
+        symbol="MONUSDT", name="MON", scenario="LONG B — Spot Accumulation",
+        direction="LONG",
+        checks=[
+            Check("Spot flow", None, "unavailable", "positive"),
+            Check("Price change 24H", True, "+2.0%", "+1%..+12%"),
+        ],
+        quality_flags=[], status="NOT_MET",
+    )
+
+    payload = result.to_dict()
+    assert payload["status"] == "NOT_MET"  # old public state stays stable
+    assert payload["diagnostic_status"] == "UNKNOWN"
+    assert payload["reason_code"] == "REQUIRED_CHECKS_UNKNOWN"
+    assert payload["failed_checks"] == []
+    assert payload["unknown_checks"][0]["name"] == "Spot flow"
+    assert "Unknown checks" in payload["reason"]
+
+
+def test_every_implemented_scenario_persists_nonempty_not_met_diagnostics():
+    market = MarketRow(
+        symbol="MONUSDT_PERP", name="MON", price=1.0, chg24_pct=-17.96,
+        market_cap_usd=1_000_000_000, volume24_usd=100_000_000, oi_usd=30_000_000,
+        oi_chg24_pct=-3.0, oi_chg24_usd=-1_000_000,
+        oi_chg4h_pct=-1.0, oi_chg4h_usd=-300_000,
+        oi_vol_ratio=0.3, oi_mktcap_ratio=0.03, vol_mktcap_ratio=0.1,
+        fr_avg_pct=0.001, fr_oiw_pct=0.001, pfr_oiw_pct=0.001,
+        liq_total24_usd=1_000_000, liq_short24_usd=300_000, liq_long24_usd=700_000,
+        ls_ratio_1d=1.5, futures_imbalance_4h=-5.0, spot_imbalance_4h=-5.0,
+    )
+    enriched, stats = analyze_universe([market], {"thresholds": {}})
+    results = evaluate_scenarios(enriched[0], stats, {"thresholds": {}})
+
+    implemented = {item.scenario.split(" — ", 1)[0] for item in results}
+    assert implemented == {
+        "LONG A", "LONG B", "LONG C", "LONG D",
+        "SHORT A", "SHORT B", "SHORT C", "SHORT D", "SHORT E",
+    }
+    for item in results:
+        if item.status == "NOT_MET":
+            payload = item.to_dict()
+            assert payload["reason"].strip()
+            assert payload["summary"].strip()
+            assert payload["reason_code"].strip()
+            assert isinstance(payload["failed_checks"], list)
+            assert isinstance(payload["unknown_checks"], list)
+            assert payload["diagnostic_status"] in {"FAILED", "UNKNOWN", "NO_CHECKS"}
