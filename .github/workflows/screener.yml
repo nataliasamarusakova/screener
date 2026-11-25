@@ -217,7 +217,13 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TELEGRAM_CHAT_IDS: ${{ secrets.TG_CHAT_IDS }}
           TELEGRAM_STORAGE_HASH_KEY: ${{ secrets.TELEGRAM_STORAGE_HASH_KEY }}
+          # Legacy fallback retained for existing repository configuration.
           TRADING_FEE_BPS_PER_SIDE: ${{ vars.TRADING_FEE_BPS_PER_SIDE }}
+          MAKER_FEE_BPS: ${{ vars.MAKER_FEE_BPS }}
+          TAKER_FEE_BPS: ${{ vars.TAKER_FEE_BPS }}
+          SHADOW_ENTRY_EXECUTION_TYPE: ${{ vars.SHADOW_ENTRY_EXECUTION_TYPE }}
+          SHADOW_EXIT_EXECUTION_TYPE: ${{ vars.SHADOW_EXIT_EXECUTION_TYPE }}
+          SHADOW_NOTIONAL_USD: ${{ vars.SHADOW_NOTIONAL_USD }}
           COINALYZE_TIMEOUT_MS: "45000"
           COINALYZE_PAGE_ATTEMPTS: "3"
           COINALYZE_RETRY_BACKOFF_SEC: "3"
