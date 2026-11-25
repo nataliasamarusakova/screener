@@ -280,6 +280,12 @@ jobs:
           cleanup() { rm -rf "$state_backup"; }
           trap cleanup EXIT
           cp data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl "$state_backup/"
+          for journal in signal_evaluations signal_outcomes; do
+            mkdir -p "$state_backup/$journal"
+            if [[ -d "data/$journal" ]]; then
+              cp -a "data/$journal/." "$state_backup/$journal/"
+            fi
+          done
           if [[ -f data/poll_state.json ]]; then
             cp data/poll_state.json "$state_backup/"
           fi
@@ -325,6 +331,11 @@ jobs:
             if [[ -f data/poll_state.json ]]; then
               git add data/poll_state.json
             fi
+            for journal in signal_evaluations signal_outcomes; do
+              if [[ -d "data/$journal" ]]; then
+                git add "data/$journal/"
+              fi
+            done
             if git diff --cached --quiet; then
               echo "Scanner state is already present on ${GITHUB_REF}; nothing to commit"
               pushed=true
@@ -343,6 +354,13 @@ jobs:
             if [[ "$attempt" -lt 5 ]]; then
               echo "::warning::State push failed; refreshing branch and merging append-only records before retry"
               cp data/snapshots.jsonl data/market_rows.jsonl data/notifications.jsonl "$state_backup/"
+              for journal in signal_evaluations signal_outcomes; do
+                rm -rf "$state_backup/$journal"
+                mkdir -p "$state_backup/$journal"
+                if [[ -d "data/$journal" ]]; then
+                  cp -a "data/$journal/." "$state_backup/$journal/"
+                fi
+              done
               if [[ -f data/poll_state.json ]]; then
                 cp data/poll_state.json "$state_backup/"
               else
