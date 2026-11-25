@@ -629,17 +629,22 @@ class SpotMarketClient:
         for item in payload["symbols"]:
             if not isinstance(item, dict) or item.get("status") != "TRADING":
                 continue
+            # The request itself is filtered with permissions=SPOT. Binance's
+            # current exchangeInfo schema can still return the legacy
+            # ``permissions`` field as an empty list while ``permissionSets``
+            # contains SPOT (verified for PUMPUSDT). An empty legacy list is
+            # therefore not evidence that a pair is unavailable. If the API
+            # returns explicit non-empty permission metadata, validate it.
             permissions = item.get("permissions")
-            if isinstance(permissions, list) and "SPOT" not in permissions:
+            if isinstance(permissions, list) and permissions and "SPOT" not in permissions:
                 continue
-            if permissions is None:
-                # The request filters SPOT on the server. If an older response
-                # still includes permissionSets, use it as a defensive check.
-                permission_sets = item.get("permissionSets")
-                if permission_sets and not any(
-                    "SPOT" in group for group in permission_sets if isinstance(group, list)
-                ):
-                    continue
+            permission_sets = item.get("permissionSets")
+            if isinstance(permission_sets, list) and permission_sets and not any(
+                "SPOT" in group for group in permission_sets if isinstance(group, list)
+            ):
+                continue
+            if item.get("isSpotTradingAllowed") is False:
+                continue
             symbol = item.get("symbol")
             base = item.get("baseAsset")
             quote = item.get("quoteAsset")

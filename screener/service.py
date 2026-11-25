@@ -127,8 +127,10 @@ def _technical_for_symbol(
         candles1h = client.fetch_candles(
             fetch_symbol, "1h", 1000 if include_outcome_history else settings.binance_kline_limit
         )
-        if include_outcome_history:
-            result["_candles_1h"] = candles1h
+        # The same closed 1H series feeds both active-signal outcome tracking
+        # and the on-demand Futures taker-flow feature. The latter is also
+        # required for first-time candidates, not only previously active alerts.
+        result["_candles_1h"] = candles1h
         result["higher_low"] = higher_low(
             candles1h, left, right, lookback,
             max_age_bars=int(structure_cfg.get("higher_low_max_age_bars", 24)),
@@ -240,7 +242,9 @@ def _technical_for_symbol(
 
 
 def _taker_flow_imbalance(candles: list[Candle]) -> float | None:
-    """Return quote-volume taker imbalance for complete source candles."""
+    """Return quote-volume taker imbalance only for fully covered candles."""
+    if not candles:
+        return None
     valid = [
         candle for candle in candles
         if candle.quote_volume > 0
@@ -248,13 +252,46 @@ def _taker_flow_imbalance(candles: list[Candle]) -> float | None:
         and math.isfinite(candle.taker_buy_quote_volume)
         and 0 <= candle.taker_buy_quote_volume <= candle.quote_volume
     ]
-    if not valid:
+    # Do not silently turn partial candle coverage into a one-hour aggregate.
+    if len(valid) != len(candles):
         return None
     quote_volume = sum(item.quote_volume for item in valid)
     buy_quote = sum(float(item.taker_buy_quote_volume) for item in valid)
     if quote_volume <= 0:
         return None
     return 2.0 * (buy_quote / quote_volume) - 1.0
+
+
+def _taker_flow_status(
+    candles: list[Candle], *, now_ms: int, max_age_ms: int,
+    expected_count: int | None = None, interval_ms: int | None = None,
+) -> str:
+    """Explain why a source candle set can or cannot yield taker flow."""
+    if not candles:
+        return "NO_CANDLES"
+    latest = candles[-1]
+    age_ms = int(now_ms) - int(latest.close_time_ms)
+    if age_ms < 0:
+        return "FUTURE_CANDLE"
+    if age_ms > max_age_ms:
+        return "STALE"
+    if expected_count is not None and len(candles) < expected_count:
+        return "INSUFFICIENT_CANDLES"
+    if interval_ms is not None and any(
+        later.open_time_ms - earlier.open_time_ms != interval_ms
+        for earlier, later in zip(candles, candles[1:])
+    ):
+        return "DATA_GAP"
+    for candle in candles:
+        if candle.taker_buy_quote_volume is None:
+            return "MISSING_TAKER_BUY_QUOTE_VOLUME"
+        if not math.isfinite(candle.taker_buy_quote_volume) or not math.isfinite(candle.quote_volume):
+            return "INVALID_TAKER_VOLUME"
+        if candle.quote_volume <= 0:
+            return "ZERO_QUOTE_VOLUME"
+        if not 0 <= candle.taker_buy_quote_volume <= candle.quote_volume:
+            return "INVALID_TAKER_BUY_QUOTE_VOLUME"
+    return "AVAILABLE"
 
 
 def _oi_change_1h(records: list[dict[str, Any]], field: str) -> float | None:
@@ -294,19 +331,35 @@ def _market_context_for_symbol(
     settings: Settings,
 ) -> dict[str, Any]:
     """Collect bounded on-demand Spot/OI/Funding context for one finalist."""
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    futures_flow_candles = futures_candles_1h[-1:]
+    futures_flow_status = _taker_flow_status(
+        futures_flow_candles, now_ms=now_ms, max_age_ms=70 * 60_000,
+    )
     context: dict[str, Any] = {
         "futures_symbol": symbol.upper(),
-        "futures_flow_1h": _taker_flow_imbalance(futures_candles_1h[-1:]),
+        "futures_flow_1h": (
+            _taker_flow_imbalance(futures_flow_candles)
+            if futures_flow_status == "AVAILABLE" else None
+        ),
+        "futures_flow_status": futures_flow_status,
+        "futures_flow_source": "Binance USDⓈ-M Futures last closed 1H candle",
+        "futures_flow_last_closed_1h_open_time_ms": (
+            futures_flow_candles[-1].open_time_ms if futures_flow_candles else None
+        ),
         "spot_status": "UNKNOWN",
+        "spot_flow_status": "NOT_CHECKED",
         "spot_symbol": None,
         "base_multiplier": None,
         "spot_flow_1h": None,
         "oi_history_status": "UNKNOWN",
+        "oi_change_status": "UNKNOWN",
         "oi_change_base_1h_pct": None,
         "oi_change_usd_1h_pct": None,
         "oi_latest_base": None,
         "oi_latest_usd": None,
         "funding_status": "UNKNOWN",
+        "funding_regular_status": "UNKNOWN",
         "funding_latest_regular": None,
         "funding_average_regular": None,
         "funding_latest_special": None,
@@ -319,7 +372,7 @@ def _market_context_for_symbol(
         oi_rows = futures_client.fetch_open_interest_history(symbol, period="5m", limit=oi_limit)
         if oi_rows:
             latest_oi_timestamp = int(oi_rows[-1].get("timestamp") or 0)
-            oi_is_fresh = 0 <= int(datetime.now(timezone.utc).timestamp() * 1000) - latest_oi_timestamp <= 15 * 60_000
+            oi_is_fresh = 0 <= now_ms - latest_oi_timestamp <= 15 * 60_000
             context.update({
                 "oi_history_status": "AVAILABLE" if oi_is_fresh else "STALE",
                 "oi_change_base_1h_pct": _oi_change_1h(oi_rows, "sumOpenInterest") if oi_is_fresh else None,
@@ -331,12 +384,20 @@ def _market_context_for_symbol(
                 "oi_latest_timestamp_ms": latest_oi_timestamp,
                 "oi_observation_count": len(oi_rows),
             })
+            context["oi_change_status"] = (
+                "STALE" if not oi_is_fresh else
+                "AVAILABLE" if context["oi_change_base_1h_pct"] is not None
+                and context["oi_change_usd_1h_pct"] is not None else
+                "INSUFFICIENT_HISTORY"
+            )
         else:
             context["oi_history_status"] = "NO_DATA"
+            context["oi_change_status"] = "NO_DATA"
     except BinanceScanAbortError:
         raise
     except BinanceDataError as exc:
         context["oi_history_status"] = "ERROR"
+        context["oi_change_status"] = "ERROR"
         context["oi_error"] = str(exc)[:300]
 
     try:
@@ -346,6 +407,7 @@ def _market_context_for_symbol(
         if funding_rows:
             context["funding_status"] = "AVAILABLE"
             context["funding_latest_regular"] = regular[-1] if regular else None
+            context["funding_regular_status"] = "AVAILABLE" if regular else "NO_REGULAR_RATE"
             context["funding_average_regular"] = (
                 sum(float(item["fundingRate"]) for item in regular[-3:]) / len(regular[-3:])
                 if regular else None
@@ -357,20 +419,24 @@ def _market_context_for_symbol(
             context["funding_observation_count"] = len(funding_rows)
         else:
             context["funding_status"] = "NO_DATA"
+            context["funding_regular_status"] = "NO_DATA"
     except BinanceScanAbortError:
         raise
     except BinanceDataError as exc:
         context["funding_status"] = "ERROR"
+        context["funding_regular_status"] = "ERROR"
         context["funding_error"] = str(exc)[:300]
 
     try:
         resolution = spot_client.resolve_symbol(symbol)
     except SpotDataError as exc:
         context["spot_status"] = "ERROR"
+        context["spot_flow_status"] = "ERROR"
         context["spot_error"] = str(exc)[:300]
         return context
     if resolution is None:
         context["spot_status"] = "SPOT_UNAVAILABLE"
+        context["spot_flow_status"] = "SPOT_UNAVAILABLE"
         return context
     context.update({
         "spot_status": "AVAILABLE",
@@ -385,37 +451,244 @@ def _market_context_for_symbol(
         )
         if len(spot_candles) >= 12:
             last_hour = spot_candles[-12:]
-            continuous = all(
-                later.open_time_ms - earlier.open_time_ms == 5 * 60_000
-                for earlier, later in zip(last_hour, last_hour[1:])
+            age_ms = now_ms - spot_candles[-1].close_time_ms
+            context["spot_last_closed_5m_open_time_ms"] = spot_candles[-1].open_time_ms
+            context["spot_observation_count"] = len(spot_candles)
+            context["spot_latest_candle_age_ms"] = age_ms
+            context["spot_flow_status"] = _taker_flow_status(
+                last_hour, now_ms=now_ms, max_age_ms=7 * 60_000,
+                expected_count=12, interval_ms=5 * 60_000,
             )
-            age_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - spot_candles[-1].close_time_ms
-            if not continuous:
-                context["spot_status"] = "DATA_GAP"
-            elif age_ms < 0 or age_ms > 7 * 60_000:
-                context["spot_status"] = "STALE"
-                context["spot_last_closed_5m_open_time_ms"] = spot_candles[-1].open_time_ms
-                context["spot_latest_candle_age_ms"] = age_ms
-            else:
+            if context["spot_flow_status"] == "AVAILABLE":
+                context["spot_status"] = "AVAILABLE"
                 context["spot_flow_1h"] = _taker_flow_imbalance(last_hour)
-                context["spot_last_closed_5m_open_time_ms"] = spot_candles[-1].open_time_ms
-                context["spot_observation_count"] = len(spot_candles)
-                context["spot_latest_candle_age_ms"] = age_ms
+                if context["spot_flow_1h"] is None:
+                    context["spot_flow_status"] = "INVALID_AGGREGATE"
+            elif context["spot_flow_status"] == "STALE":
+                context["spot_status"] = "STALE"
+            elif context["spot_flow_status"] == "DATA_GAP":
+                context["spot_status"] = "DATA_GAP"
+            else:
+                # Pair exists; data coverage is the problem, not symbol mapping.
+                context["spot_status"] = "AVAILABLE"
         else:
             context["spot_status"] = "NO_DATA"
+            context["spot_flow_status"] = "INSUFFICIENT_CANDLES"
     except SpotDataError as exc:
         # A stale/de-listed/missing Spot pair is isolated from the Futures scan.
         context["spot_status"] = "SPOT_UNAVAILABLE" if "-1121" in str(exc) else "ERROR"
+        context["spot_flow_status"] = context["spot_status"]
         context["spot_error"] = str(exc)[:300]
     return context
+
+
+def _market_context_quality(context: dict[str, Any] | None) -> dict[str, Any]:
+    """Separate strategy-check completeness from optional market-data coverage."""
+    if not isinstance(context, dict):
+        missing = [
+            "futures_flow_1h", "spot_flow_1h", "oi_change_base_1h_pct",
+            "oi_change_usd_1h_pct", "funding_latest_regular",
+        ]
+        return {
+            "market_context_status": "NOT_COLLECTED",
+            "market_context_missing_fields": missing,
+            "market_context_missing_count": len(missing),
+            "market_context_completeness_pct": 0.0,
+            "market_context_field_statuses": {},
+        }
+
+    field_statuses = {
+        "futures_flow_1h": context.get("futures_flow_status", "UNKNOWN"),
+        "spot_flow_1h": context.get("spot_flow_status", "UNKNOWN"),
+        "oi_change_base_1h_pct": context.get("oi_change_status", "UNKNOWN"),
+        "oi_change_usd_1h_pct": context.get("oi_change_status", "UNKNOWN"),
+        "funding_latest_regular": context.get("funding_regular_status", "UNKNOWN"),
+    }
+    missing = [
+        field for field, status in field_statuses.items()
+        if status != "AVAILABLE" or context.get(field) is None
+    ]
+    total = len(field_statuses)
+    complete = total - len(missing)
+    return {
+        "market_context_status": "COMPLETE" if not missing else "PARTIAL",
+        "market_context_missing_fields": missing,
+        "market_context_missing_count": len(missing),
+        "market_context_completeness_pct": round(100.0 * complete / total, 1),
+        "market_context_field_statuses": field_statuses,
+    }
+
+
+def _estimated_shadow_fee_r(
+    entry: float,
+    exit_legs: list[tuple[float, float]],
+    risk_abs: float,
+    fee_bps_per_side: float | None,
+) -> float | None:
+    """Estimate entry/exit taker fees in initial-risk units; excludes slippage/funding."""
+    if fee_bps_per_side is None:
+        return None
+    try:
+        fee_bps = float(fee_bps_per_side)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(fee_bps) or fee_bps < 0 or risk_abs <= 0:
+        return None
+    exit_notional = sum(float(fraction) * float(price) for fraction, price in exit_legs)
+    return (fee_bps / 10_000.0) * (entry + exit_notional) / risk_abs
+
+
+def _record_shadow_exit_outcomes(
+    store: Store,
+    *,
+    signal_id: str,
+    active: dict[str, Any],
+    candle: Candle,
+    entry: float,
+    invalidation: float,
+    direction: str,
+    risk_abs: float,
+    fee_bps_per_side: float | None,
+) -> int:
+    """Append conservative 1H-only shadow exit states for three fixed models.
+
+    These are observational simulations only. Same-candle target/stop conflicts
+    are recorded as ambiguous and never resolved by assuming a favorable path.
+    """
+    is_long = direction == "LONG"
+    stop_hit = candle.low <= invalidation if is_long else candle.high >= invalidation
+    event_at = datetime.fromtimestamp(candle.close_time_ms / 1000.0, tz=timezone.utc).isoformat()
+    common = {
+        "signal_id": signal_id,
+        "outcome_event": "SHADOW_EXIT_PROGRESS",
+        "evaluation_horizon": "LIVE",
+        "as_of_1h_open_time_ms": candle.open_time_ms,
+        "event_at": event_at,
+        "symbol": str(active.get("pair") or "").upper(),
+        "scenario": active.get("scenario_code"),
+        "contract_type": str(active.get("contract_type") or "").upper(),
+        "direction": direction,
+        "entry_reference": entry,
+        "invalidation_level": invalidation,
+        "risk_abs": risk_abs,
+        "risk_pct": risk_abs / entry * 100.0,
+        "candle_high": candle.high,
+        "candle_low": candle.low,
+        "data_quality": {
+            "path_resolution": "1H_OHLC",
+            "intrabar_order": "UNKNOWN_WHEN_LEVELS_SHARE_BAR",
+            "slippage_included": False,
+            "funding_included": False,
+            "fee_model": "taker_fee_per_side_only" if fee_bps_per_side is not None else "not_configured",
+        },
+        "strategy_version": active.get("strategy_version"),
+    }
+    written = 0
+
+    for model, target_r in (
+        ("FIXED_TP_1_5R_STOP_1R_V1", 1.5),
+        ("FIXED_TP_2R_STOP_1R_V1", 2.0),
+    ):
+        previous = store.latest_signal_outcome(
+            signal_id, outcome_event="SHADOW_EXIT_PROGRESS", exit_model_version=model,
+        )
+        if previous and bool(previous.get("terminal")):
+            continue
+        target = entry + target_r * risk_abs if is_long else entry - target_r * risk_abs
+        target_hit = candle.high >= target if is_long else candle.low <= target
+        if target_hit and stop_hit:
+            status, terminal, gross_r = "AMBIGUOUS_SAME_1H_BAR", True, None
+            fee_r = None
+        elif target_hit:
+            status, terminal, gross_r = "TARGET_HIT", True, target_r
+            fee_r = _estimated_shadow_fee_r(
+                entry, [(1.0, target)], risk_abs, fee_bps_per_side,
+            )
+        elif stop_hit:
+            status, terminal, gross_r = "STOP_HIT", True, -1.0
+            fee_r = _estimated_shadow_fee_r(
+                entry, [(1.0, invalidation)], risk_abs, fee_bps_per_side,
+            )
+        else:
+            status, terminal, gross_r, fee_r = "OPEN", False, None, None
+        record = {
+            **common,
+            "exit_model_version": model,
+            "target_r": target_r,
+            "target_price": target,
+            "stop_price": invalidation,
+            "exit_status": status,
+            "terminal": terminal,
+            "gross_realized_r": gross_r,
+            "estimated_fee_r": fee_r,
+            "fee_adjusted_r": gross_r - fee_r if gross_r is not None and fee_r is not None else None,
+            "same_bar_target_stop_conflict": bool(target_hit and stop_hit),
+        }
+        written += int(store.record_signal_outcome(record))
+
+    partial_model = "PARTIAL_50_TP_1_5R_BE_V1"
+    previous_partial = store.latest_signal_outcome(
+        signal_id, outcome_event="SHADOW_EXIT_PROGRESS", exit_model_version=partial_model,
+    )
+    if not (previous_partial and bool(previous_partial.get("terminal"))):
+        target_r = 1.5
+        target = entry + target_r * risk_abs if is_long else entry - target_r * risk_abs
+        target_hit = candle.high >= target if is_long else candle.low <= target
+        be_hit = candle.low <= entry if is_long else candle.high >= entry
+        prior_status = str((previous_partial or {}).get("exit_status") or "OPEN")
+        if prior_status == "PARTIAL_TP1_5R_BE_ACTIVE":
+            if be_hit:
+                status, terminal, gross_r = "BREAKEVEN_STOP_HIT", True, 0.75
+                fee_r = _estimated_shadow_fee_r(
+                    entry, [(0.5, target), (0.5, entry)], risk_abs, fee_bps_per_side,
+                )
+            else:
+                status, terminal, gross_r, fee_r = "PARTIAL_TP1_5R_BE_ACTIVE", False, 0.75, None
+        elif stop_hit:
+            if target_hit:
+                status, terminal, gross_r, fee_r = "AMBIGUOUS_INITIAL_STOP_AND_TARGET", True, None, None
+            else:
+                status, terminal, gross_r = "STOP_HIT", True, -1.0
+                fee_r = _estimated_shadow_fee_r(
+                    entry, [(1.0, invalidation)], risk_abs, fee_bps_per_side,
+                )
+        elif target_hit and be_hit:
+            # The partial target and the subsequently active break-even stop
+            # may both have traded inside this 1H candle; ordering is unknowable.
+            status, terminal, gross_r, fee_r = "AMBIGUOUS_TP_AND_BE_SAME_1H_BAR", True, None, None
+        elif target_hit:
+            status, terminal, gross_r, fee_r = "PARTIAL_TP1_5R_BE_ACTIVE", False, 0.75, None
+        else:
+            status, terminal, gross_r, fee_r = "OPEN", False, None, None
+
+        record = {
+            **common,
+            "exit_model_version": partial_model,
+            "target_r": target_r,
+            "target_price": target,
+            "initial_stop_price": invalidation,
+            "break_even_stop_price": entry,
+            "partial_fraction": 0.5,
+            "exit_status": status,
+            "terminal": terminal,
+            "gross_realized_r": gross_r,
+            "estimated_fee_r": fee_r,
+            "fee_adjusted_r": gross_r - fee_r if gross_r is not None and fee_r is not None else None,
+            "same_bar_target_be_conflict": bool(target_hit and be_hit),
+        }
+        written += int(store.record_signal_outcome(record))
+
+    return written
 
 
 def _record_signal_progress(
     store: Store,
     active_states: list[dict[str, Any]],
     candles_by_symbol: dict[str, list[Candle]],
+    *,
+    fee_bps_per_side: float | None = None,
 ) -> int:
-    """Append one cumulative outcome observation per active signal/new closed 1H candle."""
+    """Append cumulative signal and shadow-exit observations for each new closed 1H bar."""
     written = 0
     seen_signals: set[str] = set()
     for active in active_states:
@@ -428,7 +701,7 @@ def _record_signal_progress(
             continue
         seen_signals.add(signal_id)
         symbol = str(active.get("pair") or "").upper()
-        candles = candles_by_symbol.get(symbol, [])
+        candles = sorted(candles_by_symbol.get(symbol, []), key=lambda item: item.open_time_ms)
         if not candles:
             continue
         try:
@@ -440,73 +713,83 @@ def _record_signal_progress(
         direction = str(active.get("direction") or "").upper()
         if direction not in {"LONG", "SHORT"} or not all(math.isfinite(x) and x > 0 for x in (entry, level)):
             continue
-        latest = candles[-1]
-        if latest.open_time_ms <= entry_close_ms:
+        risk_pct = (entry - level) / entry * 100.0 if direction == "LONG" else (level - entry) / entry * 100.0
+        risk_abs = abs(entry - level)
+        # Refuse malformed legacy states with the stop on the wrong side.
+        if not math.isfinite(risk_pct) or risk_pct <= 0 or not math.isfinite(risk_abs) or risk_abs <= 0:
             continue
-        previous = store.latest_signal_outcome(signal_id)
-        if previous and int(previous.get("as_of_1h_open_time_ms") or 0) >= latest.open_time_ms:
-            continue
-        if direction == "LONG":
-            current_mfe_pct = (latest.high / entry - 1.0) * 100.0
-            current_mae_pct = (latest.low / entry - 1.0) * 100.0
-            touched = latest.low <= level
-            breached = latest.close < level
-            risk_pct = (entry - level) / entry * 100.0
-        else:
-            current_mfe_pct = (entry / latest.low - 1.0) * 100.0 if latest.low > 0 else 0.0
-            current_mae_pct = (entry / latest.high - 1.0) * 100.0 if latest.high > 0 else 0.0
-            touched = latest.high >= level
-            breached = latest.close > level
-            risk_pct = (level - entry) / entry * 100.0
-        # A malformed legacy state can contain an invalidation on the wrong
-        # side of the reference entry. Do not manufacture R multiples from it.
-        if not math.isfinite(risk_pct) or risk_pct <= 0:
-            continue
-        mfe_pct = max(float(previous.get("mfe_pct", 0.0)), current_mfe_pct) if previous else max(0.0, current_mfe_pct)
-        mae_pct = min(float(previous.get("mae_pct", 0.0)), current_mae_pct) if previous else min(0.0, current_mae_pct)
-        risk_fraction = risk_pct / 100.0
-        mfe_r = (mfe_pct / 100.0) / risk_fraction if risk_fraction > 0 else None
-        mae_r = (mae_pct / 100.0) / risk_fraction if risk_fraction > 0 else None
-        first_touch = (previous or {}).get("first_touch_invalidation_at_ms")
-        if first_touch is None and touched:
-            first_touch = latest.open_time_ms
-        first_breach = (previous or {}).get("first_1h_close_breach_at_ms")
-        if first_breach is None and breached:
-            first_breach = latest.close_time_ms
-        event_at = datetime.fromtimestamp(latest.close_time_ms / 1000.0, tz=timezone.utc).isoformat()
-        record = {
-            "signal_id": signal_id,
-            "outcome_event": "SIGNAL_PROGRESS",
-            "evaluation_horizon": "LIVE",
-            "exit_model_version": "STRUCTURAL_1H_V1",
-            "as_of_1h_open_time_ms": latest.open_time_ms,
-            "event_at": event_at,
-            "symbol": symbol,
-            "scenario": active.get("scenario_code"),
-            "contract_type": contract_type,
-            "direction": direction,
-            "entry_reference": entry,
-            "entry_reference_time_ms": entry_close_ms,
-            "invalidation_level": level,
-            "risk_pct": risk_pct,
-            "mfe_pct": mfe_pct,
-            "mae_pct": mae_pct,
-            "mfe_r": mfe_r,
-            "mae_r": mae_r,
-            "first_touch_invalidation_at_ms": first_touch,
-            "first_touch_invalidation_bar_open_time_ms": first_touch,
-            "first_touch_invalidation_time_precision": "WITHIN_1H_BAR_UNKNOWN",
-            "first_1h_close_breach_at_ms": first_breach,
-            "data_quality": {
-                "path_resolution": "1H_OHLC",
-                "intrabar_order": "UNKNOWN",
-                "first_touch_time_is_bar_open_not_exact_execution_time": True,
-            },
-            "strategy_version": active.get("strategy_version"),
-        }
-        written += int(store.record_signal_outcome(record))
-    return written
 
+        previous = store.latest_signal_outcome(signal_id, outcome_event="SIGNAL_PROGRESS")
+        previous_as_of = int(previous.get("as_of_1h_open_time_ms") or 0) if previous else 0
+        previous_mfe = float(previous.get("mfe_pct", 0.0)) if previous else 0.0
+        previous_mae = float(previous.get("mae_pct", 0.0)) if previous else 0.0
+        first_touch = (previous or {}).get("first_touch_invalidation_at_ms")
+        first_breach = (previous or {}).get("first_1h_close_breach_at_ms")
+
+        new_candles = [
+            candle for candle in candles
+            if candle.open_time_ms > entry_close_ms and candle.open_time_ms > previous_as_of
+        ]
+        for candle in new_candles:
+            if direction == "LONG":
+                current_mfe_pct = (candle.high / entry - 1.0) * 100.0
+                current_mae_pct = (candle.low / entry - 1.0) * 100.0
+                touched = candle.low <= level
+                breached = candle.close < level
+            else:
+                current_mfe_pct = (entry / candle.low - 1.0) * 100.0 if candle.low > 0 else 0.0
+                current_mae_pct = (entry / candle.high - 1.0) * 100.0 if candle.high > 0 else 0.0
+                touched = candle.high >= level
+                breached = candle.close > level
+            mfe_pct = max(previous_mfe, current_mfe_pct)
+            mae_pct = min(previous_mae, current_mae_pct)
+            if first_touch is None and touched:
+                first_touch = candle.open_time_ms
+            if first_breach is None and breached:
+                first_breach = candle.close_time_ms
+            risk_fraction = risk_pct / 100.0
+            mfe_r = (mfe_pct / 100.0) / risk_fraction if risk_fraction > 0 else None
+            mae_r = (mae_pct / 100.0) / risk_fraction if risk_fraction > 0 else None
+            event_at = datetime.fromtimestamp(candle.close_time_ms / 1000.0, tz=timezone.utc).isoformat()
+            record = {
+                "signal_id": signal_id,
+                "outcome_event": "SIGNAL_PROGRESS",
+                "evaluation_horizon": "LIVE",
+                "exit_model_version": "STRUCTURAL_1H_V1",
+                "as_of_1h_open_time_ms": candle.open_time_ms,
+                "event_at": event_at,
+                "symbol": symbol,
+                "scenario": active.get("scenario_code"),
+                "contract_type": contract_type,
+                "direction": direction,
+                "entry_reference": entry,
+                "entry_reference_time_ms": entry_close_ms,
+                "invalidation_level": level,
+                "risk_pct": risk_pct,
+                "mfe_pct": mfe_pct,
+                "mae_pct": mae_pct,
+                "mfe_r": mfe_r,
+                "mae_r": mae_r,
+                "first_touch_invalidation_at_ms": first_touch,
+                "first_touch_invalidation_bar_open_time_ms": first_touch,
+                "first_touch_invalidation_time_precision": "WITHIN_1H_BAR_UNKNOWN",
+                "first_1h_close_breach_at_ms": first_breach,
+                "data_quality": {
+                    "path_resolution": "1H_OHLC",
+                    "intrabar_order": "UNKNOWN",
+                    "first_touch_time_is_bar_open_not_exact_execution_time": True,
+                },
+                "strategy_version": active.get("strategy_version"),
+            }
+            if store.record_signal_outcome(record):
+                written += 1
+            previous_mfe, previous_mae = mfe_pct, mae_pct
+            _record_shadow_exit_outcomes(
+                store, signal_id=signal_id, active=active, candle=candle,
+                entry=entry, invalidation=level, direction=direction,
+                risk_abs=risk_abs, fee_bps_per_side=fee_bps_per_side,
+            )
+    return written
 
 def _preliminary_candidate_symbols(
     enriched: list[EnrichedRow], stats: Any, settings: Settings, store: Store,
@@ -1564,7 +1847,21 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
             results.extend(scenario_results)
 
         if snapshot_pending:
-            store.add_snapshot(scrape.fetched_at, scrape.contract_type, scrape.rows)
+            quality_assessments = {
+                item.market.symbol: {
+                    "quality_clean": not item.quality_flags,
+                    "quality_flags": list(item.quality_flags),
+                    "oi_vol_ratio": item.market.oi_vol_ratio,
+                    "vol_mktcap_ratio": item.market.vol_mktcap_ratio,
+                    "oi_mktcap_ratio": item.market.oi_mktcap_ratio,
+                    "diagnostic_notes": list(item.diagnostic_notes),
+                }
+                for item in enriched
+            }
+            store.add_snapshot(
+                scrape.fetched_at, scrape.contract_type, scrape.rows,
+                quality_assessments=quality_assessments,
+            )
             snapshot_saved = True
 
         # Persist only pre-screened/near-confirmation candidates. The evaluation
@@ -1674,15 +1971,21 @@ def run_scan_once(settings: Settings, *, dry_run: bool | None = None) -> dict[st
                     "technical": item.technical,
                     "market_context": market_context_by_symbol.get(symbol),
                     "data_quality": {
+                        # Scenario rule UNKNOWNs are deliberately not conflated
+                        # with missing optional market-context measurements.
                         "unknown_checks": item.unknown_count,
                         "quality_flags": list(item.quality_flags),
+                        **_market_context_quality(market_context_by_symbol.get(symbol)),
                     },
                 })
 
         # Active-signal progress is sampled once per newly closed 1H candle.
         # OHLC paths are hourly and do not claim intrabar event ordering.
         if not use_dry_run and active_states_before_scan:
-            _record_signal_progress(store, active_states_before_scan, candles_1h_by_symbol)
+            _record_signal_progress(
+                store, active_states_before_scan, candles_1h_by_symbol,
+                fee_bps_per_side=settings.trading_fee_bps_per_side,
+            )
 
         allowed, guard_reason = _can_send_alerts(scrape, settings)
         # A fresh closed Binance 1H candle can confirm a new trigger even when

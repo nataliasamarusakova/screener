@@ -554,18 +554,39 @@ class Store:
         elapsed_seconds = current_ts - previous_ts
         return elapsed_seconds >= interval_seconds
 
-    def add_snapshot(self, fetched_at: datetime, contract_type: str, rows: list[MarketRow]) -> str:
+    def add_snapshot(
+        self,
+        fetched_at: datetime,
+        contract_type: str,
+        rows: list[MarketRow],
+        *,
+        quality_assessments: dict[str, dict[str, Any]] | None = None,
+    ) -> str:
+        """Persist a full market snapshot plus optional per-symbol quality diagnostics.
+
+        Quality diagnostics live beside (not inside) the source market row so
+        they do not alter the canonical source-data hash or scenario history.
+        This also makes filtered symbols inspectable in the same durable log.
+        """
         snapshot_id = uuid.uuid4().hex
         timestamp = self._utc_iso(fetched_at)
         normalized_rows = [self._row_payload(row) for row in rows]
+        assessments = {
+            str(symbol).upper(): self._json_safe(dict(value))
+            for symbol, value in (quality_assessments or {}).items()
+            if isinstance(value, dict)
+        }
 
         # Write row records first. The manifest below is the commit marker; if the
-        # process stops mid-write, uncommitted records are ignored and later pruned.
+        # process stops mid-write, uncommitted rows are ignored by history queries.
+        # Assessment metadata is deliberately excluded from the canonical hash.
         row_records = [{
             "record_type": "market_row",
             "snapshot_id": snapshot_id,
             "symbol": row.get("symbol"),
             "data": row,
+            **({"quality_assessment": assessments[str(row.get("symbol") or "").upper()]}
+               if str(row.get("symbol") or "").upper() in assessments else {}),
         } for row in normalized_rows]
         self._append_jsonl_many(self.market_rows_path, row_records)
 
