@@ -183,7 +183,7 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
         binance_vpn_enabled=False, binance_kline_limit=300,
         binance_request_interval_sec=0.0, binance_fetch_orderbook=False,
         binance_orderbook_limit=100, execution_notional_usd=0.0,
-        trading_fee_bps_per_side=None, telegram_bot_token="", telegram_chat_ids=[],
+        telegram_bot_token="", telegram_chat_ids=[],
         data_dir=tmp_path / "data",
         log_level="INFO", dry_run=True, p1=p1,
     )
@@ -198,7 +198,14 @@ def test_scan_pipeline_dry_run_and_unchanged_snapshot_suppression(tmp_path, monk
         "trend_retest_long": {"confirmed": True, "level": 1.0, "retest_open_time_ms": 1_790_000_000_000, "reason": "test fixture: closed 1H retest"},
         "higher_low": {"confirmed": False, "reason": "not applicable"},
         "weak_bounce_rejection": {"confirmed": False},
-        "execution_cost_assumptions": {"taker_fee_bps_per_side": None},
+        "execution_cost_assumptions": {
+            "maker_fee_bps_per_side": 2.0,
+            "taker_fee_bps_per_side": 5.0,
+            "entry_execution_type": "TAKER",
+            "exit_execution_type": "TAKER",
+            "shadow_notional_usd": 1_000.0,
+            "execution_type_status": "ASSUMED",
+        },
     })
     # P0 on-demand context providers are isolated in this workflow test;
     # unit tests below exercise their request/parse contracts separately.
@@ -687,7 +694,11 @@ def test_technical_for_symbol_uses_closed_15m_and_derives_24h_low_from_closed_1h
         binance_kline_limit=100,
         binance_fetch_orderbook=False,
         execution_notional_usd=0.0,
-        trading_fee_bps_per_side=5.0,
+        maker_fee_bps=2.0,
+        taker_fee_bps=5.0,
+        shadow_entry_execution_type="TAKER",
+        shadow_exit_execution_type="TAKER",
+        shadow_notional_usd=1_000.0,
     )
     technical = _technical_for_symbol(FakeBinance(), "STRKUSDT_PERP.A", settings)
     assert technical["context_15m"]["direction"] == "BULLISH"
@@ -1038,7 +1049,7 @@ def test_unchanged_coinalyze_poll_still_allows_fresh_1h_entry_processing(tmp_pat
         coinalyze_max_pages=20, coinalyze_headless=True, coinalyze_timeout_ms=30_000,
         binance_base_url="https://fapi.binance.com", binance_http_proxy="", binance_vpn_enabled=False,
         binance_kline_limit=300, binance_request_interval_sec=0.0, binance_fetch_orderbook=False,
-        binance_orderbook_limit=100, execution_notional_usd=0.0, trading_fee_bps_per_side=None,
+        binance_orderbook_limit=100, execution_notional_usd=0.0,
         telegram_bot_token="token", telegram_chat_ids=["123"], data_dir=tmp_path / "data",
         log_level="INFO", dry_run=False,
         p1={section: values.copy() for section, values in DEFAULT_P1_CONFIG.items()},
@@ -1157,6 +1168,11 @@ def test_higher_low_reentry_uses_confirmation_candle_after_cancellation(monkeypa
         "telegram_bot_token": "token",
         "telegram_chat_ids": ["chat-1"],
         "telegram_storage_hash_key": "stable-key",
+        "maker_fee_bps": 2.0,
+        "taker_fee_bps": 5.0,
+        "shadow_entry_execution_type": "TAKER",
+        "shadow_exit_execution_type": "TAKER",
+        "shadow_notional_usd": 1_000.0,
     })()
     store = Store()
     outcomes = service._collect_notifications([result], enriched, settings, store, True, False)
@@ -1414,6 +1430,9 @@ def test_active_signal_progress_records_cumulative_mfe_mae_and_unknown_intrabar_
         entry_reference_1h_open_time_ms=1_789_996_400_000,
         entry_reference_type="BINANCE_FUTURES_LAST_CLOSED_1H_CLOSE",
         strategy_version="1.1.0-p0",
+        shadow_maker_fee_bps=2.0, shadow_taker_fee_bps=5.0,
+        shadow_entry_execution_type="TAKER", shadow_exit_execution_type="TAKER",
+        shadow_notional_usd=1_000.0,
     )
     active = store.active_notification_states(recipient_keys=["recipient"], contract_type="PERPETUAL")
     first = Candle(
@@ -1633,7 +1652,10 @@ def test_shadow_exit_models_catch_up_each_closed_candle_and_apply_fee_estimates(
         entry_reference_time_ms=entry_close_ms,
         entry_reference_1h_open_time_ms=entry_close_ms - 3_600_000,
         entry_reference_type="BINANCE_FUTURES_LAST_CLOSED_1H_CLOSE",
-        strategy_version="1.1.1-p1-shadow",
+        strategy_version="1.1.1-p3-shadow-clean",
+        shadow_maker_fee_bps=2.0, shadow_taker_fee_bps=5.0,
+        shadow_entry_execution_type="TAKER", shadow_exit_execution_type="TAKER",
+        shadow_notional_usd=1_000.0,
     )
     active = store.active_notification_states(recipient_keys=["recipient"], contract_type="PERPETUAL")
     first = Candle(
@@ -1651,9 +1673,7 @@ def test_shadow_exit_models_catch_up_each_closed_candle_and_apply_fee_estimates(
     )
 
     # A single scan must backfill both newly closed bars, not only the latest one.
-    assert _record_signal_progress(
-        store, active, {"ETHUSDT": [first, second]}, fee_bps_per_side=5.0,
-    ) == 2
+    assert _record_signal_progress(store, active, {"ETHUSDT": [first, second]}) == 2
 
     signal_id = store.signal_outcomes()[0]["signal_id"]
     progress = [
@@ -1678,8 +1698,9 @@ def test_shadow_exit_models_catch_up_each_closed_candle_and_apply_fee_estimates(
     )
 
     assert tp15["exit_status"] == "TARGET_HIT"
-    assert tp15["gross_realized_r"] == 1.5
-    assert tp15["fee_adjusted_r"] < tp15["gross_realized_r"]
+    assert tp15["gross_r"] == pytest.approx(1.5)
+    assert tp15["net_r"] < tp15["gross_r"]
+    assert "gross_realized_r" not in tp15 and "fee_adjusted_r" not in tp15
     assert tp15["data_quality"]["slippage_included"] is False
     assert tp15["entry_execution_type"] == "TAKER"
     assert tp15["exit_execution_type"] == "TAKER"
@@ -1702,10 +1723,10 @@ def test_shadow_exit_models_catch_up_each_closed_candle_and_apply_fee_estimates(
     assert tp2["total_fee_usd"] == pytest.approx(0.5)
     assert tp2["net_r"] is None  # unrealized PnL is not fabricated
     assert partial["exit_status"] == "BREAKEVEN_STOP_HIT"
-    assert partial["gross_realized_r"] == 0.75
+    assert partial["gross_r"] == pytest.approx(0.75)
     assert partial["gross_pnl_usd"] == pytest.approx(7.5)
     assert partial["net_pnl_usd"] == pytest.approx(6.49625)
-    assert partial["fee_adjusted_r"] < partial["gross_realized_r"]
+    assert partial["net_r"] < partial["gross_r"]
 
 
 def test_shadow_exit_models_mark_same_candle_target_stop_conflict_ambiguous(tmp_path):
@@ -1724,7 +1745,10 @@ def test_shadow_exit_models_mark_same_candle_target_stop_conflict_ambiguous(tmp_
         entry_reference_time_ms=entry_close_ms,
         entry_reference_1h_open_time_ms=entry_close_ms - 3_600_000,
         entry_reference_type="BINANCE_FUTURES_LAST_CLOSED_1H_CLOSE",
-        strategy_version="1.1.1-p1-shadow",
+        strategy_version="1.1.1-p3-shadow-clean",
+        shadow_maker_fee_bps=2.0, shadow_taker_fee_bps=5.0,
+        shadow_entry_execution_type="TAKER", shadow_exit_execution_type="TAKER",
+        shadow_notional_usd=1_000.0,
     )
     active = store.active_notification_states(recipient_keys=["recipient"], contract_type="PERPETUAL")
     collision = Candle(
@@ -1746,7 +1770,8 @@ def test_shadow_exit_models_mark_same_candle_target_stop_conflict_ambiguous(tmp_
         )
         assert result["exit_status"] == status
         assert result["terminal"] is True
-        assert result["gross_realized_r"] is None
+        assert result["gross_r"] is None
+        assert "gross_realized_r" not in result
 
 
 def test_taker_flow_status_distinguishes_missing_volume_and_hourly_gaps():
@@ -1870,7 +1895,7 @@ def test_shadow_fee_assumptions_are_frozen_when_signal_opens(tmp_path):
         entry_reference_time_ms=entry_close_ms,
         entry_reference_1h_open_time_ms=entry_close_ms - 3_600_000,
         entry_reference_type="BINANCE_FUTURES_LAST_CLOSED_1H_CLOSE",
-        strategy_version="1.1.1-p2-shadow",
+        strategy_version="1.1.1-p3-shadow-clean",
         shadow_maker_fee_bps=2.0, shadow_taker_fee_bps=5.0,
         shadow_entry_execution_type="MAKER", shadow_exit_execution_type="MAKER",
         shadow_notional_usd=2_000.0,
@@ -1892,12 +1917,7 @@ def test_shadow_fee_assumptions_are_frozen_when_signal_opens(tmp_path):
         volume=100.0, quote_volume=10_000.0, trades=10,
     )
 
-    _record_signal_progress(
-        store, active, {"SOLUSDT": [candle]},
-        maker_fee_bps=9.0, taker_fee_bps=10.0,
-        entry_execution_type="TAKER", exit_execution_type="TAKER",
-        notional_usd=500.0,
-    )
+    _record_signal_progress(store, active, {"SOLUSDT": [candle]})
 
     signal_id = opened["signal_id"]
     tp15 = store.latest_signal_outcome(
@@ -1917,3 +1937,35 @@ def test_shadow_fee_assumptions_are_frozen_when_signal_opens(tmp_path):
     assert tp15["net_pnl_usd"] == pytest.approx(29.194)
     assert tp15["net_r"] == pytest.approx(1.4597)
     assert tp15["fee_assumption_source"] == "SNAPSHOTTED_AT_SIGNAL_OPEN"
+
+
+def test_shadow_progress_refuses_signal_without_frozen_execution_snapshot(tmp_path):
+    from screener.models import Candle
+    from screener.service import _record_signal_progress
+    from screener.storage import Store
+
+    store = Store(tmp_path / "missing-fee-snapshot")
+    entry_time = 1_790_000_000_000
+    store.record_notification(
+        "BTCUSDT_PERP.A|LONG A|missing-snapshot", recipient_key="recipient",
+        contract_type="PERPETUAL", event_group="BTCUSDT_PERP.A|LONG A",
+        fingerprint="missing-snapshot-fp", event_state="ACTIVE", direction="LONG",
+        invalidation_level=99.0, pair="BTCUSDT", scenario_code="LONG_A",
+        delivery_status="SENT", entry_reference=100.0,
+        entry_reference_time_ms=entry_time,
+        entry_reference_1h_open_time_ms=entry_time - 3_600_000,
+        entry_reference_type="BINANCE_FUTURES_LAST_CLOSED_1H_CLOSE",
+        strategy_version="1.1.1-p3-shadow-clean",
+    )
+    active = store.active_notification_states(recipient_keys=["recipient"], contract_type="PERPETUAL")
+    candle = Candle(
+        open_time_ms=entry_time + 1, close_time_ms=entry_time + 3_600_000,
+        open=100.0, high=101.6, low=100.1, close=101.5,
+        volume=100.0, quote_volume=10_000.0, trades=10,
+    )
+
+    with pytest.raises(ValueError, match="incomplete execution snapshot"):
+        _record_signal_progress(store, active, {"BTCUSDT": [candle]})
+
+    assert not any(item["outcome_event"] == "SIGNAL_PROGRESS" for item in store.signal_outcomes())
+    assert not any(item["outcome_event"] == "SHADOW_EXIT_PROGRESS" for item in store.signal_outcomes())

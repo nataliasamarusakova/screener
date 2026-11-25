@@ -128,8 +128,9 @@ def test_coinalyze_retry_settings_are_clamped_to_safe_ranges(tmp_path: Path, mon
 
 def test_shadow_fee_defaults_and_side_specific_overrides(tmp_path: Path, monkeypatch):
     _set_required_secrets(monkeypatch)
+    monkeypatch.delenv("TRADING_FEE_BPS_PER_SIDE", raising=False)
     for name in (
-        "TRADING_FEE_BPS_PER_SIDE", "MAKER_FEE_BPS", "TAKER_FEE_BPS",
+        "MAKER_FEE_BPS", "TAKER_FEE_BPS",
         "SHADOW_ENTRY_EXECUTION_TYPE", "SHADOW_EXIT_EXECUTION_TYPE", "SHADOW_NOTIONAL_USD",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -154,19 +155,42 @@ def test_shadow_fee_defaults_and_side_specific_overrides(tmp_path: Path, monkeyp
     assert configured.shadow_notional_usd == 2_500.0
 
 
-def test_legacy_fee_environment_variable_remains_a_both_sides_fallback(tmp_path: Path, monkeypatch):
+def test_obsolete_single_fee_setting_is_rejected(tmp_path: Path, monkeypatch):
     _set_required_secrets(monkeypatch)
-    for name in ("MAKER_FEE_BPS", "TAKER_FEE_BPS"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("TRADING_FEE_BPS_PER_SIDE", "3.25")
+    monkeypatch.setenv("TRADING_FEE_BPS_PER_SIDE", "5")
+
+    with pytest.raises(ValueError, match="TRADING_FEE_BPS_PER_SIDE is no longer supported"):
+        load_settings(tmp_path)
+
+
+def test_blank_numeric_environment_values_use_clean_defaults(tmp_path: Path, monkeypatch):
+    _set_required_secrets(monkeypatch)
+    monkeypatch.setenv("SHADOW_NOTIONAL_USD", "")
+    monkeypatch.setenv("MAKER_FEE_BPS", "")
+    monkeypatch.setenv("TAKER_FEE_BPS", "")
+    monkeypatch.setenv("COINALYZE_MAX_PAGES", "")
+    monkeypatch.setenv("COINALYZE_TIMEOUT_MS", "")
+    monkeypatch.setenv("COINALYZE_PAGE_ATTEMPTS", "")
+    monkeypatch.setenv("COINALYZE_RETRY_BACKOFF_SEC", "")
+    monkeypatch.setenv("BINANCE_KLINE_LIMIT", "")
+    monkeypatch.setenv("BINANCE_REQUEST_INTERVAL_SEC", "")
+    monkeypatch.setenv("BINANCE_ORDERBOOK_LIMIT", "")
+    monkeypatch.setenv("EXECUTION_NOTIONAL_USD", "")
 
     settings = load_settings(tmp_path)
 
-    assert settings.trading_fee_bps_per_side == 3.25
+    assert settings.shadow_notional_usd == 1_000.0
     assert settings.maker_fee_bps == 2.0
-    # The old setting described the legacy taker-only model, so it remains a
-    # fallback for taker fees without overwriting the separate maker schedule.
-    assert settings.taker_fee_bps == 3.25
+    assert settings.taker_fee_bps == 5.0
+    assert settings.coinalyze_max_pages == 20
+    assert settings.coinalyze_timeout_ms == 45_000
+    assert settings.coinalyze_page_attempts == 3
+    assert settings.coinalyze_retry_backoff_sec == 3.0
+    assert settings.binance_kline_limit == 300
+    assert settings.binance_request_interval_sec == 0.12
+    assert settings.binance_orderbook_limit == 100
+    assert settings.execution_notional_usd == 0.0
+    assert not hasattr(settings, "trading_fee_bps_per_side")
 
 
 def test_shadow_fee_configuration_rejects_invalid_execution_type_and_notional(tmp_path: Path, monkeypatch):

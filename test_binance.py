@@ -375,7 +375,6 @@ def test_binance_ip_ban_propagates_out_of_technical_symbol_pipeline():
         p1={"structure": {}, "scanner": {"fetch_15m_context": False}},
         binance_kline_limit=300,
         binance_fetch_orderbook=False,
-        trading_fee_bps_per_side=None,
     )
 
     with pytest.raises(BinanceIPBanError, match="HTTP 418"):
@@ -445,7 +444,6 @@ def test_all_binance_global_blocks_propagate_out_of_symbol_pipeline():
         p1={"structure": {}, "scanner": {"fetch_15m_context": False}},
         binance_kline_limit=300,
         binance_fetch_orderbook=False,
-        trading_fee_bps_per_side=None,
     )
     for failure in (BinanceWAFBlockError("HTTP 403"), BinanceRateLimitError("HTTP 429")):
         class BlockedClient:

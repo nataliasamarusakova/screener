@@ -25,7 +25,15 @@ def _market(symbol: str = "FILUSDT_PERP.A", name: str = "Filecoin"):
 
 
 def _settings():
-    return SimpleNamespace(telegram_bot_token="test-token", telegram_chat_ids=["chat-1"])
+    return SimpleNamespace(
+        telegram_bot_token="test-token",
+        telegram_chat_ids=["chat-1"],
+        maker_fee_bps=2.0,
+        taker_fee_bps=5.0,
+        shadow_entry_execution_type="TAKER",
+        shadow_exit_execution_type="TAKER",
+        shadow_notional_usd=1_000.0,
+    )
 
 
 def _recipient_key():

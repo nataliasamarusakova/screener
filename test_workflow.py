@@ -112,9 +112,9 @@ def test_persist_step_python_heredoc_terminator_is_at_shell_column_zero():
 
 def test_workflow_passes_side_specific_shadow_fee_assumptions_from_repository_variables():
     workflow = (Path(__file__).resolve().parent / ".github/workflows/screener.yml").read_text()
-    assert "TRADING_FEE_BPS_PER_SIDE: ${{ vars.TRADING_FEE_BPS_PER_SIDE }}" in workflow
-    assert "MAKER_FEE_BPS: ${{ vars.MAKER_FEE_BPS }}" in workflow
-    assert "TAKER_FEE_BPS: ${{ vars.TAKER_FEE_BPS }}" in workflow
-    assert "SHADOW_ENTRY_EXECUTION_TYPE: ${{ vars.SHADOW_ENTRY_EXECUTION_TYPE }}" in workflow
-    assert "SHADOW_EXIT_EXECUTION_TYPE: ${{ vars.SHADOW_EXIT_EXECUTION_TYPE }}" in workflow
-    assert "SHADOW_NOTIONAL_USD: ${{ vars.SHADOW_NOTIONAL_USD }}" in workflow
+    assert "TRADING_FEE_BPS_PER_SIDE" not in workflow
+    assert "MAKER_FEE_BPS: ${{ vars.MAKER_FEE_BPS || '2' }}" in workflow
+    assert "TAKER_FEE_BPS: ${{ vars.TAKER_FEE_BPS || '5' }}" in workflow
+    assert "SHADOW_ENTRY_EXECUTION_TYPE: ${{ vars.SHADOW_ENTRY_EXECUTION_TYPE || 'TAKER' }}" in workflow
+    assert "SHADOW_EXIT_EXECUTION_TYPE: ${{ vars.SHADOW_EXIT_EXECUTION_TYPE || 'TAKER' }}" in workflow
+    assert "SHADOW_NOTIONAL_USD: ${{ vars.SHADOW_NOTIONAL_USD || '1000' }}" in workflow
