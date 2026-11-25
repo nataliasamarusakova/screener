@@ -620,3 +620,58 @@ def test_spot_resolver_returns_unavailable_for_missing_active_pair(monkeypatch):
     ]})
 
     assert client.resolve_symbol("OLDUSDT") is None
+
+
+def test_spot_resolver_accepts_exchange_info_with_empty_legacy_permissions_and_spot_enabled(monkeypatch):
+    from screener.binance import SpotMarketClient
+
+    client = SpotMarketClient(min_interval_sec=0)
+    monkeypatch.setattr(client, "_get_json", lambda *_args, **_kwargs: {"symbols": [
+        {
+            "symbol": "PUMPUSDT",
+            "status": "TRADING",
+            "baseAsset": "PUMP",
+            "quoteAsset": "USDT",
+            "permissions": [],
+            "isSpotTradingAllowed": True,
+        },
+    ]})
+
+    resolved = client.resolve_symbol("PUMPUSDT")
+
+    assert resolved is not None
+    assert resolved.spot_symbol == "PUMPUSDT"
+    assert resolved.base_multiplier == 1.0
+
+
+def test_spot_resolver_still_rejects_explicit_non_spot_permission_metadata(monkeypatch):
+    from screener.binance import SpotMarketClient
+
+    client = SpotMarketClient(min_interval_sec=0)
+    monkeypatch.setattr(client, "_get_json", lambda *_args, **_kwargs: {"symbols": [
+        {
+            "symbol": "ALTUSDT", "status": "TRADING",
+            "baseAsset": "ALT", "quoteAsset": "USDT",
+            "permissions": ["MARGIN"], "isSpotTradingAllowed": False,
+        },
+    ]})
+
+    assert client.resolve_symbol("ALTUSDT") is None
+
+
+def test_spot_candles_preserve_taker_buy_quote_volume(monkeypatch):
+    from screener.binance import SpotMarketClient
+
+    client = SpotMarketClient(min_interval_sec=0)
+    open_time = 1_700_000_000_000
+    raw = [[
+        open_time, "1.0", "1.2", "0.9", "1.1", "100.0",
+        open_time + 299_999, "110.0", 42, "55.0", "60.5", "0",
+    ]]
+    monkeypatch.setattr(client, "_get_json", lambda *_args, **_kwargs: raw)
+
+    candles = client.fetch_candles("ALTUSDT", "5m", limit=12)
+
+    assert len(candles) == 1
+    assert candles[0].taker_buy_base_volume == 55.0
+    assert candles[0].taker_buy_quote_volume == 60.5

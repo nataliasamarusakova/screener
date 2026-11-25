@@ -108,3 +108,8 @@ def test_persist_step_python_heredoc_terminator_is_at_shell_column_zero():
     terminator_index = next(i for i in range(command_index + 1, len(lines)) if lines[i].strip() == "PY")
     terminator_indent = len(lines[terminator_index]) - len(lines[terminator_index].lstrip(" "))
     assert terminator_indent == command_indent
+
+
+def test_workflow_passes_optional_taker_fee_assumption_from_repository_variable():
+    workflow = (Path(__file__).resolve().parent / ".github/workflows/screener.yml").read_text()
+    assert "TRADING_FEE_BPS_PER_SIDE: ${{ vars.TRADING_FEE_BPS_PER_SIDE }}" in workflow

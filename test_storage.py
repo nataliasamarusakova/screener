@@ -938,3 +938,32 @@ def test_failed_active_notification_does_not_open_signal_outcome(tmp_path):
         scenario_code="LONG_A", delivery_status="FAILED",
     )
     assert store.signal_outcomes() == []
+
+
+def test_snapshot_persists_quality_assessments_for_filtered_rows_without_changing_source_history(tmp_path):
+    import json
+    from datetime import datetime, timezone
+
+    store = Store(tmp_path / "data")
+    row = MarketRow(
+        symbol="LOWOIUSDT_PERP.A", name="Low OI", price=1.0,
+        oi_usd=12_000_000.0, volume24_usd=40_000_000.0,
+    )
+    snapshot_id = store.add_snapshot(
+        datetime.now(timezone.utc), "PERPETUAL", [row],
+        quality_assessments={"LOWOIUSDT_PERP.A": {
+            "quality_clean": False,
+            "quality_flags": ["OI=$12,000,000<40m"],
+            "oi_vol_ratio": 0.3,
+        }},
+    )
+
+    record = json.loads(store.market_rows_path.read_text().splitlines()[0])
+
+    assert record["snapshot_id"] == snapshot_id
+    assert record["quality_assessment"]["quality_clean"] is False
+    assert record["quality_assessment"]["quality_flags"] == ["OI=$12,000,000<40m"]
+    history = store.recent_symbol_history("LOWOIUSDT_PERP.A", contract_type="PERPETUAL")
+    assert len(history) == 1
+    assert history[0]["oi_usd"] == 12_000_000.0
+    assert "quality_assessment" not in history[0]

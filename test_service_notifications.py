@@ -693,6 +693,8 @@ def test_technical_for_symbol_uses_closed_15m_and_derives_24h_low_from_closed_1h
     assert technical["context_15m"]["source"] == "last closed Binance 15m candle"
     assert technical["range_24h_1h"]["low"] == 95.0
     assert technical["range_24h_1h"]["distance_from_low_pct"] is not None
+    # First-time candidates need these candles for on-demand Futures Flow too.
+    assert len(technical["_candles_1h"]) == 100
 
 
 def test_telegram_pair_is_copyable_code_and_send_has_no_inline_keyboard(monkeypatch):
@@ -1516,3 +1518,238 @@ def test_global_missing_required_columns_do_not_disable_other_scenarios():
     }})
 
     assert _can_send_alerts(scrape, settings) == (True, "OK")
+
+
+def test_market_context_populates_futures_and_spot_flow_and_reports_full_coverage():
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from screener.models import Candle
+    from screener.service import _market_context_for_symbol, _market_context_quality
+
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    five_minute_floor = now_ms // 300_000 * 300_000
+    hour_floor = now_ms // 3_600_000 * 3_600_000
+
+    class FuturesClient:
+        def fetch_open_interest_history(self, symbol, *, period, limit):
+            return [
+                {
+                    "symbol": symbol,
+                    "timestamp": five_minute_floor - (12 - index) * 5 * 60_000,
+                    "sumOpenInterest": str(100 + index),
+                    "sumOpenInterestValue": str(1000 + 10 * index),
+                }
+                for index in range(13)
+            ]
+
+        def fetch_funding_rate_history(self, symbol, *, limit):
+            return [{"symbol": symbol, "fundingRate": "0.0001", "fundingTime": now_ms, "rateType": "Regular"}]
+
+    class SpotClient:
+        def resolve_symbol(self, symbol):
+            return SimpleNamespace(
+                spot_symbol="PUMPUSDT", spot_base_asset="PUMP", futures_base_asset="PUMP",
+                quote_asset="USDT", base_multiplier=1.0,
+            )
+
+        def fetch_candles(self, symbol, interval, *, limit):
+            assert symbol == "PUMPUSDT"
+            return [
+                Candle(
+                    open_time_ms=five_minute_floor - (12 - index) * 5 * 60_000,
+                    close_time_ms=five_minute_floor - (12 - index) * 5 * 60_000 + 299_999,
+                    open=1.0, high=1.1, low=0.9, close=1.0,
+                    volume=100.0, quote_volume=100.0, trades=10,
+                    taker_buy_base_volume=60.0, taker_buy_quote_volume=60.0,
+                )
+                for index in range(12)
+            ]
+
+    settings = SimpleNamespace(p1={"scanner": {
+        "market_context_oi_limit": 500,
+        "market_context_funding_limit": 200,
+        "market_context_kline_limit": 300,
+    }})
+    futures_candle = Candle(
+        open_time_ms=hour_floor - 3_600_000, close_time_ms=hour_floor - 1,
+        open=1.0, high=1.1, low=0.9, close=1.0,
+        volume=100.0, quote_volume=100.0, trades=10,
+        taker_buy_base_volume=60.0, taker_buy_quote_volume=60.0,
+    )
+
+    context = _market_context_for_symbol(
+        FuturesClient(), SpotClient(), "PUMPUSDT", [futures_candle], settings,
+    )
+    quality = _market_context_quality(context)
+
+    assert context["futures_flow_status"] == "AVAILABLE"
+    assert abs(context["futures_flow_1h"] - 0.2) < 1e-9
+    assert context["spot_status"] == "AVAILABLE"
+    assert context["spot_flow_status"] == "AVAILABLE"
+    assert abs(context["spot_flow_1h"] - 0.2) < 1e-9
+    assert context["oi_change_status"] == "AVAILABLE"
+    assert context["funding_regular_status"] == "AVAILABLE"
+    assert quality["market_context_status"] == "COMPLETE"
+    assert quality["market_context_missing_fields"] == []
+
+
+def test_market_context_quality_exposes_why_optional_fields_are_missing():
+    from screener.service import _market_context_quality
+
+    quality = _market_context_quality({
+        "futures_flow_status": "MISSING_TAKER_BUY_QUOTE_VOLUME",
+        "spot_flow_status": "SPOT_UNAVAILABLE",
+        "oi_change_status": "INSUFFICIENT_HISTORY",
+        "funding_regular_status": "NO_REGULAR_RATE",
+        "futures_flow_1h": None,
+        "spot_flow_1h": None,
+        "oi_change_base_1h_pct": None,
+        "oi_change_usd_1h_pct": None,
+        "funding_latest_regular": None,
+    })
+
+    assert quality["market_context_status"] == "PARTIAL"
+    assert quality["market_context_missing_count"] == 5
+    assert quality["market_context_field_statuses"]["spot_flow_1h"] == "SPOT_UNAVAILABLE"
+    assert "funding_latest_regular" in quality["market_context_missing_fields"]
+
+
+def test_shadow_exit_models_catch_up_each_closed_candle_and_apply_fee_estimates(tmp_path):
+    from screener.models import Candle
+    from screener.service import _record_signal_progress
+    from screener.storage import Store
+
+    store = Store(tmp_path / "shadow-exits")
+    entry_close_ms = 1_790_000_000_000
+    store.record_notification(
+        "ETHUSDT_PERP.A|LONG A|shadow", recipient_key="recipient",
+        contract_type="PERPETUAL", event_group="ETHUSDT_PERP.A|LONG A",
+        fingerprint="shadow-fp", event_state="ACTIVE", direction="LONG",
+        invalidation_level=99.0, pair="ETHUSDT", scenario_code="LONG_A",
+        delivery_status="SENT", entry_reference=100.0,
+        entry_reference_time_ms=entry_close_ms,
+        entry_reference_1h_open_time_ms=entry_close_ms - 3_600_000,
+        entry_reference_type="BINANCE_FUTURES_LAST_CLOSED_1H_CLOSE",
+        strategy_version="1.1.1-p1-shadow",
+    )
+    active = store.active_notification_states(recipient_keys=["recipient"], contract_type="PERPETUAL")
+    first = Candle(
+        open_time_ms=entry_close_ms + 1, close_time_ms=entry_close_ms + 3_600_000,
+        open=100.0, high=101.6, low=100.1, close=101.5,
+        volume=100.0, quote_volume=10_000.0, trades=10,
+        taker_buy_base_volume=60.0, taker_buy_quote_volume=6_000.0,
+    )
+    second = Candle(
+        open_time_ms=first.open_time_ms + 3_600_000,
+        close_time_ms=first.close_time_ms + 3_600_000,
+        open=101.5, high=101.7, low=99.9, close=100.2,
+        volume=100.0, quote_volume=10_000.0, trades=10,
+        taker_buy_base_volume=50.0, taker_buy_quote_volume=5_000.0,
+    )
+
+    # A single scan must backfill both newly closed bars, not only the latest one.
+    assert _record_signal_progress(
+        store, active, {"ETHUSDT": [first, second]}, fee_bps_per_side=5.0,
+    ) == 2
+
+    signal_id = store.signal_outcomes()[0]["signal_id"]
+    progress = [
+        item for item in store.signal_outcomes()
+        if item["signal_id"] == signal_id and item["outcome_event"] == "SIGNAL_PROGRESS"
+    ]
+    assert [item["as_of_1h_open_time_ms"] for item in progress] == [
+        first.open_time_ms, second.open_time_ms,
+    ]
+
+    tp15 = store.latest_signal_outcome(
+        signal_id, outcome_event="SHADOW_EXIT_PROGRESS",
+        exit_model_version="FIXED_TP_1_5R_STOP_1R_V1",
+    )
+    tp2 = store.latest_signal_outcome(
+        signal_id, outcome_event="SHADOW_EXIT_PROGRESS",
+        exit_model_version="FIXED_TP_2R_STOP_1R_V1",
+    )
+    partial = store.latest_signal_outcome(
+        signal_id, outcome_event="SHADOW_EXIT_PROGRESS",
+        exit_model_version="PARTIAL_50_TP_1_5R_BE_V1",
+    )
+
+    assert tp15["exit_status"] == "TARGET_HIT"
+    assert tp15["gross_realized_r"] == 1.5
+    assert tp15["fee_adjusted_r"] < tp15["gross_realized_r"]
+    assert tp15["data_quality"]["slippage_included"] is False
+    assert tp2["exit_status"] == "OPEN"
+    assert partial["exit_status"] == "BREAKEVEN_STOP_HIT"
+    assert partial["gross_realized_r"] == 0.75
+    assert partial["fee_adjusted_r"] < partial["gross_realized_r"]
+
+
+def test_shadow_exit_models_mark_same_candle_target_stop_conflict_ambiguous(tmp_path):
+    from screener.models import Candle
+    from screener.service import _record_signal_progress
+    from screener.storage import Store
+
+    store = Store(tmp_path / "shadow-ambiguous")
+    entry_close_ms = 1_790_000_000_000
+    store.record_notification(
+        "BTCUSDT_PERP.A|LONG A|ambiguous", recipient_key="recipient",
+        contract_type="PERPETUAL", event_group="BTCUSDT_PERP.A|LONG A",
+        fingerprint="ambiguous-fp", event_state="ACTIVE", direction="LONG",
+        invalidation_level=99.0, pair="BTCUSDT", scenario_code="LONG_A",
+        delivery_status="SENT", entry_reference=100.0,
+        entry_reference_time_ms=entry_close_ms,
+        entry_reference_1h_open_time_ms=entry_close_ms - 3_600_000,
+        entry_reference_type="BINANCE_FUTURES_LAST_CLOSED_1H_CLOSE",
+        strategy_version="1.1.1-p1-shadow",
+    )
+    active = store.active_notification_states(recipient_keys=["recipient"], contract_type="PERPETUAL")
+    collision = Candle(
+        open_time_ms=entry_close_ms + 1, close_time_ms=entry_close_ms + 3_600_000,
+        open=100.0, high=102.1, low=98.9, close=100.5,
+        volume=100.0, quote_volume=10_000.0, trades=10,
+    )
+    assert _record_signal_progress(store, active, {"BTCUSDT": [collision]}) == 1
+
+    signal_id = store.signal_outcomes()[0]["signal_id"]
+    expected = {
+        "FIXED_TP_1_5R_STOP_1R_V1": "AMBIGUOUS_SAME_1H_BAR",
+        "FIXED_TP_2R_STOP_1R_V1": "AMBIGUOUS_SAME_1H_BAR",
+        "PARTIAL_50_TP_1_5R_BE_V1": "AMBIGUOUS_INITIAL_STOP_AND_TARGET",
+    }
+    for model, status in expected.items():
+        result = store.latest_signal_outcome(
+            signal_id, outcome_event="SHADOW_EXIT_PROGRESS", exit_model_version=model,
+        )
+        assert result["exit_status"] == status
+        assert result["terminal"] is True
+        assert result["gross_realized_r"] is None
+
+
+def test_taker_flow_status_distinguishes_missing_volume_and_hourly_gaps():
+    from screener.models import Candle
+    from screener.service import _taker_flow_status
+
+    now_ms = 1_790_000_000_000
+    base = Candle(
+        open_time_ms=now_ms - 3_600_000,
+        close_time_ms=now_ms - 3_000_001,
+        open=1.0, high=1.1, low=0.9, close=1.0,
+        volume=100.0, quote_volume=100.0, trades=10,
+        taker_buy_base_volume=50.0, taker_buy_quote_volume=50.0,
+    )
+    missing = Candle(
+        open_time_ms=base.open_time_ms + 300_000,
+        close_time_ms=base.close_time_ms + 300_000,
+        open=1.0, high=1.1, low=0.9, close=1.0,
+        volume=100.0, quote_volume=100.0, trades=10,
+    )
+    assert _taker_flow_status([missing], now_ms=now_ms, max_age_ms=70 * 60_000) == "MISSING_TAKER_BUY_QUOTE_VOLUME"
+    assert _taker_flow_status(
+        [base, missing], now_ms=now_ms, max_age_ms=70 * 60_000,
+        expected_count=2, interval_ms=300_000,
+    ) == "MISSING_TAKER_BUY_QUOTE_VOLUME"
+    assert _taker_flow_status(
+        [base, base], now_ms=now_ms, max_age_ms=70 * 60_000,
+        expected_count=2, interval_ms=300_000,
+    ) == "DATA_GAP"
