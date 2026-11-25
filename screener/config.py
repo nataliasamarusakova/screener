@@ -95,7 +95,6 @@ class Settings:
     binance_fetch_orderbook: bool
     binance_orderbook_limit: int
     execution_notional_usd: float
-    trading_fee_bps_per_side: float | None
     telegram_bot_token: str
     telegram_chat_ids: list[str]
     data_dir: Path
@@ -117,9 +116,37 @@ class Settings:
 
 def _bool_env(name: str, default: bool) -> bool:
     value = os.getenv(name)
-    if value is None:
+    if value is None or not value.strip():
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _text_env(name: str, default: str) -> str:
+    value = os.getenv(name)
+    return value.strip() if value is not None and value.strip() else default
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return float(default)
+    try:
+        value = float(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a valid number") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    return value
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return int(default)
+    try:
+        return int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a valid integer") from exc
 
 
 def load_settings(root: Path = ROOT) -> Settings:
@@ -135,24 +162,26 @@ def load_settings(root: Path = ROOT) -> Settings:
     if not data_dir.is_absolute():
         data_dir = root / data_dir
 
-    fee_value = os.getenv("TRADING_FEE_BPS_PER_SIDE", "").strip()
-    legacy_fee = float(fee_value) if fee_value else None
+    obsolete_fee_value = os.getenv("TRADING_FEE_BPS_PER_SIDE", "").strip()
+    if obsolete_fee_value:
+        raise ValueError(
+            "TRADING_FEE_BPS_PER_SIDE is no longer supported. Remove this obsolete Actions variable; "
+            "configure MAKER_FEE_BPS and TAKER_FEE_BPS instead."
+        )
 
-    def fee_setting(env_name: str, default: float, *, legacy_taker_fallback: bool = False) -> float:
-        raw = os.getenv(env_name, "").strip()
-        fallback = legacy_fee if legacy_taker_fallback and legacy_fee is not None else default
-        value = float(raw) if raw else fallback
-        if not math.isfinite(value) or value < 0:
+    def fee_setting(env_name: str, default: float) -> float:
+        value = _float_env(env_name, default)
+        if value < 0:
             raise ValueError(f"{env_name} must be a finite non-negative number of basis points")
         return value
 
-    entry_execution_type = os.getenv("SHADOW_ENTRY_EXECUTION_TYPE", "TAKER").strip().upper() or "TAKER"
-    exit_execution_type = os.getenv("SHADOW_EXIT_EXECUTION_TYPE", "TAKER").strip().upper() or "TAKER"
+    entry_execution_type = _text_env("SHADOW_ENTRY_EXECUTION_TYPE", "TAKER").upper()
+    exit_execution_type = _text_env("SHADOW_EXIT_EXECUTION_TYPE", "TAKER").upper()
     if entry_execution_type not in {"MAKER", "TAKER"}:
         raise ValueError("SHADOW_ENTRY_EXECUTION_TYPE must be MAKER or TAKER")
     if exit_execution_type not in {"MAKER", "TAKER"}:
         raise ValueError("SHADOW_EXIT_EXECUTION_TYPE must be MAKER or TAKER")
-    shadow_notional = float(os.getenv("SHADOW_NOTIONAL_USD", "1000"))
+    shadow_notional = _float_env("SHADOW_NOTIONAL_USD", 1_000.0)
     if not math.isfinite(shadow_notional) or shadow_notional <= 0:
         raise ValueError("SHADOW_NOTIONAL_USD must be a finite positive number")
 
@@ -160,18 +189,17 @@ def load_settings(root: Path = ROOT) -> Settings:
         coinalyze_url=os.getenv("COINALYZE_URL", "").strip(),
         coinalyze_p_sid=os.getenv("COINALYZE_P_SID", "").strip(),
         coinalyze_chat_sid=os.getenv("COINALYZE_CHAT_SID", "").strip(),
-        coinalyze_max_pages=max(1, min(100, int(os.getenv("COINALYZE_MAX_PAGES", "20")))),
+        coinalyze_max_pages=max(1, min(100, _int_env("COINALYZE_MAX_PAGES", 20))),
         coinalyze_headless=_bool_env("COINALYZE_HEADLESS", True),
-        coinalyze_timeout_ms=max(5000, min(120_000, int(os.getenv("COINALYZE_TIMEOUT_MS", "45000")))),
-        binance_base_url=os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/"),
+        coinalyze_timeout_ms=max(5000, min(120_000, _int_env("COINALYZE_TIMEOUT_MS", 45_000))),
+        binance_base_url=_text_env("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/"),
         binance_http_proxy=os.getenv("BINANCE_HTTP_PROXY", "").strip(),
         binance_vpn_enabled=_bool_env("BINANCE_VPN_ENABLED", False),
-        binance_kline_limit=max(100, min(1500, int(os.getenv("BINANCE_KLINE_LIMIT", "300")))),
-        binance_request_interval_sec=max(0.0, float(os.getenv("BINANCE_REQUEST_INTERVAL_SEC", "0.12"))),
+        binance_kline_limit=max(100, min(1500, _int_env("BINANCE_KLINE_LIMIT", 300))),
+        binance_request_interval_sec=max(0.0, _float_env("BINANCE_REQUEST_INTERVAL_SEC", 0.12)),
         binance_fetch_orderbook=_bool_env("BINANCE_FETCH_ORDERBOOK", False),
-        binance_orderbook_limit=max(5, min(1000, int(os.getenv("BINANCE_ORDERBOOK_LIMIT", "100")))),
-        execution_notional_usd=max(0.0, float(os.getenv("EXECUTION_NOTIONAL_USD", "0"))),
-        trading_fee_bps_per_side=max(0.0, float(fee_value)) if fee_value else None,
+        binance_orderbook_limit=max(5, min(1000, _int_env("BINANCE_ORDERBOOK_LIMIT", 100))),
+        execution_notional_usd=max(0.0, _float_env("EXECUTION_NOTIONAL_USD", 0.0)),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         telegram_chat_ids=chat_ids,
         data_dir=data_dir,
@@ -179,12 +207,12 @@ def load_settings(root: Path = ROOT) -> Settings:
         dry_run=_bool_env("DRY_RUN", True),
         p1={section: values.copy() for section, values in strategy.items()},
         telegram_storage_hash_key=os.getenv("TELEGRAM_STORAGE_HASH_KEY", "").strip(),
-        coinalyze_page_attempts=max(1, min(5, int(os.getenv("COINALYZE_PAGE_ATTEMPTS", "3")))),
+        coinalyze_page_attempts=max(1, min(5, _int_env("COINALYZE_PAGE_ATTEMPTS", 3))),
         coinalyze_retry_backoff_sec=max(
-            0.0, min(30.0, float(os.getenv("COINALYZE_RETRY_BACKOFF_SEC", "3")))
+            0.0, min(30.0, _float_env("COINALYZE_RETRY_BACKOFF_SEC", 3.0))
         ),
         maker_fee_bps=fee_setting("MAKER_FEE_BPS", 2.0),
-        taker_fee_bps=fee_setting("TAKER_FEE_BPS", 5.0, legacy_taker_fallback=True),
+        taker_fee_bps=fee_setting("TAKER_FEE_BPS", 5.0),
         shadow_entry_execution_type=entry_execution_type,
         shadow_exit_execution_type=exit_execution_type,
         shadow_notional_usd=shadow_notional,

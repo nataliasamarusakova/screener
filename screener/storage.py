@@ -45,7 +45,7 @@ class Store:
             for path in self.paths:
                 path.touch(exist_ok=True)
             # Analytical directories are created lazily on the first append so
-            # legacy dry-runs do not change the persisted data tree.
+            # dry-runs do not change the persisted data tree.
         self._manifests_cache: list[dict[str, Any]] | None = None
         self._history_cache: dict[str, list[dict[str, Any]]] | None = None
         self._notification_cache: list[dict[str, Any]] | None = None
